@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "nexus",
+    "cortex"
+]
+resolver = "2"
