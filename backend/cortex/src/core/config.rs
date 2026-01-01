@@ -7,7 +7,9 @@ pub struct Config {
     pub nexus: NexusConfig,
     pub llm: LlmConfig,
     pub tts: TtsConfig,
-    pub sources: Vec<SourceConfig>,
+    pub news: Option<Vec<NewsCategory>>,
+    pub interval_min: Option<u64>,
+    pub schedule_times: Option<Vec<String>>, // Format: "HH:MM"
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -24,15 +26,22 @@ pub struct LlmConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TtsConfig {
-    pub model_path: String,
+    pub engine: Option<String>,
+
+    pub voxcpm: Option<VoxCPMConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct SourceConfig {
-    pub name: String,
-    pub url: String,
-    pub interval_min: u64,
-    pub tags: Option<Vec<String>>,
+pub struct VoxCPMConfig {
+    pub model_path: String,
+    pub prompt_text: Option<String>,
+    pub prompt_wav_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct NewsCategory {
+    pub category: String,
+    pub urls: Vec<String>,
 }
 
 pub fn load_config(path: &str) -> Result<Config> {

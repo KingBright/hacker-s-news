@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# Resolve the project root directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+PROJECT_ROOT="$SCRIPT_DIR/.."
+
+# Change to the project root
+cd "$PROJECT_ROOT"
+
 # 1. Clean and create the distribution directory
 echo "Cleaning up and creating the distribution directory..."
 rm -rf dist
@@ -26,9 +33,7 @@ cd ..
 
 # 5. Copy the frontend build artifacts
 echo "Copying frontend build artifacts..."
-cp -r frontend/.next dist/frontend/
-cp frontend/package.json dist/frontend/
-cp frontend/package-lock.json dist/frontend/
-cp -r frontend/public dist/frontend/
+# Copy static export
+cp -r frontend/out/* dist/frontend/
 
 echo "Build complete. Artifacts are in the dist/ directory."

@@ -8,4 +8,7 @@ export interface Item {
   audio_url: string | null;
   publish_time: number | null;
   created_at: number | null;
+  rating?: number | null;
+  tags?: string | null;
+  is_deleted?: boolean | null;
 }

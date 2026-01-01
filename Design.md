@@ -35,7 +35,7 @@ FreshLoop (鲜阅) - 分布式架构设计文档1. 项目概述FreshLoop 是一�
     %% 结果回传
     Cortex --4. POST /api/internal/items (Auth)--> Nexus
     Cortex --5. Upload Audio--> FS_Audio
-3. 功能模块详解3.1 前端：Web Client (Port: 3000)技术栈：Next.js, Tailwind CSS核心功能：沉浸式阅读：纯粹的内容展示界面，通过 GET /api/items 获取时间流信息。Zen Mode：极简音频播放模式，提供无干扰的听书体验。状态展示：仅展示内容，不包含任何系统配置或管理入口。3.2 枢纽服务：Nexus Service (Port: 8080)角色：数据状态管理者 (State Manager)。职责：数据库独占：唯一拥有 SQLite 数据库读写权限的服务。API 接口：GET /api/items：面向前端，提供分页内容查询。POST /api/internal/items：面向 Cortex，接收处理完成的结构化数据（需 X-NEXUS-KEY 鉴权）。POST /api/internal/upload：面向 Cortex，接收生成的音频文件流。3.3 核心服务：Cortex Service (Daemon)角色：计算工作者 (Compute Worker)。职责：守护进程：作为后台服务运行，由配置文件驱动任务调度。任务循环：加载配置：启动时读取 config.toml 获取 RSS 源和模型参数。采集与处理：执行爬虫抓取、调用 Ollama 进行清洗与摘要、调用 Piper 生成语音。数据上报：将生成的 Metadata 和音频文件通过 HTTP 接口推送到 Nexus。4. 数据与存储设计4.1 部署目录结构Server Side (Nexus 节点)/opt/freshloop/server/
+3. 功能模块详解3.1 前端：Web Client (Port: 3000)技术栈：Next.js, Tailwind CSS核心功能：沉浸式阅读：纯粹的内容展示界面，通过 GET /api/items 获取时间流信息。Zen Mode：极简音频播放模式，提供无干扰的听书体验。状态展示：仅展示内容，不包含任何系统配置或管理入口。3.2 枢纽服务：Nexus Service (Port: 8899)角色：数据状态管理者 (State Manager)。职责：数据库独占：唯一拥有 SQLite 数据库读写权限的服务。API 接口：GET /api/items：面向前端，提供分页内容查询。POST /api/internal/items：面向 Cortex，接收处理完成的结构化数据（需 X-NEXUS-KEY 鉴权）。POST /api/internal/upload：面向 Cortex，接收生成的音频文件流。3.3 核心服务：Cortex Service (Daemon)角色：计算工作者 (Compute Worker)。职责：守护进程：作为后台服务运行，由配置文件驱动任务调度。任务循环：加载配置：启动时读取 config.toml 获取 RSS 源和模型参数。采集与处理：执行爬虫抓取、调用 Ollama 进行清洗与摘要、调用 Piper 生成语音。数据上报：将生成的 Metadata 和音频文件通过 HTTP 接口推送到 Nexus。4. 数据与存储设计4.1 部署目录结构Server Side (Nexus 节点)/opt/freshloop/server/
 ├── data/
 │   ├── freshloop.db  # SQLite 数据库文件
 │   └── audio/        # 静态音频文件存储目录
@@ -44,7 +44,7 @@ Worker Side (Cortex 节点)/opt/freshloop/worker/
 ├── config.toml       # 核心配置文件
 └── cortex_app        # 工作端二进制文件
 4.2 配置文件 (config.toml)Cortex 通过此文件管理所有业务逻辑配置。[nexus]
-api_url = "[http://192.168.1.10:8080](http://192.168.1.10:8080)"  # Nexus 服务地址
+api_url = "[http://192.168.1.10:8899](http://192.168.1.10:)"  # Nexus 服务地址
 auth_key = "my-secret-key-123"        # 通信鉴权密钥
 
 [llm]

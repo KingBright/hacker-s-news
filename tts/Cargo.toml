@@ -1,0 +1,13 @@
+[package]
+name = "tts"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aha = { path = "../aha" }
+anyhow = "1.0"
+candle-core = "0.9.1"
+
+[features]
+metal = ["aha/metal"]
+cuda = ["aha/cuda"]

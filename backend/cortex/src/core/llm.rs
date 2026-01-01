@@ -11,35 +11,30 @@ pub struct LlmClient {
 impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             config,
         }
     }
 
-    pub async fn summarize(&self, text: &str) -> Result<String> {
-        // Truncate text if too long to avoid token limits (simplistic approach)
-        let truncated_text = if text.len() > 10000 {
-            &text[..10000]
-        } else {
-            text
-        };
-
-        let prompt = format!(
-            "Please summarize the following content into a concise paragraph (less than 200 words), focusing on the key points. Content: {}",
-            truncated_text
-        );
-
+    pub async fn chat(&self, prompt: &str) -> Result<String> {
         let body = json!({
             "model": self.config.model,
-            "prompt": prompt,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
             "stream": false
         });
 
-        let url = format!("{}/api/generate", self.config.api_url);
+        // Assume api_url is like "http://localhost:1234/v1"
+        let url = format!("{}/chat/completions", self.config.api_url.trim_end_matches('/'));
 
-        // Mock implementation if can't connect (or if in test environment)
-        // For now, we try to connect. If it fails, we might return a dummy summary for testing purposes?
-        // Let's implement robust error handling.
+        log::info!("Sending LLM request to {}. Body: {}", url, body);
 
         let res = match self.client.post(&url)
             .json(&body)
@@ -47,17 +42,34 @@ impl LlmClient {
             .await {
                 Ok(response) => response,
                 Err(e) => {
-                     log::warn!("Failed to connect to LLM at {}: {}. Using mock summary.", url, e);
-                     return Ok(format!("(Mock Summary) Summary generation failed. Original start: {:.100}...", text));
+                     log::warn!("Failed to connect to LLM at {}: {}", url, e);
+                     return Err(anyhow::anyhow!("LLM Connection Failed: {}", e));
                 }
             };
 
         if !res.status().is_success() {
-             return Ok(format!("(Mock Summary) LLM Error {}. Original start: {:.100}...", res.status(), text));
+             let status = res.status();
+             let error_text = res.text().await.unwrap_or_default();
+             log::error!("LLM Error {}: {}", status, error_text);
+             return Err(anyhow::anyhow!("LLM API Error {}: {}", status, error_text));
         }
 
         let response_json: serde_json::Value = res.json().await?;
-        let summary = response_json["response"].as_str().unwrap_or("Failed to parse summary").to_string();
+        log::info!("Received LLM response: {}", response_json);
+        
+        // Parse OpenAI format: choices[0].message.content
+        let mut summary = response_json["choices"][0]["message"]["content"]
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                log::warn!("Unexpected LLM response format: {:?}", response_json);
+                "Failed to parse summary".to_string()
+            });
+
+        // Strip <think> tags if present
+        if let Some(idx) = summary.find("</think>") {
+             summary = summary[idx + "</think>".len()..].trim().to_string();
+        }
 
         Ok(summary)
     }
