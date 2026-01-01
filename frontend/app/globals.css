@@ -3,23 +3,15 @@
 @theme {
   --color-primary: #19e66b;
   --color-background-light: #f6f8f7;
-  --color-background-dark: #112117;
+  --color-background-dark: #050a07;
   --color-surface-dark: #1a3224;
   --color-surface-highlight: #244732;
   --font-display: "Work Sans", sans-serif;
 }
 
 :root {
-  --background: var(--color-background-light);
-  --foreground: #0f172a;
-  /* slate-900 */
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: var(--color-background-dark);
-    --foreground: #ffffff;
-  }
+  --background: var(--color-background-dark);
+  --foreground: #ffffff;
 }
 
 /* Force dark mode if class is present on html, but Tailwind handles .dark: selector automatically with darkMode: 'class' (default in v4 if using .dark class?)
