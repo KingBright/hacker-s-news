@@ -17,9 +17,8 @@ export default function Home() {
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
-  const [showPlaylist, setShowPlaylist] = useState(false);
-  const [isModalOpen, setIsModalOpen] = useState(false);
 
+  // Audio ref
   const audioRef = useRef<HTMLAudioElement>(null);
 
   // Poll for new items
@@ -27,8 +26,6 @@ export default function Home() {
     fetch('/api/items')
       .then(res => res.json())
       .then(data => {
-        // Simple merge: replace list if different length, or if head is different
-        // Ideally we should do a smarter merge. For now, just set.
         setItems(data);
       })
       .catch(err => console.error('Failed to fetch items:', err));
@@ -101,18 +98,17 @@ export default function Home() {
     }
   };
 
-  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const time = parseFloat(e.target.value);
-    setProgress(time);
-    if (audioRef.current) {
-      audioRef.current.currentTime = time;
-    }
-  };
+  // Circular Progress Calculation
+  const circleRadius = 22;
+  const circumference = 2 * Math.PI * circleRadius; // ~138
+  const progressPercent = duration > 0 ? (progress / duration) : 0;
+  const strokeDashoffset = circumference - (progressPercent * circumference);
 
   const currentItem = items.find(i => i.id === currentId);
+  const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
 
   return (
-    <main className="min-h-screen bg-stone-50 text-stone-900 font-sans pb-40">
+    <div className="relative flex h-full min-h-screen w-full flex-col overflow-x-hidden max-w-md mx-auto shadow-2xl pb-32 bg-background-light dark:bg-background-dark text-slate-900 dark:text-white font-display">
       <audio
         ref={audioRef}
         onTimeUpdate={handleTimeUpdate}
@@ -123,128 +119,182 @@ export default function Home() {
         className="hidden"
       />
 
-      <div className="max-w-3xl mx-auto p-6">
-        <header className="mb-8 pt-4 flex justify-between items-end border-b border-stone-200 pb-4 sticky top-0 bg-stone-50/95 backdrop-blur z-10 transition-all">
+      {/* Header */}
+      <header className="sticky top-0 z-20 bg-background-light/95 dark:bg-background-dark/95 backdrop-blur-md px-4 pt-12 pb-4 border-b border-black/5 dark:border-white/5">
+        <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-3xl font-serif font-bold tracking-tight text-stone-900">FreshLoop</h1>
-            <p className="text-stone-500 text-sm mt-1">Daily Briefing • Zen Mode</p>
+            <h1 className="text-[28px] font-bold leading-none tracking-tight text-slate-900 dark:text-white">FreshLoop</h1>
+            <p className="text-xs text-slate-500 dark:text-[#93c8a8] mt-1 font-medium tracking-wide uppercase">Audio Briefing • Zen Mode</p>
           </div>
-          <button onClick={fetchItems} className="text-stone-400 hover:text-stone-600 transition p-2">
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
-          </button>
-        </header>
+        </div>
+      </header>
 
-        <div className="space-y-8">
-          {items.map((item, index) => (
-            <article
-              key={item.id}
-              className={`
-                group relative p-4 rounded-xl transition-all duration-300
-                ${currentId === item.id ? 'bg-white shadow-md ring-1 ring-stone-200 scale-[1.02]' : 'hover:bg-white/50'}
-              `}
-            >
-              <div className="flex items-start gap-4">
-                <button
+      <main className="flex flex-col gap-6 p-4">
+        {/* Hero Card: Daily Summary */}
+        <section className="relative overflow-hidden rounded-3xl bg-surface-dark shadow-lg ring-1 ring-white/5 group">
+          {/* Abstract Background Pattern */}
+          <div className="absolute inset-0 opacity-40 mix-blend-overlay" style={{ backgroundImage: 'radial-gradient(circle at 80% 20%, rgba(25, 230, 107, 0.3) 0%, transparent 50%)' }}></div>
+          <div className="relative flex flex-col p-6 z-10">
+            <div className="flex items-start justify-between mb-8">
+              <div>
+                <p className="text-[#93c8a8] text-sm font-medium uppercase tracking-wider mb-1">{today}</p>
+                <h2 className="text-3xl font-bold text-white tracking-tight leading-none">Good Morning</h2>
+              </div>
+              <div className="h-10 w-10 rounded-full bg-primary/20 flex items-center justify-center text-primary">
+                <span className="material-symbols-outlined">wb_sunny</span>
+              </div>
+            </div>
+            <div className="space-y-4">
+              <div className="flex items-end gap-3">
+                <span className="text-5xl font-bold text-primary font-display tabular-nums">{items.length}</span>
+                <span className="text-lg text-white/80 font-medium mb-1.5">Fresh stories tailored for you</span>
+              </div>
+              <div className="w-full bg-black/20 h-1.5 rounded-full overflow-hidden">
+                <div className="bg-primary h-full w-[35%] rounded-full shadow-[0_0_10px_rgba(25,230,107,0.5)]"></div>
+              </div>
+              <div className="flex items-center justify-between text-sm text-[#93c8a8]">
+                <span className="flex items-center gap-1.5">
+                  <span className="material-symbols-outlined text-[16px]">schedule</span>
+                  Updated just now
+                </span>
+                <button onClick={() => items.length > 0 && items[0].audio_url && playItem(items[0].id, items[0].audio_url)} className="text-primary font-bold hover:underline decoration-2 underline-offset-4 flex items-center gap-1">
+                  Play Digest <span className="material-symbols-outlined text-[16px]">arrow_forward</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Collections Section (Items List) */}
+        <section className="flex flex-col gap-4">
+          <div className="flex items-center justify-between px-1">
+            <h3 className="text-xl font-bold text-slate-900 dark:text-white">Your Feed</h3>
+            <button className="text-sm font-medium text-slate-500 dark:text-[#93c8a8] hover:text-primary transition-colors">Edit</button>
+          </div>
+
+          <div className="flex flex-col gap-3">
+            {items.map((item, index) => {
+              const isActive = currentId === item.id;
+              return (
+                <div
+                  key={item.id}
                   onClick={() => item.audio_url && playItem(item.id, item.audio_url)}
-                  disabled={!item.audio_url}
                   className={`
-                    mt-1 w-10 h-10 flex-shrink-0 flex items-center justify-center rounded-full transition-all
-                    ${!item.audio_url ? 'bg-stone-100 text-stone-300 cursor-not-allowed' :
-                      currentId === item.id && isPlaying
-                        ? 'bg-stone-900 text-white shadow-lg scale-110'
-                        : 'bg-stone-200 text-stone-600 hover:bg-stone-800 hover:text-white'}
+                    group flex items-center gap-4 bg-white dark:bg-surface-dark p-4 rounded-2xl ring-1 shadow-sm hover:shadow-md transition-all cursor-pointer active:scale-[0.99]
+                    ${isActive ? 'ring-primary dark:ring-primary' : 'ring-black/5 dark:ring-white/5 hover:ring-primary/50 dark:hover:ring-primary/50'}
                   `}
                 >
-                  {currentId === item.id && isPlaying ? (
-                    <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" /></svg>
-                  ) : (
-                    <svg className="w-4 h-4 fill-current ml-0.5" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-                  )}
-                </button>
-
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="text-xs font-bold text-stone-400 font-mono">#{String(items.length - index).padStart(2, '0')}</span>
-                    <span className="text-xs text-stone-400">
-                      {item.publish_time ? new Date(item.publish_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-                    </span>
+                  <div className="relative shrink-0">
+                    <div className={`flex items-center justify-center rounded-xl size-14 shadow-inner ${isActive ? 'bg-primary text-black' : 'bg-blue-100 dark:bg-[#244732] text-blue-600 dark:text-white'}`}>
+                      {/* Use a generic icon or map based on content if possible */}
+                      <span className="material-symbols-outlined text-[28px]">graphic_eq</span>
+                    </div>
+                    {isActive && (
+                      <div className="absolute -bottom-1 -right-1 bg-surface-dark rounded-full p-0.5">
+                        <div className="size-4 rounded-full bg-primary border-2 border-surface-dark animate-pulse"></div>
+                      </div>
+                    )}
                   </div>
-
-                  <h2 className={`text-xl font-serif font-medium mb-2 leading-tight ${currentId === item.id ? 'text-stone-900' : 'text-stone-700'}`}>
-                    <a href={item.original_url || '#'} target="_blank" rel="noopener noreferrer" className="hover:underline decoration-stone-300 underline-offset-4">
+                  <div className="flex flex-col justify-center grow min-w-0">
+                    <h4 className={`text-base font-bold leading-tight truncate ${isActive ? 'text-primary' : 'text-slate-900 dark:text-white'}`}>
                       {item.title}
-                    </a>
-                  </h2>
-
-                  {item.summary && (
-                    <p className={`text-stone-600 leading-relaxed text-sm line-clamp-3 group-hover:line-clamp-none transition-all ${currentId === item.id ? 'line-clamp-none' : ''}`}>
-                      {item.summary}
+                    </h4>
+                    <p className="text-slate-500 dark:text-[#93c8a8] text-sm mt-1 line-clamp-1">
+                      {item.summary || "Audio briefing available"}
                     </p>
-                  )}
+                    <div className="flex items-center gap-2 mt-1.5">
+                      <span className="text-xs font-medium text-slate-400 dark:text-white/40 bg-slate-100 dark:bg-black/20 px-2 py-0.5 rounded">
+                        {item.publish_time ? new Date(item.publish_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Now'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="shrink-0">
+                    <button className={`flex items-center justify-center size-10 rounded-full transition-colors ${isActive && isPlaying ? 'bg-primary text-black' : 'bg-slate-100 dark:bg-black/20 text-slate-900 dark:text-white group-hover:bg-primary group-hover:text-black'}`}>
+                      <span className="material-symbols-outlined filled text-[24px]">
+                        {isActive && isPlaying ? 'pause' : 'play_arrow'}
+                      </span>
+                    </button>
+                  </div>
                 </div>
-              </div>
-            </article>
-          ))}
-        </div>
-      </div>
+              );
+            })}
 
-      {/* Sticky Player Bar */}
+            {items.length === 0 && (
+              <div className="text-center py-20 text-slate-500 dark:text-[#93c8a8]">
+                Loading stories...
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Secondary Feature Card (Static for now) */}
+        <section className="mt-2">
+          <div className="rounded-2xl bg-gradient-to-r from-indigo-900 to-indigo-800 p-5 text-white shadow-lg relative overflow-hidden">
+            <div className="absolute right-0 top-0 h-full w-1/2 opacity-20" style={{ backgroundImage: 'radial-gradient(circle at 100% 0%, #ffffff 0%, transparent 70%)' }}></div>
+            <div className="relative z-10 flex items-center justify-between">
+              <div>
+                <h4 className="font-bold text-lg">Weekly Deep Dive</h4>
+                <p className="text-indigo-200 text-sm mt-1">This week: The Future of Energy</p>
+              </div>
+              <button className="bg-white/10 hover:bg-white/20 p-2 rounded-full backdrop-blur-sm transition-colors">
+                <span className="material-symbols-outlined">bookmark_add</span>
+              </button>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      {/* Persistent Player Bar (Floating) */}
       {currentItem && (
-        <div className="fixed bottom-0 left-0 right-0 bg-white/95 backdrop-blur-md border-t border-stone-200 shadow-[0_-4px_20px_rgba(0,0,0,0.05)] pb-safe pt-2 px-4 z-50">
-          <div className="max-w-3xl mx-auto">
-            {/* Progress Bar */}
-            <div className="flex items-center gap-3 mb-2 group">
-              <span className="text-xs font-mono text-stone-400 w-10 text-right">{formatTime(progress)}</span>
-              <input
-                type="range"
-                min={0}
-                max={duration || 100}
-                value={progress}
-                onChange={handleSeek}
-                onMouseDown={() => setIsDragging(true)}
-                onMouseUp={() => setIsDragging(false)}
-                onTouchStart={() => setIsDragging(true)}
-                onTouchEnd={() => setIsDragging(false)}
-                className="
-                  flex-1 h-1 bg-stone-200 rounded-lg appearance-none cursor-pointer
-                  [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 
-                  [&::-webkit-slider-thumb]:bg-stone-900 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:transition-transform
-                  group-hover:[&::-webkit-slider-thumb]:scale-125
-                "
-              />
-              <span className="text-xs font-mono text-stone-400 w-10">{formatTime(duration)}</span>
+        <div className="fixed bottom-[88px] left-0 right-0 px-4 z-40 max-w-md mx-auto">
+          <div className="bg-[#1e1e1e] dark:bg-black rounded-2xl p-3 pr-4 shadow-[0_8px_30px_rgb(0,0,0,0.4)] ring-1 ring-white/10 flex items-center gap-3 backdrop-blur-xl">
+            {/* Art / Progress Circle */}
+            <div className="relative size-12 shrink-0 flex items-center justify-center">
+              <svg className="transform -rotate-90 size-12 drop-shadow-[0_0_8px_rgba(25,230,107,0.3)]">
+                <circle className="text-white/10" cx="24" cy="24" fill="transparent" r={circleRadius} stroke="currentColor" strokeWidth="2"></circle>
+                <circle
+                  className="text-primary transition-all duration-300"
+                  cx="24" cy="24"
+                  fill="transparent"
+                  r={circleRadius}
+                  stroke="currentColor"
+                  strokeDasharray={circumference}
+                  strokeDashoffset={strokeDashoffset}
+                  strokeLinecap="round"
+                  strokeWidth="2"
+                ></circle>
+              </svg>
+              <div className="absolute inset-0 m-auto size-8 rounded-full bg-surface-highlight overflow-hidden flex items-center justify-center">
+                {/* Fallback pattern or image if available */}
+                <span className="material-symbols-outlined text-white/50 text-sm">music_note</span>
+              </div>
             </div>
 
-            <div className="flex items-center justify-between pb-2">
-              <div className="flex-1 min-w-0 pr-4">
-                <div className="text-xs text-stone-500 uppercase tracking-wider mb-0.5">Now Playing</div>
-                <div className="font-serif font-medium text-stone-900 truncate">{currentItem.title}</div>
+            <div className="flex flex-col grow overflow-hidden">
+              <div className="flex items-center gap-2">
+                <span className="bg-primary/20 text-primary text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider">Live</span>
+                <p className="text-white text-sm font-bold truncate">{currentItem.title}</p>
               </div>
+              <p className="text-[#93c8a8] text-xs truncate">
+                {formatTime(duration - progress)} remaining
+              </p>
+            </div>
 
-              <div className="flex items-center gap-4 flex-shrink-0">
-                <button onClick={playPrev} className="p-2 text-stone-400 hover:text-stone-900 transition">
-                  <svg className="w-6 h-6 fill-current" viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" /></svg>
-                </button>
-
-                <button
-                  onClick={togglePlay}
-                  className="w-12 h-12 flex items-center justify-center rounded-full bg-stone-900 text-white shadow-lg hover:scale-105 active:scale-95 transition"
-                >
-                  {isPlaying ? (
-                    <svg className="w-5 h-5 fill-current" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" /></svg>
-                  ) : (
-                    <svg className="w-5 h-5 fill-current ml-0.5" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-                  )}
-                </button>
-
-                <button onClick={playNext} className="p-2 text-stone-400 hover:text-stone-900 transition">
-                  <svg className="w-6 h-6 fill-current" viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" /></svg>
-                </button>
-              </div>
+            <div className="flex items-center gap-1">
+              <button onClick={togglePlay} className="text-white hover:text-primary p-2 rounded-full transition-colors">
+                <span className="material-symbols-outlined text-[28px] filled">
+                  {isPlaying ? 'pause_circle' : 'play_circle'}
+                </span>
+              </button>
+              <button onClick={playNext} className="text-white/60 hover:text-white p-2 rounded-full transition-colors">
+                <span className="material-symbols-outlined text-[26px]">skip_next</span>
+              </button>
             </div>
           </div>
         </div>
       )}
-    </main>
+
+    </div>
   );
 }
+

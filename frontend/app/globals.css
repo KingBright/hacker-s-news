@@ -1,19 +1,54 @@
 @import "tailwindcss";
 
+@theme {
+  --color-primary: #19e66b;
+  --color-background-light: #f6f8f7;
+  --color-background-dark: #112117;
+  --color-surface-dark: #1a3224;
+  --color-surface-highlight: #244732;
+  --font-display: "Work Sans", sans-serif;
+}
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: var(--color-background-light);
+  --foreground: #0f172a;
+  /* slate-900 */
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --background: var(--color-background-dark);
+    --foreground: #ffffff;
   }
 }
+
+/* Force dark mode if class is present on html, but Tailwind handles .dark: selector automatically with darkMode: 'class' (default in v4 if using .dark class?)
+   Actually v4 uses variant based on media query by default, but we can verify.
+   The user HTML has <html class="dark"> so we want that to work.
+   Tailwind v4 supports dark: variant automatically.
+*/
 
 body {
   color: var(--foreground);
   background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-display), sans-serif;
+}
+
+/* Custom scrollbar for webkit */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #334155;
 }
