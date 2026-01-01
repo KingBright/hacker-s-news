@@ -27,7 +27,10 @@ html2text = "0.16"
 regex = "1"
 sled = "0.34"
 
-candle-core = { version = "0.9.1", features = ["metal"] }
-candle-nn = { version = "0.9.1", features = ["metal"] }
-candle-transformers = { version = "0.9.1", features = ["metal"] }
-tts = { path = "../../tts", features = ["metal"] }
+candle-core = { version = "0.9.1" }
+candle-nn = { version = "0.9.1" }
+candle-transformers = { version = "0.9.1" }
+tts = { path = "../../tts" }
+
+[features]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "tts/metal"]
