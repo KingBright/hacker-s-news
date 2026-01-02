@@ -10,6 +10,19 @@ function formatTime(seconds: number): string {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
+function getRelativeTime(timestamp: number): string {
+  if (!timestamp) return '';
+  const now = Date.now();
+  const diff = now - timestamp * 1000;
+
+  if (diff < 60000) return 'Just now';
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return new Date(timestamp * 1000).toLocaleDateString();
+}
+
 export default function Home() {
   const [items, setItems] = useState<Item[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
@@ -264,6 +277,9 @@ export default function Home() {
   const currentItem = items.find(i => i.id === currentId);
   const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
   const unreadCount = items.filter(i => !playedIds.has(i.id)).length;
+  const lastUpdated = items.length > 0 && items[0].publish_time
+    ? `Updated ${getRelativeTime(items[0].publish_time)}`
+    : (items.length > 0 ? 'Updated recently' : 'No content');
 
   return (
     <div className="relative flex h-full min-h-screen w-full flex-col overflow-x-hidden max-w-md mx-auto shadow-2xl pb-32 bg-background-dark text-white font-display">
@@ -324,7 +340,7 @@ export default function Home() {
               <div className="flex items-center justify-between text-sm text-[#93c8a8]">
                 <span className="flex items-center gap-1.5">
                   <span className="material-symbols-outlined text-[16px]">schedule</span>
-                  Updated just now
+                  {lastUpdated}
                 </span>
               </div>
             </div>
