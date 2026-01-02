@@ -11,4 +11,5 @@ export interface Item {
   rating?: number | null;
   tags?: string | null;
   is_deleted?: boolean | null;
+  duration_sec?: number | null;
 }

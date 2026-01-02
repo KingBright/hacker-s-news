@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
-use rss::Channel;
 use crate::core::config::Config;
 use crate::core::llm::LlmClient;
 use crate::core::tts::TtsClient;
@@ -328,14 +327,26 @@ async fn fetch_rss_items(url: &str) -> Result<Vec<RssItem>> {
         .build()?;
         
     let content = client.get(url).send().await?.bytes().await?;
-    let channel = Channel::read_from(&content[..])?;
+    let cursor = std::io::Cursor::new(content);
+    let feed = feed_rs::parser::parse(cursor)?;
     
-    let items = channel.items().iter().map(|item| {
+    let items = feed.entries.into_iter().map(|entry| {
+        let title = entry.title.map(|t| t.content).unwrap_or_default();
+        let link = entry.links.first().map(|l| l.href.clone()).unwrap_or_default();
+        
+        // Try summary first, then content body
+        let description = entry.summary
+            .map(|s| s.content)
+            .or_else(|| entry.content.and_then(|c| c.body))
+            .unwrap_or_default();
+
+        let pub_date = entry.published.map(|d| d.to_rfc3339());
+
         RssItem {
-            title: item.title().unwrap_or("").to_string(),
-            link: item.link().unwrap_or("").to_string(),
-            description: item.description().unwrap_or("").to_string(),
-            pub_date: item.pub_date().map(|s| s.to_string()),
+            title,
+            link,
+            description,
+            pub_date,
         }
     }).filter(|i| !i.link.is_empty())
     .collect();

@@ -372,10 +372,12 @@ export default function Home() {
                         <span className="material-symbols-outlined text-[14px]">schedule</span>
                         {item.publish_time ? new Date(item.publish_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Now'}
                       </div>
-                      <div className="flex items-center gap-1.5 text-xs font-medium text-[#93c8a8] bg-black/20 px-2 py-0.5 rounded-md">
-                        <span className="material-symbols-outlined text-[14px]">graphic_eq</span>
-                        <span>01:30</span> {/* Placeholder for duration */}
-                      </div>
+                      {item.duration_sec ? (
+                        <div className="flex items-center gap-1.5 text-xs font-medium text-[#93c8a8] bg-black/20 px-2 py-0.5 rounded-md">
+                          <span className="material-symbols-outlined text-[14px]">graphic_eq</span>
+                          <span>{formatTime(item.duration_sec)}</span>
+                        </div>
+                      ) : null}
                     </div>
                   </div>
                   <div className="shrink-0">

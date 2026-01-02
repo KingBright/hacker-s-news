@@ -15,7 +15,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
-rss = "2.0"
+feed-rs = "1.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 futures = "0.3"
@@ -33,4 +33,9 @@ candle-transformers = { version = "0.9.1" }
 tts = { path = "../../tts" }
 
 [features]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "tts/metal"]
+metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+    "tts/metal",
+]
