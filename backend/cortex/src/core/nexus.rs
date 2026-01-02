@@ -17,6 +17,7 @@ pub struct ItemPayload {
     pub cover_image_url: Option<String>,
     pub audio_url: Option<String>,
     pub publish_time: Option<i64>,
+    pub duration_sec: Option<i64>,
 }
 
 impl NexusClient {

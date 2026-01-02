@@ -46,6 +46,7 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN rating INTEGER").execute(&pool).await;
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN tags TEXT").execute(&pool).await;
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN is_deleted BOOLEAN DEFAULT 0").execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE items ADD COLUMN duration_sec INTEGER").execute(&pool).await;
 
     Ok(pool)
 }

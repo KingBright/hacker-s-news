@@ -12,7 +12,7 @@ impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
         Self {
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(180))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             config,

@@ -299,14 +299,6 @@ export default function Home() {
                 <h2 className="text-3xl font-bold text-white tracking-tight leading-none">Good Morning</h2>
               </div>
               <div className="flex items-center gap-3">
-                <button
-                  onClick={() => fetchItems(1, true)}
-                  disabled={isLoading}
-                  className="h-10 w-10 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white transition-colors active:scale-95 disabled:opacity-50"
-                  title="Refresh Feed"
-                >
-                  <span className={`material-symbols-outlined ${isLoading ? 'animate-spin' : ''}`}>refresh</span>
-                </button>
                 {weather && <span className="text-white text-2xl font-bold tracking-tighter">{weather.temp}°</span>}
                 <div className="h-10 w-10 rounded-full bg-primary/20 flex items-center justify-center text-primary">
                   <span className="material-symbols-outlined">{weather ? getWeatherIcon(weather.code) : 'wb_sunny'}</span>
@@ -320,6 +312,14 @@ export default function Home() {
                   <span className="text-lg font-bold text-white leading-tight">Fresh stories</span>
                   <span className="text-sm font-medium text-white/70">Tailored for you</span>
                 </div>
+                <button
+                  onClick={() => fetchItems(1, true)}
+                  disabled={isLoading}
+                  className="h-10 w-10 ml-2 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white transition-colors active:scale-95 disabled:opacity-50"
+                  title="Refresh Feed"
+                >
+                  <span className={`material-symbols-outlined ${isLoading ? 'animate-spin' : ''}`}>refresh</span>
+                </button>
               </div>
               <div className="flex items-center justify-between text-sm text-[#93c8a8]">
                 <span className="flex items-center gap-1.5">

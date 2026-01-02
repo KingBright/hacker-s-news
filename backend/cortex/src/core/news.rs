@@ -6,6 +6,7 @@ use crate::core::config::Config;
 use crate::core::llm::LlmClient;
 use crate::core::tts::TtsClient;
 use crate::core::nexus::{NexusClient, ItemPayload};
+use regex::Regex;
 
 pub async fn run_news_loop(
     config: Config,
@@ -136,18 +137,16 @@ async fn process_category(
     // We want ONE manuscript for the category.
     // Construct prompt with limits to avoid context overflow
     let mut context = String::new();
-    let max_items = 10;
+    let max_items = 20;
     let max_chars_per_item = 500;
     let max_total_chars = 8000;
 
     let items_to_process: Vec<_> = new_items.iter().take(max_items).collect();
     
     for (idx, item) in items_to_process.iter().enumerate() {
-        let description = if item.description.len() > max_chars_per_item {
-            format!("{}...", &item.description[..max_chars_per_item])
-        } else {
-            item.description.clone()
-        };
+        let description = clean_text(&item.description, max_chars_per_item);
+        
+        // ...
         
         let item_text = format!("{}. Title: {}\nLink: {}\nContent: {}\n\n", idx + 1, item.title, item.link, description);
         
@@ -193,7 +192,9 @@ async fn process_category(
             // Construct fallback
             let mut fallback = format!("听众朋友们大家好，这里是FreshLoop。由于智能服务暂时不可用，以下是{}的新闻简报。\n\n", date_str);
             for (idx, item) in items_to_process.iter().enumerate() {
-                fallback.push_str(&format!("第{}条：{}\n{}\n\n", idx + 1, item.title, item.description));
+                // Strip HTML and truncate for fallback too
+                let clean_desc = clean_text(&item.description, 200);
+                fallback.push_str(&format!("第{}条：{}\n{}\n\n", idx + 1, item.title, clean_desc));
             }
             fallback.push_str("播报结束，谢谢大家。");
             fallback
@@ -252,6 +253,15 @@ async fn process_category(
     }
 
     // 5. Push summary item to Nexus
+    // 5. Push summary item to Nexus
+    let duration_sec = if !audio_data.is_empty() {
+        // Assume 24kHz, 16-bit, Mono
+        // Bytes per second = 24000 * 2 bytes * 1 channel = 48000
+        Some((audio_data.len() as f64 / 48000.0) as i64)
+    } else {
+        None
+    };
+
     let payload = ItemPayload {
         title: format!("{} Update - {}", category_config.category, date_str),
         summary: Some(summary.clone()),
@@ -259,6 +269,7 @@ async fn process_category(
         cover_image_url: None,
         audio_url,
         publish_time: Some(chrono::Utc::now().timestamp()),
+        duration_sec,
     };
 
     if let Err(e) = nexus.push_item(payload.clone()).await {
@@ -271,8 +282,7 @@ async fn process_category(
     }
 
     // 6. Mark items as seen
-    // 6. Mark items as seen
-    for item in new_items {
+    for item in items_to_process {
         if let Err(e) = nexus.mark_url(&item.link, &category_config.category).await {
             log::warn!("Failed to mark url {}: {}. Enqueuing retry.", item.link, e);
             let _ = retry.enqueue(crate::core::retry::RetryAction::MarkUrl {
@@ -283,6 +293,25 @@ async fn process_category(
     }
 
     Ok(())
+}
+
+fn clean_text(input: &str, max_chars: usize) -> String {
+    // 1. Strip HTML tags
+    let re = Regex::new(r"<[^>]*>").unwrap();
+    let no_html = re.replace_all(input, " ");
+    
+    // 2. Collapse whitespace
+    let re_space = Regex::new(r"\s+").unwrap();
+    let clean = re_space.replace_all(&no_html, " ");
+    
+    // 3. Truncate
+    if clean.chars().count() > max_chars {
+        let mut s: String = clean.chars().take(max_chars).collect();
+        s.push_str("...");
+        s
+    } else {
+        clean.to_string()
+    }
 }
 
 struct RssItem {

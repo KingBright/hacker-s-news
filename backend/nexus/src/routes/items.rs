@@ -22,6 +22,7 @@ pub struct Item {
     pub rating: Option<i32>,
     pub tags: Option<String>,
     pub is_deleted: Option<bool>,
+    pub duration_sec: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -32,6 +33,7 @@ pub struct CreateItemRequest {
     pub cover_image_url: Option<String>,
     pub audio_url: Option<String>,
     pub publish_time: Option<i64>,
+    pub duration_sec: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -77,8 +79,8 @@ pub async fn create_item(
 
     let result = sqlx::query(
         r#"
-        INSERT INTO items (id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO items (id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at, duration_sec)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&id)
@@ -89,6 +91,7 @@ pub async fn create_item(
     .bind(&payload.audio_url)
     .bind(payload.publish_time)
     .bind(created_at)
+    .bind(payload.duration_sec)
     .execute(&state.db)
     .await;
 
