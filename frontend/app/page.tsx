@@ -41,6 +41,7 @@ export default function Home() {
   const [initialized, setInitialized] = useState(false);
   const [resumeTime, setResumeTime] = useState<number | null>(null);
   const [showPlaylist, setShowPlaylist] = useState(false);
+  const [showTranscript, setShowTranscript] = useState(false);
 
   // Load persistence
   useEffect(() => {
@@ -466,17 +467,21 @@ export default function Home() {
               </p>
             </div>
 
-            <div className="flex items-center gap-1">
-              <button onClick={() => setShowPlaylist(true)} className="text-white/60 hover:text-white p-2 rounded-full transition-colors">
-                <span className="material-symbols-outlined text-[26px]">queue_music</span>
+            <div className="flex items-center gap-0.5">
+              <button
+                onClick={() => setShowTranscript(true)}
+                className="text-white/60 hover:text-white p-1.5 rounded-full transition-colors"
+                title="Read Transcript"
+              >
+                <span className="material-symbols-outlined text-[24px]">article</span>
               </button>
-              <button onClick={togglePlay} className="text-white hover:text-primary p-2 rounded-full transition-colors">
-                <span className="material-symbols-outlined text-[28px] filled">
+              <button onClick={() => setShowPlaylist(true)} className="text-white/60 hover:text-white p-1.5 rounded-full transition-colors">
+                <span className="material-symbols-outlined text-[24px]">queue_music</span>
+              </button>
+              <button onClick={togglePlay} className="text-white hover:text-primary p-1 rounded-full transition-colors">
+                <span className="material-symbols-outlined text-[32px] filled">
                   {isPlaying ? 'pause_circle' : 'play_circle'}
                 </span>
-              </button>
-              <button onClick={playNext} className="text-white/60 hover:text-white p-2 rounded-full transition-colors">
-                <span className="material-symbols-outlined text-[26px]">skip_next</span>
               </button>
             </div>
           </div>
@@ -487,14 +492,30 @@ export default function Home() {
       {showPlaylist && (
         <div className="fixed inset-0 z-50 flex flex-col items-center justify-end sm:justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
           <div className="w-full max-w-md bg-surface-dark rounded-3xl shadow-2xl ring-1 ring-white/10 max-h-[80vh] flex flex-col animate-in slide-in-from-bottom-10 duration-200">
-            <div className="flex items-center justify-between p-4 border-b border-white/5 shrink-0">
-              <h3 className="text-lg font-bold text-white pl-2">Play Queue</h3>
-              <button
-                onClick={() => setShowPlaylist(false)}
-                className="p-2 rounded-full hover:bg-white/10 text-white/60 hover:text-white transition-colors"
-              >
-                <span className="material-symbols-outlined">close</span>
-              </button>
+            <div className="flex flex-col p-4 border-b border-white/5 shrink-0 bg-surface-dark/95 backdrop-blur z-10 rounded-t-3xl gap-2">
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-bold text-white pl-2">Play Queue</h3>
+                <button
+                  onClick={() => setShowPlaylist(false)}
+                  className="p-2 rounded-full hover:bg-white/10 text-white/60 hover:text-white transition-colors"
+                >
+                  <span className="material-symbols-outlined">close</span>
+                </button>
+              </div>
+
+              <div className="flex items-center justify-center gap-4 pb-1">
+                <button onClick={playPrev} className="text-white/60 hover:text-white transition-colors p-2">
+                  <span className="material-symbols-outlined text-[32px]">skip_previous</span>
+                </button>
+                <button onClick={togglePlay} className="text-white hover:text-primary transition-colors p-1 rounded-full">
+                  <span className="material-symbols-outlined text-[48px] filled">
+                    {isPlaying ? 'pause_circle' : 'play_circle'}
+                  </span>
+                </button>
+                <button onClick={playNext} className="text-white/60 hover:text-white transition-colors p-2">
+                  <span className="material-symbols-outlined text-[32px]">skip_next</span>
+                </button>
+              </div>
             </div>
 
             <div className="overflow-y-auto p-2 space-y-1">
@@ -529,6 +550,48 @@ export default function Home() {
                 <div className="py-8 text-center text-white/30 text-sm">queue is empty</div>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Transcript Overlay */}
+      {showTranscript && currentItem && (
+        <div className="fixed inset-0 z-50 flex flex-col items-center justify-end sm:justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+          <div className="w-full max-w-2xl bg-surface-dark rounded-3xl shadow-2xl ring-1 ring-white/10 max-h-[80vh] flex flex-col animate-in slide-in-from-bottom-10 duration-200">
+            <div className="flex items-center justify-between p-6 border-b border-white/5 shrink-0 bg-surface-dark/50 z-10 rounded-t-3xl">
+              <div className="pr-4">
+                <p className="text-[#93c8a8] text-xs font-bold uppercase tracking-wider mb-2">Transcript</p>
+                <h3 className="text-xl font-bold text-white leading-tight">{currentItem.title}</h3>
+              </div>
+              <button
+                onClick={() => setShowTranscript(false)}
+                className="p-2 rounded-full hover:bg-white/10 text-white/60 hover:text-white transition-colors shrink-0"
+              >
+                <span className="material-symbols-outlined">close</span>
+              </button>
+            </div>
+
+            <div className="overflow-y-auto p-6 text-white/90">
+              {currentItem.summary ? (
+                <div className="prose prose-invert prose-lg max-w-none">
+                  <p className="whitespace-pre-wrap font-serif leading-relaxed text-[1.1rem]">
+                    {currentItem.summary}
+                  </p>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center py-20 text-white/30 text-center">
+                  <span className="material-symbols-outlined text-4xl mb-4 opacity-50">description</span>
+                  <p>No transcript available for this story.</p>
+                </div>
+              )}
+            </div>
+            {currentItem.original_url && (
+              <div className="p-4 border-t border-white/5 shrink-0 bg-surface-dark/50 rounded-b-3xl">
+                <a href={currentItem.original_url} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 text-primary hover:text-primary/80 transition-colors text-sm font-bold py-2 bg-primary/10 hover:bg-primary/20 rounded-xl">
+                  Read full article <span className="material-symbols-outlined text-[18px]">open_in_new</span>
+                </a>
+              </div>
+            )}
           </div>
         </div>
       )}
