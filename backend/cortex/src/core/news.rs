@@ -254,9 +254,20 @@ async fn process_category(
     // 5. Push summary item to Nexus
     // 5. Push summary item to Nexus
     let duration_sec = if !audio_data.is_empty() {
-        // Assume 24kHz, 16-bit, Mono
-        // Bytes per second = 24000 * 2 bytes * 1 channel = 48000
-        Some((audio_data.len() as f64 / 48000.0) as i64)
+        let cursor = std::io::Cursor::new(&audio_data);
+        match hound::WavReader::new(cursor) {
+            Ok(reader) => {
+                let spec = reader.spec();
+                let duration = reader.duration();
+                let seconds = duration as f64 / spec.sample_rate as f64;
+                Some(seconds as i64)
+            },
+            Err(e) => {
+                log::warn!("Failed to parse WAV duration: {}. Defaulting to estimation.", e);
+                // Fallback estimation (16kHz 16-bit mono)
+                Some((audio_data.len() as f64 / 32000.0) as i64)
+            }
+        }
     } else {
         None
     };

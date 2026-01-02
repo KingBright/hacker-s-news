@@ -26,6 +26,7 @@ anyhow = "1"
 html2text = "0.16"
 regex = "1.10"
 sled = "0.34"
+hound = "3.5"
 
 candle-core = { version = "0.9.1" }
 candle-nn = { version = "0.9.1" }

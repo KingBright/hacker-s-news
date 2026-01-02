@@ -808,6 +808,7 @@ dependencies = [
  "env_logger",
  "feed-rs",
  "futures",
+ "hound",
  "html2text",
  "log",
  "regex",
