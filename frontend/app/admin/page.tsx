@@ -68,8 +68,27 @@ export default function AdminPage() {
                 setItems(items.filter(i => i.id !== id));
             }
 
-        } catch (err) {
+        } catch (err: any) {
             alert('Failed to update item: ' + err);
+        }
+    };
+
+    const handleRegenerate = async (id: string) => {
+        if (!confirm('Regenerate audio for this item? This will overwrite the current files.')) return;
+
+        try {
+            const res = await fetch(`/api/admin/items/${id}/regenerate`, {
+                method: 'POST',
+                headers: {
+                    'X-NEXUS-KEY': password
+                }
+            });
+
+            if (!res.ok) throw new Error('Regeneration request failed');
+
+            alert('Regeneration started. Please allow a few minutes for processing.');
+        } catch (err) {
+            alert('Failed to start regeneration: ' + err);
         }
     };
 
@@ -183,8 +202,8 @@ export default function AdminPage() {
                                                             key={star}
                                                             onClick={() => updateItem(item.id, { rating: star })}
                                                             className={`w-5 h-5 transition-all duration-200 ${(item.rating || 0) >= star
-                                                                    ? 'text-yellow-400 scale-110 drop-shadow-sm'
-                                                                    : 'text-slate-300 dark:text-white/10 hover:text-slate-400 dark:hover:text-white/30'
+                                                                ? 'text-yellow-400 scale-110 drop-shadow-sm'
+                                                                : 'text-slate-300 dark:text-white/10 hover:text-slate-400 dark:hover:text-white/30'
                                                                 }`}
                                                         >
                                                             ★
@@ -206,6 +225,13 @@ export default function AdminPage() {
                                                 />
                                             </td>
                                             <td className="p-5 align-top text-center">
+                                                <button
+                                                    onClick={() => handleRegenerate(item.id)}
+                                                    className="text-slate-400 dark:text-white/20 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 p-2.5 rounded-full transition-all mr-1"
+                                                    title="Regenerate"
+                                                >
+                                                    <span className="material-symbols-outlined text-[20px]">refresh</span>
+                                                </button>
                                                 <button
                                                     onClick={() => {
                                                         if (confirm('Are you sure you want to delete this item?')) {

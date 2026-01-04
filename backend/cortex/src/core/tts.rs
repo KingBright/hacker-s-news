@@ -105,18 +105,19 @@ impl TtsClient {
             chunks.push(current_chunk);
         }
 
-        // Concatenate all chunks
-        // Best way: collect all tensors then concat? Or all samples.
-        // Since we are inside async function and iterating, collecting samples is easier.
+        // Concatenate all chunks with Cross-Fade
         let mut all_samples: Vec<f32> = Vec::new();
+        // Variables moved inside loop for dynamic calculation based on model sample rate
 
         for (idx, chunk) in chunks.iter().enumerate() {
             if chunk.trim().is_empty() { continue; }
             
             log::info!("Generating audio for chunk {}/{}: {}...", idx+1, chunks.len(), &chunk.chars().take(20).collect::<String>());
             
-            // Lock the model for each inference
             let mut model = model_mutex.lock().map_err(|e| anyhow::anyhow!("Model lock failed: {}", e))?;
+            
+            // Get sample rate dynamically from the model
+            let sample_rate = model.sample_rate();
 
             // Parameters
             let prompt_text = vox_config.prompt_text.clone();
@@ -135,20 +136,46 @@ impl TtsClient {
             )?;
             log::info!("Chunk {} generated in {:.2?}", idx+1, start.elapsed());
             
-            // Convert tensor to samples immediately
-            let samples = audio_tensor.flatten_all()?.to_vec1::<f32>()?;
-            all_samples.extend(samples);
+            let new_samples = audio_tensor.flatten_all()?.to_vec1::<f32>()?;
             
-            // Add silence (0.5s)
-            let silence_samples = (16000.0 * 0.5) as usize;
-            all_samples.extend(vec![0.0f32; silence_samples]);
+             if all_samples.is_empty() {
+                all_samples.extend(new_samples);
+            } else {
+                // Cross-fade logic:
+                // Blend end of all_samples with start of new_samples
+                let crossfade_duration = 0.05; // 50ms overlap
+                let crossfade_samples = (sample_rate as f64 * crossfade_duration) as usize;
+                
+                let overlap_len = std::cmp::min(all_samples.len(), crossfade_samples);
+                let overlap_len = std::cmp::min(overlap_len, new_samples.len());
+
+                let start_idx = all_samples.len() - overlap_len;
+                for i in 0..overlap_len {
+                    let fade_out = 1.0 - (i as f32 / overlap_len as f32);
+                    let fade_in = i as f32 / overlap_len as f32;
+                    let old_val = all_samples[start_idx + i];
+                    let new_val = new_samples[i];
+                    all_samples[start_idx + i] = old_val * fade_out + new_val * fade_in;
+                }
+                
+                if new_samples.len() > overlap_len {
+                    all_samples.extend(&new_samples[overlap_len..]);
+                }
+            }
         }
 
         // Convert all samples back to tensor for wav conversion
         // Reshape to (1, N) as get_audio_wav_u8 expects [Channels, Samples]
         let combined_tensor = candle_core::Tensor::from_vec(all_samples.clone(), (1, all_samples.len()), &Device::Cpu)?;
-        let sample_rate = 16000;
-        let wav_bytes = get_audio_wav_u8(&combined_tensor, sample_rate)?;
+        
+        // Use the sample rate from the last model interaction (should be consistent)
+        // We need to unlock or just get it again. Since we are in a loop above, we can just grab it briefly.
+        let sample_rate = {
+             let model = model_mutex.lock().map_err(|e| anyhow::anyhow!("Model lock failed: {}", e))?;
+             model.sample_rate()
+        };
+        
+        let wav_bytes = get_audio_wav_u8(&combined_tensor, sample_rate as u32)?;
         
         Ok(wav_bytes)
     }

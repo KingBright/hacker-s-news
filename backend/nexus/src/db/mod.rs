@@ -28,7 +28,8 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
             created_at INTEGER,
             rating INTEGER,
             tags TEXT,
-            is_deleted BOOLEAN DEFAULT 0
+            is_deleted BOOLEAN DEFAULT 0,
+            status TEXT DEFAULT 'published'
         );
         CREATE TABLE IF NOT EXISTS source_items (
             id TEXT PRIMARY KEY,
@@ -47,6 +48,7 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN tags TEXT").execute(&pool).await;
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN is_deleted BOOLEAN DEFAULT 0").execute(&pool).await;
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN duration_sec INTEGER").execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE items ADD COLUMN status TEXT DEFAULT 'published'").execute(&pool).await; // New status column
 
     Ok(pool)
 }

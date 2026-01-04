@@ -106,6 +106,51 @@ impl NexusClient {
         if !res.status().is_success() {
             return Err(anyhow!("Failed to mark url: {}", res.status()));
         }
+    pub async fn fetch_pending_jobs(&self) -> Result<Vec<ItemPayload>> {
+        let url = format!("{}/api/internal/items/pending", self.config.api_url);
+        let res = self.client.get(&url)
+            .header("X-NEXUS-KEY", &self.config.auth_key)
+            .send()
+            .await?;
+            
+        if !res.status().is_success() {
+             return Err(anyhow!("Failed to fetch pending jobs: {}", res.status()));
+        }
+
+        let items: Vec<serde_json::Value> = res.json().await?;
+        let payloads = items.into_iter().map(|v| {
+            ItemPayload {
+                 title: v["title"].as_str().unwrap_or_default().to_string(),
+                 summary: v["summary"].as_str().map(|s| s.to_string()),
+                 original_url: v["id"].as_str().map(|s| s.to_string()), // Using ID as carrier
+                 cover_image_url: v["cover_image_url"].as_str().map(|s| s.to_string()),
+                 audio_url: v["audio_url"].as_str().map(|s| s.to_string()),
+                 publish_time: v["publish_time"].as_i64(),
+                 duration_sec: v["duration_sec"].as_i64(),
+            }
+        }).collect();
+        
+        Ok(payloads)
+    }
+
+    pub async fn complete_job(&self, id: &str, audio_url: &str, summary: &str, duration_sec: Option<i64>) -> Result<()> {
+        let url = format!("{}/api/internal/items/{}/complete", self.config.api_url, id);
+        let payload = serde_json::json!({
+            "audio_url": audio_url,
+            "summary": summary,
+            "duration_sec": duration_sec,
+            "publish_time": chrono::Utc::now().timestamp()
+        });
+
+        let res = self.client.post(&url)
+            .header("X-NEXUS-KEY", &self.config.auth_key)
+            .json(&payload)
+            .send()
+            .await?;
+            
+        if !res.status().is_success() {
+            return Err(anyhow!("Failed to complete job: {}", res.status()));
+        }
         Ok(())
     }
 }

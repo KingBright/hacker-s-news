@@ -10,7 +10,7 @@ LOG_DIR="$HOME/.freshloop/logs"
 
 echo ">>> Building Cortex (Release)..."
 cd backend
-cargo build -p cortex --release
+cargo build -p cortex --release --features metal
 cd ..
 
 if [ ! -f "$BINARY_SOURCE" ]; then

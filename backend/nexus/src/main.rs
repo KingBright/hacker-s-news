@@ -53,10 +53,13 @@ async fn main() {
     let app = Router::new()
         .route("/api/items", get(routes::items::list_items))
         .route("/api/internal/items", post(routes::items::create_item))
+        .route("/api/internal/items/pending", get(routes::internal_api::list_pending_items))
+        .route("/api/internal/items/{id}/complete", post(routes::internal_api::complete_item))
         .route("/api/internal/upload", post(routes::upload::upload_audio))
         .route("/api/internal/dedup/check", post(routes::dedup::check_files))
         .route("/api/internal/dedup/mark", post(routes::dedup::mark_file))
         .route("/api/admin/items/{id}", axum::routing::patch(routes::admin::update_item))
+        .route("/api/admin/items/{id}/regenerate", post(routes::admin::regenerate_item))
         .route("/api/admin/export", get(routes::admin::export_items))
         .route("/admin", get(move || async move {
             match tokio::fs::read_to_string(&admin_index).await {

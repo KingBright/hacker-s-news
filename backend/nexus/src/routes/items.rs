@@ -23,6 +23,7 @@ pub struct Item {
     pub tags: Option<String>,
     pub is_deleted: Option<bool>,
     pub duration_sec: Option<i64>,
+    pub status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -50,7 +51,7 @@ pub async fn list_items(
     let offset = (pagination.page.unwrap_or(1) - 1) * limit;
 
     let items = sqlx::query_as::<_, Item>(
-        "SELECT * FROM items WHERE is_deleted = 0 OR is_deleted IS NULL ORDER BY publish_time DESC LIMIT ? OFFSET ?",
+        "SELECT id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at, rating, tags, is_deleted, duration_sec, status FROM items WHERE is_deleted = 0 OR is_deleted IS NULL ORDER BY publish_time DESC LIMIT ? OFFSET ?",
     )
     .bind(limit)
     .bind(offset)

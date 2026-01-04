@@ -90,3 +90,25 @@ pub async fn export_items(
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
+
+pub async fn regenerate_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // Check Auth
+    let api_key = headers.get("X-NEXUS-KEY").and_then(|v| v.to_str().ok());
+    if api_key != Some(&state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "Invalid API Key").into_response();
+    }
+
+    let result = sqlx::query("UPDATE items SET status = 'pending_regen' WHERE id = ?")
+        .bind(id)
+        .execute(&state.db)
+        .await;
+
+    match result {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
