@@ -9,7 +9,34 @@ use cortex::core::nexus::{NexusClient, ItemPayload};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    // Custom Logger to split stdout/stderr
+    struct SplitLogger;
+
+    impl log::Log for SplitLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%SZ");
+                let msg = format!("[{}] [{}] [{}] {}", timestamp, record.level(), record.target(), record.args());
+                
+                // Error and Warn go to stderr (cortex.err.log)
+                // Info and below go to stdout (cortex.out.log)
+                if record.level() <= log::Level::Warn {
+                    eprintln!("{}", msg);
+                } else {
+                    println!("{}", msg);
+                }
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    log::set_boxed_logger(Box::new(SplitLogger)).unwrap();
+    log::set_max_level(log::LevelFilter::Info);
 
     // Load Config
     // In a real app, path might be an argument

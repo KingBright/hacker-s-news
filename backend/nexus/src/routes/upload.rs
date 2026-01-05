@@ -31,35 +31,34 @@ pub async fn upload_audio(
                     let sanitized_file_name = Path::new(&file_name)
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .unwrap_or("audio.mp3");
+                        .unwrap_or("audio.mp3")
+                        .to_string();
 
-                    // let id = Uuid::new_v4();
-                    // let new_filename = format!("{}-{}", id, sanitized_file_name);
-                    let new_filename = sanitized_file_name.to_string();
-                    let filepath = Path::new(&state.audio_dir).join(&new_filename);
+                    let filepath = Path::new(&state.audio_dir).join(&sanitized_file_name);
+                    
+                    // Create file for streaming
+                    let mut file = match fs::File::create(&filepath).await {
+                        Ok(f) => f,
+                        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create file: {}", e)).into_response(),
+                    };
 
-                    let data_res = field.bytes().await;
-                    match data_res {
-                        Ok(data) => {
-                             if let Err(e) = fs::write(&filepath, data).await {
-                                return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save file: {}", e)).into_response();
-                            }
-
-                            return Json(json!({
-                                "url": format!("/audio/{}", new_filename),
-                                "filename": new_filename
-                            })).into_response();
-                        },
-                        Err(e) => {
-                            return (StatusCode::BAD_REQUEST, format!("Failed to read file data: {}", e)).into_response();
-                        }
+                    // Stream chunks directly to file
+                    let mut field = field; // make mutable
+                    while let Ok(Some(chunk)) = field.chunk().await {
+                         // use tokio::io::AsyncWriteExt;
+                         if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
+                             return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write chunk: {}", e)).into_response();
+                         }
                     }
+
+                    return Json(json!({
+                        "url": format!("/audio/{}", sanitized_file_name),
+                        "filename": sanitized_file_name
+                    })).into_response();
                 }
             },
-            Ok(None) => break, // No more fields
-            Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response();
-            }
+            Ok(None) => break, 
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response(),
         }
     }
 

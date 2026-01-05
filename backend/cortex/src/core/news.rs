@@ -445,6 +445,39 @@ async fn generate_and_broadcast(
         else if hour < 18 { "下午" }
         else if hour < 21 { "晚上" }
         else { "深夜" };
+
+    // Holiday Detection
+    let today_solar = now.format("%m-%d").to_string();
+    let lunar = chinese_lunisolar_calendar::LunisolarDate::from_date(chinese_lunisolar_calendar::SolarDate::from_year_month_day(now.year() as u16, now.month() as u16, now.day() as u16).unwrap()).unwrap();
+    let lunar_str = format!("{}.{}", lunar.month.to_string(), lunar.day.to_string());
+    
+    let mut holiday_greeting = String::new();
+    
+    // Solar Holidays
+    match today_solar.as_str() {
+        "01-01" => holiday_greeting.push_str("今天是元旦节，"),
+        "05-01" => holiday_greeting.push_str("今天是劳动节，"),
+        "10-01" => holiday_greeting.push_str("今天是国庆节，"),
+        _ => {}
+    }
+
+    // Lunar Holidays (Approximate matching logic)
+    // 1.1 Spring Festival
+    if lunar.month.to_u8() == 1 && lunar.day.to_u8() == 1 { holiday_greeting.push_str("今天是农历正月初一，春节快乐！"); }
+    // 1.15 Lantern
+    if lunar.month.to_u8() == 1 && lunar.day.to_u8() == 15 { holiday_greeting.push_str("今天是元宵节，"); }
+    // 5.5 Dragon Boat
+    if lunar.month.to_u8() == 5 && lunar.day.to_u8() == 5 { holiday_greeting.push_str("今天是端午节，"); }
+    // 8.15 Mid-Autumn
+    if lunar.month.to_u8() == 8 && lunar.day.to_u8() == 15 { holiday_greeting.push_str("今天是中秋节，"); }
+    // 12.30 (Eve? Need accurate last day calculation, simplified for now)
+    
+    let extra_context = if !holiday_greeting.is_empty() {
+        format!("特别提示：{} 请在开场问候中自然融入节日祝福。", holiday_greeting)
+    } else {
+        String::new()
+    };
+
     
     let prompt = format!(
         "请为'{}'类别的新闻生成一份详尽深入的中文口播新闻稿。\
@@ -453,12 +486,13 @@ async fn generate_and_broadcast(
         \n1. 详尽报道：基于提供的摘要，整合成连贯的报道。\
         \n2. 逻辑串联：使用自然流畅的过渡词。\
         \n3. 口语风格：适合TTS语音播报，禁止使用任何格式符号如星号、下划线等。\
-        \n4. 动态开场：根据时间设计亲切的问候语（如'大家{}好'），结合是否是周末/节假日等，然后自然引入'欢迎收听FreshLoop {}版块，我是{}'。\
+        \n4. 动态开场：根据时间设计亲切的问候语。可以报时，但必须符合自然口语语法。推荐格式：'今天是X月X日星期X'，或'现在是星期X的晚上'。**禁止**出现'今天是晚上'这种病句。\
         \n5. **禁止臆造**：**绝对不要**提及任何未提供的天气情况（如'天气晴朗'等）。\
         \n6. 动态结尾：根据时间设计温暖的结束语，最后说'我是{}，感谢您收听FreshLoop'。\
         \n7. 绝对纯净输出：只输出新闻稿纯文本内容，禁止使用Markdown格式。\
+        \n{}\
         \n\n新闻素材摘要：\n{}",
-        category, weekday, time_period, time_period, category, host_name, host_name, context_content
+        category, weekday, time_period, extra_context, host_name, context_content
     );
 
     log::info!("Generating script for {} (Host: {})", category, host_name);

@@ -691,7 +691,10 @@ export default function Home() {
 
             <div className="flex items-center gap-0.5">
               <button
-                onClick={() => setShowTranscript(true)}
+                onClick={() => {
+                  setTranscriptItemId(currentId);
+                  setShowTranscript(true);
+                }}
                 className="text-white/60 hover:text-white p-1.5 rounded-full transition-colors"
                 title="Read Transcript"
               >
@@ -745,7 +748,10 @@ export default function Home() {
                 <div className="flex items-center justify-center gap-4">
                   {/* Article / Transcript */}
                   <button
-                    onClick={() => setShowTranscript(true)}
+                    onClick={() => {
+                      setTranscriptItemId(currentId);
+                      setShowTranscript(true);
+                    }}
                     className="text-white/40 hover:text-white transition-colors p-2"
                     title="View Transcript"
                   >

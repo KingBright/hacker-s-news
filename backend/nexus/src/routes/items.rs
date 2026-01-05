@@ -120,6 +120,17 @@ pub async fn create_item(
                 .bind(created_at)
                 .execute(&state.db)
                 .await;
+
+                // Also insert into source_items for DEDUPLICATION
+                let _ = sqlx::query(
+                    "INSERT OR IGNORE INTO source_items (id, url, category, created_at) VALUES (?, ?, ?, ?)"
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(&source.url)
+                .bind("imported")
+                .bind(created_at)
+                .execute(&state.db)
+                .await;
             }
         }
     }

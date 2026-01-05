@@ -28,6 +28,7 @@ html2md = "0.2"
 regex = "1.10"
 sled = "0.34"
 hound = "3.5"
+chinese-lunisolar-calendar = "0.2"
 
 candle-core = { version = "0.9.1" }
 candle-nn = { version = "0.9.1" }
