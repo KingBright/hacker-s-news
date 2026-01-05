@@ -1,45 +1,105 @@
-[nexus]
-api_url = "http://127.0.0.1:8899"
-auth_key = "my-secret-key-123"
+# ===========================================
+# ROOT-LEVEL CONFIG (must be before sections)
+# ===========================================
 
+# Refresh interval (if schedule_times is commented out or empty)
 interval_min = 60
-schedule_times = ["08:00", "12:00", "16:00"]
+
+# Fixed Schedule (Service will skip checks outside these times)
+schedule_times = [
+    "06:00",
+    "08:00",
+    "10:00",
+    "12:00",
+    "14:00",
+    "16:00",
+    "18:00",
+    "20:00",
+    "22:00",
+]
+
+# Classification Categories for LLM
+categories = [
+    "热点科技",
+    "工程技术",
+    "生命科学",
+    "科学",
+    "极客",
+    "数码",
+    "游戏影音",
+    "读书",
+    "文娱",
+    "财经",
+    "政治",
+    "探索",
+    "生活",
+    "广告",
+    "其他",
+]
+
+# RSS Feeds to monitor
+rss_feeds = [
+    # Tech
+    "https://www.solidot.org/index.rss",
+    "https://www.infoq.cn/feed",
+    "https://www.v2ex.com/index.xml",
+    "https://hackaday.com/feed/",
+    "https://www.technologyreview.com/feed/",
+    "https://36kr.com/feed",
+    # Add your feeds here...
+]
+
+# ===========================================
+# SECTIONS
+# ===========================================
+
+[nexus]
+# URL of your deployed Nexus backend (or local)
+api_url = "http://127.0.0.1:8899"
+# API Key must match server's NEXUS_KEY env var
+auth_key = "your-secret-api-key"
 
 [llm]
+# OpenAI-compatible LLM endpoint
 model = "nvidia/nemotron-3-nano"
-api_url = "http://localhost:1234/v1"
+api_url = "http://127.0.0.1:1234/v1"
 
 [tts]
 engine = "voxcpm"
 
 [tts.voxcpm]
-model_path = "/Users/jinliang/.aha/OpenBMB/VoxCPM-0.5B"
-prompt_text = "我最近在研究 AI Agent 的工作流，发现 F5-TTS 的效果真的非常 amazing。它可以 seamlessly 地在中文和 English 之间切换，听起来特别自然。"
-prompt_wav_path = "file:///Users/jinliang/workspace/hacker-s-news/audio/ref.wav"
+# Path to local VoxCPM model directory (required for aha)
+model_path = "/path/to/VoxCPM1.5"
+prompt_text = "我最近在研究 AI Agent 工作流，发现豆包 TTS 2.0 的效果真的非常 amazing。它可以 seamlessly 地在中文和 English 之间切换，听起来特别自然。"
+prompt_wav_path = "file:///path/to/ref.wav"
 
-[[news]]
-category = "Digital & Tech"
-urls = ["https://pandaily.com/feed/", "https://www.engadget.com/rss.xml"]
+# ===========================================
+# HOSTS (Array of Tables)
+# Each host handles specific categories with a unique voice
+# ===========================================
 
-[[news]]
-category = "AI & Frontier Tech"
-urls = [
-    "https://www.sciencedaily.com/rss/computers_math/artificial_intelligence.xml",
-    "https://www.sciencedaily.com/rss/computers_math/robotics.xml",
-    "https://www.sciencedaily.com/rss/earth_climate/renewable_energy.xml",
-]
+[[hosts]]
+name = "Vivian"
+# Voice file path (or model name if using other engines)
+voice = "file:///path/to/audio/vivian.wav"
+categories = ["热点科技", "工程技术", "生命科学", "科学", "极客"]
 
-[[news]]
-category = "Finance & Policy"
-urls = [
-    "https://www.cnbc.com/id/10000664/device/rss/rss.html",
-    "http://www.ftchinese.com/rss/news",
-]
+[[hosts]]
+name = "灿灿"
+voice = "file:///path/to/audio/cancan.wav"
+categories = ["数码", "游戏影音"]
 
-[[news]]
-category = "Gaming"
-urls = ["https://www.ign.com/rss/articles.xml"]
+[[hosts]]
+name = "小萌"
+voice = "file:///path/to/audio/meng.wav"
+categories = ["读书", "文娱"]
 
-[[news]]
-category = "Marathon & Sports"
-urls = ["https://rss.nytimes.com/services/xml/rss/nyt/Sports.xml"]
+[[hosts]]
+name = "小凡"
+voice = "file:///path/to/audio/xiaofan.wav"
+categories = ["财经", "政治"]
+
+[[hosts]]
+name = "小何"
+voice = "file:///path/to/audio/xiaohe.wav"
+categories = ["探索", "生活", "其他"]

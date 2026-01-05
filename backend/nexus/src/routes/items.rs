@@ -27,6 +27,13 @@ pub struct Item {
 }
 
 #[derive(Deserialize)]
+pub struct CreateSourceItem {
+    pub url: String,
+    pub title: String,
+    pub summary: String,
+}
+
+#[derive(Deserialize)]
 pub struct CreateItemRequest {
     pub title: String,
     pub summary: Option<String>,
@@ -35,6 +42,7 @@ pub struct CreateItemRequest {
     pub audio_url: Option<String>,
     pub publish_time: Option<i64>,
     pub duration_sec: Option<i64>,
+    pub sources: Option<Vec<CreateSourceItem>>,
 }
 
 #[derive(Deserialize)]
@@ -95,6 +103,26 @@ pub async fn create_item(
     .bind(payload.duration_sec)
     .execute(&state.db)
     .await;
+
+    // Insert sources if provided
+    if let Ok(_) = result {
+        if let Some(sources) = payload.sources {
+            for source in sources {
+                let source_id = Uuid::new_v4().to_string();
+                let _ = sqlx::query(
+                    "INSERT OR IGNORE INTO item_sources (id, item_id, source_url, source_title, source_summary, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+                )
+                .bind(&source_id)
+                .bind(&id)
+                .bind(&source.url)
+                .bind(&source.title)
+                .bind(&source.summary)
+                .bind(created_at)
+                .execute(&state.db)
+                .await;
+            }
+        }
+    }
 
     match result {
         Ok(_) => Json(json!({ "id": id })).into_response(),

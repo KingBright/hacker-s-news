@@ -52,6 +52,44 @@ export default function Home() {
   // Playlist and Transcript UI State
   const [showPlayed, setShowPlayed] = useState(false);
   const [transcriptItemId, setTranscriptItemId] = useState<string | null>(null);
+  const [queueIds, setQueueIds] = useState<string[]>([]);
+  // Debug State
+  const [showDebug, setShowDebug] = useState(false);
+  const [logs, setLogs] = useState<string[]>([]);
+
+  // Capture Logs
+  useEffect(() => {
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    const originalError = console.error;
+
+    const addLog = (type: string, args: any[]) => {
+      const msg = args.map(arg =>
+        typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
+      ).join(' ');
+      const time = new Date().toLocaleTimeString();
+      setLogs(prev => [...prev.slice(-99), `[${time}] [${type}] ${msg}`]);
+    };
+
+    console.log = (...args) => {
+      originalLog(...args);
+      addLog('LOG', args);
+    };
+    console.warn = (...args) => {
+      originalWarn(...args);
+      addLog('WARN', args);
+    };
+    console.error = (...args) => {
+      originalError(...args);
+      addLog('ERR', args);
+    };
+
+    return () => {
+      console.log = originalLog;
+      console.warn = originalWarn;
+      console.error = originalError;
+    };
+  }, []);
 
   // Load persistence
   useEffect(() => {
@@ -88,33 +126,17 @@ export default function Home() {
   // Save persistence (Resume State)
   useEffect(() => {
     if (!initialized || !currentId) return;
+    // Don't save if we are in the middle of a resume-seek operation (to avoid overwriting with 0)
+    if (resumeTime !== null) return;
+
     localStorage.setItem('freshloop_resume_id', currentId);
     // We save progress frequently or on meaningful change?
     // Let's save it in specific events or throttled.
     // For simplicity here, rely on progress state update (every ~200ms).
     localStorage.setItem('freshloop_resume_time', progress.toString());
-  }, [currentId, progress, initialized]);
+  }, [currentId, progress, initialized, resumeTime]);
 
-  // Sync Audio Src (Declarative)
-  useEffect(() => {
-    if (!currentId || items.length === 0) return;
-    const item = items.find(i => i.id === currentId);
-    if (item?.audio_url && audioRef.current) {
-      // Only update if changed to avoid reloading
-      const currentSrc = audioRef.current.src;
-      // Check if src matches (ignoring base if needed, but audio_url is absolute usually)
-      if (currentSrc !== item.audio_url && !currentSrc.endsWith(item.audio_url)) {
-        audioRef.current.src = item.audio_url;
-        // If we have a resume time for THIS item (could match resumption), trigger seek.
-        // But we only have global "last resume time".
-        // If we just loaded the page (resumeTime is set), seek.
-        if (resumeTime !== null) {
-          audioRef.current.currentTime = resumeTime;
-          setResumeTime(null); // Clear signal
-        }
-      }
-    }
-  }, [currentId, items]); // removed resumeTime dependency to avoid seek loops, handle inside
+
 
   // Audio ref
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -178,24 +200,38 @@ export default function Home() {
       const data = await res.json();
 
       if (isRefresh) {
+        // Items from API are New -> Old
+        // User wants Old -> New order for general flow
+        // Only add items that are NOT played
+        const initialQueue = data.map((i: Item) => i.id).reverse()
+          .filter((id: string) => !playedIds.has(id));
+
+        // If there's a current playing item, ensure it's in the queue
+        if (currentId && !playedIds.has(currentId) && !initialQueue.includes(currentId)) {
+          initialQueue.unshift(currentId);
+        }
+
+        setQueueIds(initialQueue);
+
         // Preserve currently playing item to avoid audio interruption
         setItems(prev => {
           const currentPlayingItem = prev.find(i => i.id === currentId);
           const newItems = data.filter((d: Item) => d.id !== currentId);
           if (currentPlayingItem) {
-            // Keep current item in its position or at front
             const currentInNew = data.find((d: Item) => d.id === currentId);
-            if (currentInNew) {
-              return data; // Current item is in new data, use as-is
-            } else {
-              return [currentPlayingItem, ...newItems]; // Prepend current item
-            }
+            if (currentInNew) return data;
+            return [currentPlayingItem, ...newItems];
           }
           return data;
         });
         setPage(1);
       } else {
-        // filter out potentially duplicate ids just in case
+        // Append new items to the END of the queue (since they are newer)
+        const newIds = data.map((i: Item) => i.id).reverse()
+          .filter((id: string) => !playedIds.has(id) && !queueIds.includes(id));
+
+        setQueueIds(prev => [...prev, ...newIds]);
+
         setItems(prev => {
           const newItems = data.filter((d: Item) => !prev.some(p => p.id === d.id));
           return [...prev, ...newItems];
@@ -208,11 +244,13 @@ export default function Home() {
     } finally {
       setIsLoading(false);
     }
-  }, [currentId]);
+  }, [currentId, playedIds, queueIds]);
 
   useEffect(() => {
-    fetchItems(1, true);
-  }, []);
+    if (initialized) {
+      fetchItems(1, true);
+    }
+  }, [initialized]);
 
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -259,96 +297,129 @@ export default function Home() {
   };
 
   // Audio Event Handlers
-  const togglePlay = () => {
-    if (audioRef.current) {
-      if (isPlaying) {
-        audioRef.current.pause();
-      } else {
-        audioRef.current.play();
-      }
-      setIsPlaying(!isPlaying);
+  // Sync audio element with state
+  // Master Audio Effect: Sync Src, Resume, and Play State
+  useEffect(() => {
+    if (!audioRef.current || !initialized) return;
+    if (!currentId || items.length === 0) return;
+
+    const item = items.find(i => i.id === currentId);
+    if (!item || !item.audio_url) return;
+
+    // 1. Sync Source
+    const currentSrc = audioRef.current.src;
+    // Use absolute URL comparison to be safe
+    const targetSrc = new URL(item.audio_url, window.location.href).href;
+    const srcChanged = currentSrc !== targetSrc;
+
+    if (srcChanged) {
+      audioRef.current.src = item.audio_url;
+      // Note: resumeTime seek will be handled by handleLoadedMetadata
+      // But we can also set it here if readyState > 0? Best to rely on metadata event.
+      audioRef.current.load();
     }
+
+    // 2. Sync Play/Pause State
+    if (isPlaying) {
+      audioRef.current.play().catch(e => {
+        console.warn("Playback failed or interrupted", e);
+      });
+    } else {
+      audioRef.current.pause();
+    }
+  }, [currentId, isPlaying, initialized, items]);
+
+  const togglePlay = () => {
+    setIsPlaying(!isPlaying);
   };
 
-  const playItem = useCallback((id: string, url: string) => {
-    // Mark as played
-    if (!playedIds.has(id)) {
-      const newPlayed = new Set(playedIds);
-      newPlayed.add(id);
-      setPlayedIds(newPlayed);
-    }
+  // Helper to mark item as read
+  const markAsPlayed = useCallback((id: string) => {
+    setPlayedIds(prev => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    setQueueIds(prev => prev.filter(qid => qid !== id));
 
+    // If we marked the CURRENT playing item as played manually, play the next one? 
+    // Usually user does this for items they don't want to hear.
     if (currentId === id) {
-      // Toggle play/pause for current item
-      if (audioRef.current) {
-        if (audioRef.current.paused) {
-          audioRef.current.play().catch(e => console.error("Play failed", e));
-        } else {
-          audioRef.current.pause();
-        }
-      }
-      return;
+      // if we are playing it, and user marks as read, maybe skip next?
+      // Let's defer to playNext logic.
     }
+  }, [currentId]);
 
-    setCurrentId(id);
-    if (audioRef.current) {
-      audioRef.current.src = url;
-      audioRef.current.play()
-        .then(() => setIsPlaying(true))
-        .catch(e => console.error("Play failed", e));
+  const playItem = useCallback((id: string, url: string) => {
+    if (currentId === id) {
+      setIsPlaying(!isPlaying);
+    } else {
+      // If it was played, re-add to queue at start
+      if (playedIds.has(id)) {
+        setPlayedIds(prev => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+        setQueueIds(prev => [id, ...prev.filter(qid => qid !== id)]);
+      } else if (!queueIds.includes(id)) {
+        // If not in queue (somehow?), add it
+        setQueueIds(prev => [id, ...prev]);
+      }
+
+      setCurrentId(id);
+      setIsPlaying(true);
     }
-  }, [playedIds, currentId]);
+  }, [currentId, isPlaying, playedIds, queueIds]);
 
   const playNext = useCallback(() => {
+    console.log("[AutoPlay] playNext triggered", { currentId, queueIds });
     if (!currentId) return;
-    const currentIndex = items.findIndex(i => i.id === currentId);
-    if (currentIndex === -1) return;
 
-    // Chronological Next = Newer = Lower Index (since list is New->Old)
-    // Find first unplayed item moving towards 0
-    for (let i = currentIndex - 1; i >= 0; i--) {
-      const item = items[i];
-      if (item.audio_url && !playedIds.has(item.id)) {
-        // Direct play without using playItem to avoid stale closure
-        const newPlayed = new Set(playedIds);
-        newPlayed.add(item.id);
-        setPlayedIds(newPlayed);
-        setCurrentId(item.id);
-        if (audioRef.current) {
-          audioRef.current.src = item.audio_url;
-          audioRef.current.play()
-            .then(() => setIsPlaying(true))
-            .catch(e => console.error("Play next failed", e));
-        }
-        return;
-      }
+    // 1. Mark FINISHED item as played
+    setPlayedIds(prev => {
+      const next = new Set(prev);
+      next.add(currentId);
+      return next;
+    });
+
+    // 2. Remove FINISHED item from queue
+    setQueueIds(prev => {
+      const nextQueue = prev.filter(id => id !== currentId);
+      return nextQueue;
+    });
+
+    // 3. Find next item ID to play from current queue state
+    const nextQueue = queueIds.filter(id => id !== currentId);
+
+    let nextId = null;
+    if (nextQueue.length > 0) {
+      nextId = nextQueue[0];
     }
-    // No more unplayed items
-    setIsPlaying(false);
-  }, [currentId, items, playedIds]);
+
+    if (nextId) {
+      console.log("[AutoPlay] Playing next:", nextId);
+      setCurrentId(nextId);
+      setIsPlaying(true);
+    } else {
+      console.log("[AutoPlay] Queue empty, stopping.");
+      setIsPlaying(false);
+    }
+  }, [currentId, queueIds]);
 
   const playPrev = useCallback(() => {
     if (!currentId) return;
-    const currentIndex = items.findIndex(i => i.id === currentId);
-    if (currentIndex === -1) return;
-
-    // Chronological Prev = Older = Higher Index
-    for (let i = currentIndex + 1; i < items.length; i++) {
-      const item = items[i];
-      if (item.audio_url) {
-        setCurrentId(item.id);
-        if (audioRef.current) {
-          audioRef.current.src = item.audio_url;
-          audioRef.current.play()
-            .then(() => setIsPlaying(true))
-            .catch(e => console.error("Play prev failed", e));
-        }
-        return;
-      }
+    const currentIndex = queueIds.indexOf(currentId);
+    if (currentIndex > 0) {
+      setCurrentId(queueIds[currentIndex - 1]);
+      setIsPlaying(true);
     }
-  }, [currentId, items]);
+  }, [currentId, queueIds]);
 
   const handleTimeUpdate = () => {
+    // Block updates if we are waiting to resume seeking, to prevent overwriting saved progress with 0
+    if (resumeTime !== null) return;
+
     if (audioRef.current && !isDragging) {
       setProgress(audioRef.current.currentTime);
     }
@@ -357,6 +428,47 @@ export default function Home() {
   const handleLoadedMetadata = () => {
     if (audioRef.current) {
       setDuration(audioRef.current.duration);
+      if (resumeTime !== null) {
+        audioRef.current.currentTime = resumeTime;
+        setResumeTime(null);
+      }
+    }
+  };
+
+  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const time = parseFloat(e.target.value);
+    if (audioRef.current) {
+      audioRef.current.currentTime = time;
+      setProgress(time);
+    }
+  };
+
+  const skipTime = (seconds: number) => {
+    if (audioRef.current) {
+      const newTime = audioRef.current.currentTime + seconds;
+      audioRef.current.currentTime = Math.max(0, Math.min(newTime, duration));
+      setProgress(audioRef.current.currentTime);
+    }
+  };
+
+  // Debug Trigger Logic
+  const debugClicks = useRef(0);
+  const lastDebugClick = useRef(0);
+  const handleDebugTrigger = () => {
+    const now = Date.now();
+    // Reset if too slow (more than 500ms between clicks)
+    if (now - lastDebugClick.current > 500) {
+      debugClicks.current = 0;
+    }
+
+    debugClicks.current += 1;
+    lastDebugClick.current = now;
+
+    if (debugClicks.current >= 5) {
+      setShowDebug(prev => !prev);
+      debugClicks.current = 0;
+      // Visual feedback?
+      if (navigator.vibrate) navigator.vibrate(50);
     }
   };
 
@@ -379,17 +491,25 @@ export default function Home() {
         ref={audioRef}
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
-        onEnded={playNext}
+        onEnded={() => {
+          console.log("[Audio] onEnded fired");
+          playNext();
+        }}
         onPlay={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}
         className="hidden"
+        autoPlay
+        playsInline
       />
 
       {/* Header */}
       <header className="sticky top-0 z-20 bg-background-dark/95 backdrop-blur-md px-4 pt-12 pb-4 border-b border-white/5">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-[28px] font-bold leading-none tracking-tight text-white">FreshLoop</h1>
+            <div className="flex items-center gap-2" onClick={handleDebugTrigger}>
+              <h1 className="text-[28px] font-bold leading-none tracking-tight text-white">FreshLoop</h1>
+              {showDebug && <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />}
+            </div>
             <p className="text-xs text-slate-500 dark:text-[#93c8a8] mt-1 font-medium tracking-wide uppercase">Audio Briefing • Zen Mode</p>
           </div>
         </div>
@@ -446,7 +566,7 @@ export default function Home() {
           </div>
 
           <div className="flex flex-col gap-3">
-            {items.map((item, index) => {
+            {items.filter(i => !playedIds.has(i.id)).map((item, index) => {
               const isActive = currentId === item.id;
               return (
                 <div
@@ -594,36 +714,76 @@ export default function Home() {
       {showPlaylist && (
         <div className="fixed inset-0 z-50 flex flex-col items-center justify-end sm:justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200" onClick={() => setShowPlaylist(false)}>
           <div className="w-full max-w-md bg-surface-dark rounded-3xl shadow-2xl ring-1 ring-white/10 max-h-[80vh] flex flex-col animate-in slide-in-from-bottom-10 duration-200 overscroll-contain" onClick={(e) => e.stopPropagation()}>
-            <div className="flex flex-col p-4 border-b border-white/5 shrink-0 bg-surface-dark/95 backdrop-blur z-10 rounded-t-3xl gap-2">
+            <div className="flex flex-col p-3 border-b border-white/5 shrink-0 bg-surface-dark/95 backdrop-blur z-10 rounded-t-3xl gap-1">
               <div className="flex items-center justify-between">
-                <h3 className="text-lg font-bold text-white pl-2">播放列表</h3>
+                <h3 className="text-lg font-bold text-white pl-1">播放列表</h3>
                 <button
                   onClick={() => setShowPlaylist(false)}
-                  className="p-2 rounded-full hover:bg-white/10 text-white/60 hover:text-white transition-colors"
+                  className="p-1.5 rounded-full hover:bg-white/10 text-white/60 hover:text-white transition-colors"
                 >
                   <span className="material-symbols-outlined">close</span>
                 </button>
               </div>
 
-              <div className="flex items-center justify-center gap-4 pb-1">
-                <button onClick={playPrev} className="text-white/60 hover:text-white transition-colors p-2">
-                  <span className="material-symbols-outlined text-[32px]">skip_previous</span>
-                </button>
-                <button onClick={togglePlay} className="text-white hover:text-primary transition-colors p-1 rounded-full">
-                  <span className="material-symbols-outlined text-[48px] filled">
-                    {isPlaying ? 'pause_circle' : 'play_circle'}
-                  </span>
-                </button>
-                <button onClick={playNext} className="text-white/60 hover:text-white transition-colors p-2">
-                  <span className="material-symbols-outlined text-[32px]">skip_next</span>
-                </button>
+              <div className="flex flex-col gap-2 pb-1">
+                {/* Progress Bar */}
+                <div className="flex flex-col gap-1 px-2">
+                  <input
+                    type="range"
+                    min="0"
+                    max={duration || 100}
+                    value={progress}
+                    onChange={handleSeek}
+                    className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-primary"
+                  />
+                  <div className="flex justify-between text-[10px] text-white/40 font-mono">
+                    <span>{formatTime(progress)}</span>
+                    <span>{formatTime(duration)}</span>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-center gap-4">
+                  {/* Article / Transcript */}
+                  <button
+                    onClick={() => setShowTranscript(true)}
+                    className="text-white/40 hover:text-white transition-colors p-2"
+                    title="View Transcript"
+                  >
+                    <span className="material-symbols-outlined text-[24px]">article</span>
+                  </button>
+
+                  {/* Rewind */}
+                  <button onClick={() => skipTime(-15)} className="text-white/40 hover:text-white transition-colors p-2">
+                    <span className="material-symbols-outlined text-[24px]">replay_10</span>
+                  </button>
+
+                  <button onClick={playPrev} className="text-white/60 hover:text-white transition-colors p-2">
+                    <span className="material-symbols-outlined text-[32px]">skip_previous</span>
+                  </button>
+                  <button onClick={togglePlay} className="text-white hover:text-primary transition-colors p-1 rounded-full">
+                    <span className="material-symbols-outlined text-[48px] filled">
+                      {isPlaying ? 'pause_circle' : 'play_circle'}
+                    </span>
+                  </button>
+                  <button onClick={playNext} className="text-white/60 hover:text-white transition-colors p-2">
+                    <span className="material-symbols-outlined text-[32px]">skip_next</span>
+                  </button>
+
+                  {/* Fast Forward */}
+                  <button onClick={() => skipTime(30)} className="text-white/40 hover:text-white transition-colors p-2">
+                    <span className="material-symbols-outlined text-[24px]">forward_30</span>
+                  </button>
+                </div>
               </div>
             </div>
 
             <div className="overflow-y-auto p-2 space-y-4">
               {/* Queue (Unplayed + Currently Playing) */}
               {(() => {
-                const queueItems = items.filter(i => !playedIds.has(i.id) || i.id === currentId);
+                const queueItems = queueIds
+                  .map(id => items.find(i => i.id === id))
+                  .filter(i => i !== undefined) as Item[];
+
                 return queueItems.length > 0 && (
                   <div>
                     <h4 className="text-xs font-bold text-[#93c8a8] uppercase tracking-wider px-2 py-2">
@@ -647,10 +807,30 @@ export default function Home() {
                               <h4 className={`text-sm font-bold truncate ${isActive ? 'text-primary' : 'text-white'}`}>
                                 {item.title}
                               </h4>
-                              <p className="text-xs text-white/30 truncate">
-                                {item.publish_time ? new Date(item.publish_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-                              </p>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <div className="flex items-center gap-1 text-[10px] text-white/30 uppercase font-mono">
+                                  <span className="material-symbols-outlined leading-3" style={{ fontSize: '10px' }}>schedule</span>
+                                  <span className="leading-3">{item.publish_time ? new Date(item.publish_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</span>
+                                </div>
+                                {item.duration_sec && (
+                                  <div className="flex items-center gap-1 text-[10px] text-[#93c8a8] font-mono">
+                                    <span className="material-symbols-outlined leading-3" style={{ fontSize: '10px' }}>timer</span>
+                                    <span className="leading-3">{formatTime(item.duration_sec)}</span>
+                                  </div>
+                                )}
+                              </div>
                             </div>
+
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                markAsPlayed(item.id);
+                              }}
+                              className="p-2 rounded-full text-white/20 hover:text-white hover:bg-white/10 transition-all shrink-0"
+                              title="Mark as Played"
+                            >
+                              <span className="material-symbols-outlined" style={{ fontSize: '20px' }}>check_circle</span>
+                            </button>
                           </div>
                         );
                       })}
@@ -661,7 +841,10 @@ export default function Home() {
 
               {/* Played (History) - Collapsible */}
               {(() => {
-                const playedItems = items.filter(i => playedIds.has(i.id) && i.id !== currentId);
+                const playedItems = items
+                  .filter(i => playedIds.has(i.id) && i.id !== currentId)
+                  .sort((a, b) => (b.publish_time || 0) - (a.publish_time || 0));
+
                 return playedItems.length > 0 && (
                   <div className="border-t border-white/5 mt-2 pt-2">
                     <button
@@ -677,24 +860,35 @@ export default function Home() {
                     </button>
                     {showPlayed && (
                       <div className="space-y-1 mt-1">
-                        {playedItems.slice(0, 10).map((item) => (
+                        {playedItems.slice(0, 20).map((item) => (
                           <div
                             key={item.id}
-                            onClick={() => {
-                              const newPlayed = new Set(playedIds);
-                              newPlayed.delete(item.id);
-                              setPlayedIds(newPlayed);
-                              playItem(item.id, item.audio_url || '');
-                            }}
-                            className="flex items-center gap-3 p-2 rounded-lg cursor-pointer transition-colors hover:bg-white/5"
+                            onClick={() => playItem(item.id, item.audio_url || '')}
+                            className="flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-colors hover:bg-white/5"
                           >
                             <span className="material-symbols-outlined text-white/20 text-lg">replay</span>
-                            <span className="text-sm truncate text-white/40">{item.title}</span>
+                            <div className="min-w-0 grow">
+                              <h4 className="text-sm font-medium truncate text-white/40">
+                                {item.title}
+                              </h4>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <div className="flex items-center gap-1 text-[10px] text-white/20">
+                                  <span className="material-symbols-outlined leading-3" style={{ fontSize: '10px' }}>schedule</span>
+                                  <span className="leading-3">{item.publish_time ? new Date(item.publish_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</span>
+                                </div>
+                                {item.duration_sec && (
+                                  <div className="flex items-center gap-1 text-[10px] text-white/10 font-mono">
+                                    <span className="material-symbols-outlined leading-3" style={{ fontSize: '10px' }}>timer</span>
+                                    <span className="leading-3">{formatTime(item.duration_sec)}</span>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
                           </div>
                         ))}
-                        {playedItems.length > 10 && (
+                        {playedItems.length > 20 && (
                           <div className="text-center py-1 text-xs text-white/20">
-                            还有 {playedItems.length - 10} 条
+                            还有 {playedItems.length - 20} 条
                           </div>
                         )}
                       </div>
@@ -707,6 +901,29 @@ export default function Home() {
                 <div className="py-8 text-center text-white/30 text-sm">暂无内容</div>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Debug Console Overlay */}
+      {showDebug && (
+        <div className="fixed inset-x-0 bottom-0 z-[100] h-[50vh] bg-black/90 text-green-400 font-mono text-[10px] p-2 overflow-y-auto border-t border-white/20 pointer-events-auto">
+          <div className="flex justify-between items-center bg-white/10 p-1 mb-2 rounded">
+            <span className="font-bold text-white">Debug Console ({logs.length})</span>
+            <div className="flex gap-2">
+              <button onClick={() => {
+                const text = logs.join('\n');
+                navigator.clipboard.writeText(text).then(() => alert('Logs copied!'));
+              }} className="px-2 py-1 bg-blue-600 text-white rounded">Copy</button>
+              <button onClick={() => setLogs([])} className="px-2 py-1 bg-white/20 text-white rounded">Clear</button>
+              <button onClick={() => setShowDebug(false)} className="px-2 py-1 bg-red-600 text-white rounded">Close</button>
+            </div>
+          </div>
+          <div className="whitespace-pre-wrap break-all">
+            {logs.map((log, i) => (
+              <div key={i} className="border-b border-white/5 py-0.5">{log}</div>
+            ))}
+            <div id="log-end" />
           </div>
         </div>
       )}

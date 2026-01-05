@@ -19,6 +19,7 @@ pub struct ItemPayload {
     pub audio_url: Option<String>,
     pub publish_time: Option<i64>,
     pub duration_sec: Option<i64>,
+    pub sources: Option<Vec<SourceInfo>>,
 }
 
 impl NexusClient {
@@ -135,6 +136,7 @@ impl NexusClient {
                  audio_url: v["audio_url"].as_str().map(|s| s.to_string()),
                  publish_time: v["publish_time"].as_i64(),
                  duration_sec: v["duration_sec"].as_i64(),
+                 sources: None,
             }
         }).collect();
         
@@ -182,7 +184,7 @@ impl NexusClient {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceInfo {
     pub url: String,
     pub title: String,

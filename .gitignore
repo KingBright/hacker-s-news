@@ -7,3 +7,4 @@ freshloop.db
 freshloop.db-shm
 freshloop.db-wal
 config.toml
+scripts/deploy.sh

@@ -198,6 +198,12 @@ pub async fn run_news_loop(
                     let potential_json = &json_clean[start..end];
 
                     if let Ok(analysis) = serde_json::from_str::<ItemAnalysis>(potential_json) {
+                        // Filter out Advertisements
+                        if analysis.category == "广告" || analysis.category == "Advertisement" {
+                            log::info!("[FILTER] Discarding Advertisement: [{}] {}", analysis.category, analysis.title);
+                            continue;
+                        }
+
                         log::info!("Analyzed item: [{}] {}", analysis.category, analysis.title);
                         categorized_groups.entry(analysis.category.clone()).or_default().push((item, analysis));
                     } else {
@@ -313,16 +319,17 @@ async fn process_pending_jobs(
         
         let proofread_prompt = format!(
             "请对以下新闻稿进行**深度优化和润色**。\
-            \n\n**时间背景**：现在是{}，{}\
+            \n\n**当前时间**：{} {}\
             \n\n核心要求：\
             \n1. **提升流畅度**：使语句更符合口语习惯，更加自然。\
             \n2. **修正错误**：修复任何潜在的错别字或语病。\
             \n3. **保持结构**：保留核心事实，但可以微调句子结构以提高可读性。\
-            \n4. **动态开场**：根据时间背景调整问候语（如'{}{}'），然后说'欢迎收听FreshLoop {}版块，我是{}'。\
-            \n5. **动态结尾**：根据时间调整结束语（如{}可以说'祝您{}愉快'），最后说'我是{}，感谢您收听FreshLoop'。\
-            \n6. **输出限制**：只输出优化后的全文。\
+            \n4. **动态开场**：根据当前时间设计自然的问候语（如'大家{}好'），然后自然引入'欢迎收听FreshLoop {}版块，我是{}'。\
+            \n5. **禁止臆造**：**绝对不要**提及任何未提供的信息（如天气等），因为不知道实际信息。\
+            \n6. **动态结尾**：根据时间调整结束语，最后说'我是{}，感谢您收听FreshLoop'。\
+            \n7. **输出限制**：只输出优化后的全文。\
             \n\n原文：\n{}",
-            time_period, weekday, time_period, "好", category, host_name, weekday, weekday, host_name, summary
+            time_period, weekday, time_period, category, host_name, host_name, summary
         );
 
         let final_summary = match llm.chat(&proofread_prompt).await {
@@ -441,16 +448,17 @@ async fn generate_and_broadcast(
     
     let prompt = format!(
         "请为'{}'类别的新闻生成一份详尽深入的中文口播新闻稿。\
-        \n\n时间背景：现在是{}，{}{}。\
+        \n\n当前时间：{} {}\
         \n\n核心要求：\
         \n1. 详尽报道：基于提供的摘要，整合成连贯的报道。\
         \n2. 逻辑串联：使用自然流畅的过渡词。\
         \n3. 口语风格：适合TTS语音播报，禁止使用任何格式符号如星号、下划线等。\
-        \n4. 动态开场：根据时间背景设计亲切的问候语，例如'{}{}'、结合是否是周末/节假日等，然后自然引入'欢迎收听FreshLoop {}版块，我是{}'。\
-        \n5. 动态结尾：根据时间设计温暖的结束语，如早间可以说'祝您今天工作顺利'，晚间可以说'祝您晚安好梦'，周末可以说'祝您周末愉快'。最后说'我是{}，感谢您收听FreshLoop'。\
-        \n6. 绝对纯净输出：只输出新闻稿纯文本内容，禁止使用Markdown格式。\
+        \n4. 动态开场：根据时间设计亲切的问候语（如'大家{}好'），结合是否是周末/节假日等，然后自然引入'欢迎收听FreshLoop {}版块，我是{}'。\
+        \n5. **禁止臆造**：**绝对不要**提及任何未提供的天气情况（如'天气晴朗'等）。\
+        \n6. 动态结尾：根据时间设计温暖的结束语，最后说'我是{}，感谢您收听FreshLoop'。\
+        \n7. 绝对纯净输出：只输出新闻稿纯文本内容，禁止使用Markdown格式。\
         \n\n新闻素材摘要：\n{}",
-        category, date_str, weekday, time_period, time_period, "好", category, host_name, host_name, context_content
+        category, weekday, time_period, time_period, category, host_name, host_name, context_content
     );
 
     log::info!("Generating script for {} (Host: {})", category, host_name);
@@ -553,14 +561,15 @@ async fn generate_and_broadcast(
         audio_url,
         publish_time: Some(chrono::Utc::now().timestamp()),
         duration_sec,
+        sources: if sources.is_empty() { None } else { Some(sources) },
     };
 
-    let item_id = nexus.push_item(payload).await?;
-    
-    // Store source links for this item
-    if !sources.is_empty() {
-        log::info!("Storing {} sources for item {}", sources.len(), item_id);
-        let _ = nexus.push_sources(&item_id, sources).await;
+    if let Err(e) = nexus.push_item(payload.clone()).await {
+        log::warn!("Failed to push item to Nexus: {}. Enqueuing for retry.", e);
+        let action = crate::core::retry::RetryAction::PushItem(payload);
+        retry.enqueue(action).map_err(|e| anyhow::anyhow!("Failed to enqueue retry: {}", e))?;
+    } else {
+        log::info!("Successfully pushed item to Nexus.");
     }
     
     Ok(())

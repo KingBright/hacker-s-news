@@ -21,6 +21,10 @@ fi
 echo ">>> Setting up executable..."
 mkdir -p "$HOME/.freshloop/bin"
 cp "$BINARY_SOURCE" "$BINARY_DEST"
+# Fix macOS quarantine/signing issues
+echo ">>> Fixing permissions..."
+xattr -d com.apple.quarantine "$BINARY_DEST" 2>/dev/null || true
+codesign --force --sign - "$BINARY_DEST"
 mkdir -p "$LOG_DIR"
 
 echo ">>> Copying latest config..."
