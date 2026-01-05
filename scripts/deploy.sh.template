@@ -2,13 +2,13 @@
 set -e
 
 # Configuration
-SERVER="root@hackerlife.fun"
-SSH_PORT="222"
-APP_DIR="/opt/nexus"
-DATA_DIR="/volume1/docker/nexus/data"
-AUDIO_DIR="/volume1/docker/nexus/audio"
-BINARY_NAME="nexus"
-DOMAIN="news.hackerlife.fun"
+SERVER=""
+SSH_PORT=""
+APP_DIR=""
+DATA_DIR=""
+AUDIO_DIR=""
+BINARY_NAME=""
+DOMAIN=""
 
 # Argument Parsing
 DEPLOY_FRONTEND=false
