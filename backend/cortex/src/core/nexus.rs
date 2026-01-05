@@ -11,6 +11,7 @@ pub struct NexusClient {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ItemPayload {
+    pub id: Option<String>, // Added for fetching
     pub title: String,
     pub summary: Option<String>,
     pub original_url: Option<String>,
@@ -63,7 +64,7 @@ impl NexusClient {
         self.upload_file(audio_data, filename, "audio/mpeg").await
     }
 
-    pub async fn push_item(&self, item: ItemPayload) -> Result<()> {
+    pub async fn push_item(&self, item: ItemPayload) -> Result<String> {
         let url = format!("{}/api/internal/items", self.config.api_url);
         let res = self.client.post(&url)
             .header("X-NEXUS-KEY", &self.config.auth_key)
@@ -75,7 +76,10 @@ impl NexusClient {
              return Err(anyhow!("Failed to push item: {}", res.status()));
         }
 
-        Ok(())
+        // Parse response to get item ID
+        let json: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
+        let item_id = json["id"].as_str().unwrap_or("unknown").to_string();
+        Ok(item_id)
     }
 
     pub async fn check_urls(&self, urls: Vec<String>) -> Result<Vec<String>> {
@@ -106,6 +110,9 @@ impl NexusClient {
         if !res.status().is_success() {
             return Err(anyhow!("Failed to mark url: {}", res.status()));
         }
+        Ok(())
+    }
+
     pub async fn fetch_pending_jobs(&self) -> Result<Vec<ItemPayload>> {
         let url = format!("{}/api/internal/items/pending", self.config.api_url);
         let res = self.client.get(&url)
@@ -120,9 +127,10 @@ impl NexusClient {
         let items: Vec<serde_json::Value> = res.json().await?;
         let payloads = items.into_iter().map(|v| {
             ItemPayload {
+                 id: v["id"].as_str().map(|s| s.to_string()),
                  title: v["title"].as_str().unwrap_or_default().to_string(),
                  summary: v["summary"].as_str().map(|s| s.to_string()),
-                 original_url: v["id"].as_str().map(|s| s.to_string()), // Using ID as carrier
+                 original_url: v["original_url"].as_str().map(|s| s.to_string()),
                  cover_image_url: v["cover_image_url"].as_str().map(|s| s.to_string()),
                  audio_url: v["audio_url"].as_str().map(|s| s.to_string()),
                  publish_time: v["publish_time"].as_i64(),
@@ -153,4 +161,31 @@ impl NexusClient {
         }
         Ok(())
     }
+
+    /// Push source articles for an item
+    pub async fn push_sources(&self, item_id: &str, sources: Vec<SourceInfo>) -> Result<()> {
+        let url = format!("{}/api/internal/items/{}/sources", self.config.api_url, item_id);
+        let payload = serde_json::json!({
+            "sources": sources
+        });
+
+        let res = self.client.post(&url)
+            .header("X-NEXUS-KEY", &self.config.auth_key)
+            .json(&payload)
+            .send()
+            .await?;
+            
+        if !res.status().is_success() {
+            log::warn!("Failed to push sources: {}", res.status());
+        }
+        Ok(())
+    }
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SourceInfo {
+    pub url: String,
+    pub title: String,
+    pub summary: String,
+}
+

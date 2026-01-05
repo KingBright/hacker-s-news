@@ -43,6 +43,16 @@ export default function Home() {
   const [showPlaylist, setShowPlaylist] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false);
 
+  // Sources Modal State
+  const [showSources, setShowSources] = useState(false);
+  const [sources, setSources] = useState<Array<{ url: string, title: string, summary: string }>>([]);
+  const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [sourcesItemId, setSourcesItemId] = useState<string | null>(null);
+
+  // Playlist and Transcript UI State
+  const [showPlayed, setShowPlayed] = useState(false);
+  const [transcriptItemId, setTranscriptItemId] = useState<string | null>(null);
+
   // Load persistence
   useEffect(() => {
     try {
@@ -112,6 +122,23 @@ export default function Home() {
 
   // Weather State
   const [weather, setWeather] = useState<{ temp: number, code: number } | null>(null);
+  const [greeting, setGreeting] = useState('Good Morning');
+
+  useEffect(() => {
+    const updateGreeting = () => {
+      const hour = new Date().getHours();
+      if (hour < 5) setGreeting("Good Late Night");
+      else if (hour < 12) setGreeting("Good Morning");
+      else if (hour < 17) setGreeting("Good Afternoon");
+      else if (hour < 21) setGreeting("Good Evening");
+      else setGreeting("Good Night");
+    };
+
+    updateGreeting(); // Initial call
+    const intervalId = setInterval(updateGreeting, 60000); // Update every minute
+
+    return () => clearInterval(intervalId); // Cleanup on unmount
+  }, []);
 
   useEffect(() => {
     if ("geolocation" in navigator) {
@@ -151,7 +178,21 @@ export default function Home() {
       const data = await res.json();
 
       if (isRefresh) {
-        setItems(data);
+        // Preserve currently playing item to avoid audio interruption
+        setItems(prev => {
+          const currentPlayingItem = prev.find(i => i.id === currentId);
+          const newItems = data.filter((d: Item) => d.id !== currentId);
+          if (currentPlayingItem) {
+            // Keep current item in its position or at front
+            const currentInNew = data.find((d: Item) => d.id === currentId);
+            if (currentInNew) {
+              return data; // Current item is in new data, use as-is
+            } else {
+              return [currentPlayingItem, ...newItems]; // Prepend current item
+            }
+          }
+          return data;
+        });
         setPage(1);
       } else {
         // filter out potentially duplicate ids just in case
@@ -167,7 +208,7 @@ export default function Home() {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [currentId]);
 
   useEffect(() => {
     fetchItems(1, true);
@@ -192,6 +233,31 @@ export default function Home() {
     return () => observer.disconnect();
   }, [hasMore, isLoading, page, fetchItems]);
 
+  // Fetch sources for an item
+  const fetchSources = async (itemId: string) => {
+    setSourcesLoading(true);
+    setSourcesItemId(itemId);
+    setShowSources(true);
+    try {
+      const res = await fetch(`/api/items/${itemId}/sources`);
+      if (res.ok) {
+        const data = await res.json();
+        setSources(data.map((s: any) => ({
+          url: s.source_url,
+          title: s.source_title || 'Untitled',
+          summary: s.source_summary || ''
+        })));
+      } else {
+        setSources([]);
+      }
+    } catch (e) {
+      console.error('Failed to fetch sources', e);
+      setSources([]);
+    } finally {
+      setSourcesLoading(false);
+    }
+  };
+
   // Audio Event Handlers
   const togglePlay = () => {
     if (audioRef.current) {
@@ -204,7 +270,7 @@ export default function Home() {
     }
   };
 
-  const playItem = (id: string, url: string) => {
+  const playItem = useCallback((id: string, url: string) => {
     // Mark as played
     if (!playedIds.has(id)) {
       const newPlayed = new Set(playedIds);
@@ -213,7 +279,14 @@ export default function Home() {
     }
 
     if (currentId === id) {
-      togglePlay();
+      // Toggle play/pause for current item
+      if (audioRef.current) {
+        if (audioRef.current.paused) {
+          audioRef.current.play().catch(e => console.error("Play failed", e));
+        } else {
+          audioRef.current.pause();
+        }
+      }
       return;
     }
 
@@ -224,7 +297,7 @@ export default function Home() {
         .then(() => setIsPlaying(true))
         .catch(e => console.error("Play failed", e));
     }
-  };
+  }, [playedIds, currentId]);
 
   const playNext = useCallback(() => {
     if (!currentId) return;
@@ -236,10 +309,22 @@ export default function Home() {
     for (let i = currentIndex - 1; i >= 0; i--) {
       const item = items[i];
       if (item.audio_url && !playedIds.has(item.id)) {
-        playItem(item.id, item.audio_url);
+        // Direct play without using playItem to avoid stale closure
+        const newPlayed = new Set(playedIds);
+        newPlayed.add(item.id);
+        setPlayedIds(newPlayed);
+        setCurrentId(item.id);
+        if (audioRef.current) {
+          audioRef.current.src = item.audio_url;
+          audioRef.current.play()
+            .then(() => setIsPlaying(true))
+            .catch(e => console.error("Play next failed", e));
+        }
         return;
       }
     }
+    // No more unplayed items
+    setIsPlaying(false);
   }, [currentId, items, playedIds]);
 
   const playPrev = useCallback(() => {
@@ -251,7 +336,13 @@ export default function Home() {
     for (let i = currentIndex + 1; i < items.length; i++) {
       const item = items[i];
       if (item.audio_url) {
-        playItem(item.id, item.audio_url);
+        setCurrentId(item.id);
+        if (audioRef.current) {
+          audioRef.current.src = item.audio_url;
+          audioRef.current.play()
+            .then(() => setIsPlaying(true))
+            .catch(e => console.error("Play prev failed", e));
+        }
         return;
       }
     }
@@ -313,7 +404,7 @@ export default function Home() {
             <div className="flex items-start justify-between mb-8">
               <div>
                 <p className="text-[#93c8a8] text-sm font-medium uppercase tracking-wider mb-1">{today}</p>
-                <h2 className="text-3xl font-bold text-white tracking-tight leading-none">Good Morning</h2>
+                <h2 className="text-3xl font-bold text-white tracking-tight leading-none">{greeting}</h2>
               </div>
               <div className="flex items-center gap-3">
                 {weather && <span className="text-white text-2xl font-bold tracking-tighter">{weather.temp}°</span>}
@@ -397,11 +488,22 @@ export default function Home() {
                       ) : null}
                     </div>
                   </div>
-                  <div className="shrink-0">
+                  <div className="flex flex-col items-center gap-2 shrink-0">
                     <button className={`flex items-center justify-center size-10 rounded-full transition-colors ${isActive && isPlaying ? 'bg-primary text-black' : 'bg-black/20 text-white group-hover:bg-primary group-hover:text-black'}`}>
                       <span className="material-symbols-outlined filled text-[24px]">
                         {isActive && isPlaying ? 'pause' : 'play_arrow'}
                       </span>
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setTranscriptItemId(item.id);
+                        setShowTranscript(true);
+                      }}
+                      className="flex items-center justify-center size-8 rounded-full bg-black/20 text-white/60 hover:text-white hover:bg-black/30 transition-colors"
+                      title="查看文稿"
+                    >
+                      <span className="material-symbols-outlined text-[18px]">article</span>
                     </button>
                   </div>
                 </div>
@@ -490,11 +592,11 @@ export default function Home() {
 
       {/* Playlist Overlay */}
       {showPlaylist && (
-        <div className="fixed inset-0 z-50 flex flex-col items-center justify-end sm:justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
-          <div className="w-full max-w-md bg-surface-dark rounded-3xl shadow-2xl ring-1 ring-white/10 max-h-[80vh] flex flex-col animate-in slide-in-from-bottom-10 duration-200">
+        <div className="fixed inset-0 z-50 flex flex-col items-center justify-end sm:justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200" onClick={() => setShowPlaylist(false)}>
+          <div className="w-full max-w-md bg-surface-dark rounded-3xl shadow-2xl ring-1 ring-white/10 max-h-[80vh] flex flex-col animate-in slide-in-from-bottom-10 duration-200 overscroll-contain" onClick={(e) => e.stopPropagation()}>
             <div className="flex flex-col p-4 border-b border-white/5 shrink-0 bg-surface-dark/95 backdrop-blur z-10 rounded-t-3xl gap-2">
               <div className="flex items-center justify-between">
-                <h3 className="text-lg font-bold text-white pl-2">Play Queue</h3>
+                <h3 className="text-lg font-bold text-white pl-2">播放列表</h3>
                 <button
                   onClick={() => setShowPlaylist(false)}
                   className="p-2 rounded-full hover:bg-white/10 text-white/60 hover:text-white transition-colors"
@@ -518,36 +620,91 @@ export default function Home() {
               </div>
             </div>
 
-            <div className="overflow-y-auto p-2 space-y-1">
-              {[...items].reverse().map((item) => {
-                const isActive = currentId === item.id;
-                const isPlayed = playedIds.has(item.id);
-                return (
-                  <div
-                    key={item.id}
-                    onClick={() => {
-                      playItem(item.id, item.audio_url || '');
-                    }}
-                    className={`flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-colors ${isActive ? 'bg-primary/10' : 'hover:bg-white/5'}`}
-                  >
-                    <div className={`flex items-center justify-center size-10 rounded-lg shrink-0 ${isActive ? 'bg-primary text-black' : 'bg-white/5 text-white/40'}`}>
-                      <span className="material-symbols-outlined text-xl">
-                        {isActive && isPlaying ? 'graphic_eq' : (isPlayed ? 'check' : 'music_note')}
-                      </span>
-                    </div>
-                    <div className="min-w-0 grow">
-                      <h4 className={`text-sm font-bold truncate ${isActive ? 'text-primary' : (isPlayed ? 'text-white/40' : 'text-white')}`}>
-                        {item.title}
-                      </h4>
-                      <p className="text-xs text-white/30 truncate">
-                        {item.publish_time ? new Date(item.publish_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Unknown time'}
-                      </p>
+            <div className="overflow-y-auto p-2 space-y-4">
+              {/* Queue (Unplayed + Currently Playing) */}
+              {(() => {
+                const queueItems = items.filter(i => !playedIds.has(i.id) || i.id === currentId);
+                return queueItems.length > 0 && (
+                  <div>
+                    <h4 className="text-xs font-bold text-[#93c8a8] uppercase tracking-wider px-2 py-2">
+                      播放队列 ({queueItems.length})
+                    </h4>
+                    <div className="space-y-1">
+                      {queueItems.map((item) => {
+                        const isActive = currentId === item.id;
+                        return (
+                          <div
+                            key={item.id}
+                            onClick={() => playItem(item.id, item.audio_url || '')}
+                            className={`flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-colors ${isActive ? 'bg-primary/10' : 'hover:bg-white/5'}`}
+                          >
+                            <div className={`flex items-center justify-center size-10 rounded-lg shrink-0 ${isActive ? 'bg-primary text-black' : 'bg-white/5 text-white/40'}`}>
+                              <span className="material-symbols-outlined text-xl">
+                                {isActive && isPlaying ? 'graphic_eq' : 'music_note'}
+                              </span>
+                            </div>
+                            <div className="min-w-0 grow">
+                              <h4 className={`text-sm font-bold truncate ${isActive ? 'text-primary' : 'text-white'}`}>
+                                {item.title}
+                              </h4>
+                              <p className="text-xs text-white/30 truncate">
+                                {item.publish_time ? new Date(item.publish_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 );
-              })}
+              })()}
+
+              {/* Played (History) - Collapsible */}
+              {(() => {
+                const playedItems = items.filter(i => playedIds.has(i.id) && i.id !== currentId);
+                return playedItems.length > 0 && (
+                  <div className="border-t border-white/5 mt-2 pt-2">
+                    <button
+                      onClick={() => setShowPlayed(!showPlayed)}
+                      className="w-full flex items-center justify-between px-2 py-1.5 text-white/30 hover:text-white/50 transition-colors"
+                    >
+                      <span className="text-xs font-bold uppercase tracking-wider">
+                        已播放 ({playedItems.length})
+                      </span>
+                      <span className="material-symbols-outlined text-sm">
+                        {showPlayed ? 'expand_less' : 'expand_more'}
+                      </span>
+                    </button>
+                    {showPlayed && (
+                      <div className="space-y-1 mt-1">
+                        {playedItems.slice(0, 10).map((item) => (
+                          <div
+                            key={item.id}
+                            onClick={() => {
+                              const newPlayed = new Set(playedIds);
+                              newPlayed.delete(item.id);
+                              setPlayedIds(newPlayed);
+                              playItem(item.id, item.audio_url || '');
+                            }}
+                            className="flex items-center gap-3 p-2 rounded-lg cursor-pointer transition-colors hover:bg-white/5"
+                          >
+                            <span className="material-symbols-outlined text-white/20 text-lg">replay</span>
+                            <span className="text-sm truncate text-white/40">{item.title}</span>
+                          </div>
+                        ))}
+                        {playedItems.length > 10 && (
+                          <div className="text-center py-1 text-xs text-white/20">
+                            还有 {playedItems.length - 10} 条
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               {items.length === 0 && (
-                <div className="py-8 text-center text-white/30 text-sm">queue is empty</div>
+                <div className="py-8 text-center text-white/30 text-sm">暂无内容</div>
               )}
             </div>
           </div>
@@ -555,43 +712,106 @@ export default function Home() {
       )}
 
       {/* Transcript Overlay */}
-      {showTranscript && currentItem && (
+      {showTranscript && (() => {
+        const transcriptItem = transcriptItemId
+          ? items.find(i => i.id === transcriptItemId) || currentItem
+          : currentItem;
+        return transcriptItem && (
+          <div className="fixed inset-0 z-50 flex flex-col items-center justify-end sm:justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+            <div className="w-full max-w-2xl bg-surface-dark rounded-3xl shadow-2xl ring-1 ring-white/10 max-h-[80vh] flex flex-col animate-in slide-in-from-bottom-10 duration-200 overscroll-contain">
+              <div className="flex items-center justify-between p-6 border-b border-white/5 shrink-0 bg-surface-dark/50 z-10 rounded-t-3xl">
+                <div className="pr-4">
+                  <p className="text-[#93c8a8] text-xs font-bold uppercase tracking-wider mb-2">文稿</p>
+                  <h3 className="text-xl font-bold text-white leading-tight">{transcriptItem.title}</h3>
+                </div>
+                <button
+                  onClick={() => setShowTranscript(false)}
+                  className="p-2 rounded-full hover:bg-white/10 text-white/60 hover:text-white transition-colors shrink-0"
+                >
+                  <span className="material-symbols-outlined">close</span>
+                </button>
+              </div>
+
+              <div className="overflow-y-auto p-6 text-white/90">
+                {transcriptItem.summary ? (
+                  <div className="prose prose-invert prose-lg max-w-none">
+                    <p className="whitespace-pre-wrap font-serif leading-relaxed text-[1.1rem]">
+                      {transcriptItem.summary}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center py-20 text-white/30 text-center">
+                    <span className="material-symbols-outlined text-4xl mb-4 opacity-50">description</span>
+                    <p>暂无文稿内容</p>
+                  </div>
+                )}
+              </div>
+              <div className="p-4 border-t border-white/5 shrink-0 bg-surface-dark/50 rounded-b-3xl">
+                <button
+                  onClick={() => {
+                    setShowTranscript(false);
+                    fetchSources(transcriptItem.id);
+                  }}
+                  className="w-full flex items-center justify-center gap-2 text-primary hover:text-primary/80 transition-colors text-sm font-bold py-2 bg-primary/10 hover:bg-primary/20 rounded-xl"
+                >
+                  <span className="material-symbols-outlined text-[18px]">article</span>
+                  查看原文来源
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Sources Modal */}
+      {showSources && (
         <div className="fixed inset-0 z-50 flex flex-col items-center justify-end sm:justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
           <div className="w-full max-w-2xl bg-surface-dark rounded-3xl shadow-2xl ring-1 ring-white/10 max-h-[80vh] flex flex-col animate-in slide-in-from-bottom-10 duration-200">
             <div className="flex items-center justify-between p-6 border-b border-white/5 shrink-0 bg-surface-dark/50 z-10 rounded-t-3xl">
               <div className="pr-4">
-                <p className="text-[#93c8a8] text-xs font-bold uppercase tracking-wider mb-2">Transcript</p>
-                <h3 className="text-xl font-bold text-white leading-tight">{currentItem.title}</h3>
+                <p className="text-[#93c8a8] text-xs font-bold uppercase tracking-wider mb-2">原始来源</p>
+                <h3 className="text-xl font-bold text-white leading-tight">
+                  {sources.length} 篇参考文章
+                </h3>
               </div>
               <button
-                onClick={() => setShowTranscript(false)}
+                onClick={() => setShowSources(false)}
                 className="p-2 rounded-full hover:bg-white/10 text-white/60 hover:text-white transition-colors shrink-0"
               >
                 <span className="material-symbols-outlined">close</span>
               </button>
             </div>
 
-            <div className="overflow-y-auto p-6 text-white/90">
-              {currentItem.summary ? (
-                <div className="prose prose-invert prose-lg max-w-none">
-                  <p className="whitespace-pre-wrap font-serif leading-relaxed text-[1.1rem]">
-                    {currentItem.summary}
-                  </p>
+            <div className="overflow-y-auto p-4">
+              {sourcesLoading ? (
+                <div className="flex justify-center py-12">
+                  <div className="size-8 border-2 border-white/20 border-t-primary rounded-full animate-spin"></div>
+                </div>
+              ) : sources.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-16 text-white/30 text-center">
+                  <span className="material-symbols-outlined text-4xl mb-4 opacity-50">article</span>
+                  <p>暂无原始来源信息</p>
                 </div>
               ) : (
-                <div className="flex flex-col items-center justify-center py-20 text-white/30 text-center">
-                  <span className="material-symbols-outlined text-4xl mb-4 opacity-50">description</span>
-                  <p>No transcript available for this story.</p>
+                <div className="flex flex-col gap-3">
+                  {sources.map((source, idx) => (
+                    <div key={idx} className="bg-black/20 rounded-xl p-4 hover:bg-black/30 transition-colors">
+                      <h4 className="text-white font-bold text-sm mb-2 line-clamp-2">{source.title}</h4>
+                      <p className="text-white/60 text-xs mb-3 line-clamp-3">{source.summary}</p>
+                      <a
+                        href={source.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 text-primary hover:text-primary/80 text-xs font-bold transition-colors"
+                      >
+                        <span className="material-symbols-outlined text-[14px]">open_in_new</span>
+                        查看原文
+                      </a>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
-            {currentItem.original_url && (
-              <div className="p-4 border-t border-white/5 shrink-0 bg-surface-dark/50 rounded-b-3xl">
-                <a href={currentItem.original_url} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 text-primary hover:text-primary/80 transition-colors text-sm font-bold py-2 bg-primary/10 hover:bg-primary/20 rounded-xl">
-                  Read full article <span className="material-symbols-outlined text-[18px]">open_in_new</span>
-                </a>
-              </div>
-            )}
           </div>
         </div>
       )}

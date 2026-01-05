@@ -23,6 +23,22 @@ mkdir -p "$HOME/.freshloop/bin"
 cp "$BINARY_SOURCE" "$BINARY_DEST"
 mkdir -p "$LOG_DIR"
 
+echo ">>> Copying latest config..."
+CONFIG_SOURCE="$WORK_DIR/config.toml"
+if [ -f "$CONFIG_SOURCE" ]; then
+    echo "Config file: $CONFIG_SOURCE"
+    # Show key config info
+    FEED_COUNT=$(grep -c "https://" "$CONFIG_SOURCE" 2>/dev/null || echo "0")
+    HOST_COUNT=$(grep -c "^\[\[hosts\]\]" "$CONFIG_SOURCE" 2>/dev/null || echo "0")
+    CAT_LINE=$(grep -m1 "categories = \[" "$CONFIG_SOURCE" | head -1)
+    echo "  - RSS feeds: ~$FEED_COUNT URLs"
+    echo "  - Hosts: $HOST_COUNT"
+    echo "  - Categories: $(grep "categories = \[" "$CONFIG_SOURCE" -A1 | tail -1 | tr -d ' \"')"
+else
+    echo "ERROR: config.toml not found at $CONFIG_SOURCE"
+    exit 1
+fi
+
 echo ">>> Generating LaunchAgent Plist..."
 cat <<EOF > "$PLIST_PATH"
 <?xml version="1.0" encoding="UTF-8"?>

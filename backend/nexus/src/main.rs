@@ -58,6 +58,8 @@ async fn main() {
         .route("/api/internal/upload", post(routes::upload::upload_audio))
         .route("/api/internal/dedup/check", post(routes::dedup::check_files))
         .route("/api/internal/dedup/mark", post(routes::dedup::mark_file))
+        .route("/api/internal/items/{id}/sources", post(routes::internal_api::push_sources))
+        .route("/api/items/{id}/sources", get(routes::internal_api::get_sources))
         .route("/api/admin/items/{id}", axum::routing::patch(routes::admin::update_item))
         .route("/api/admin/items/{id}/regenerate", post(routes::admin::regenerate_item))
         .route("/api/admin/export", get(routes::admin::export_items))

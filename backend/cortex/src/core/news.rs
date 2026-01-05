@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
+use chrono::Timelike;
 use crate::core::config::Config;
 use crate::core::llm::LlmClient;
 use crate::core::tts::TtsClient;
@@ -32,7 +33,8 @@ pub async fn run_news_loop(
     };
 
     let mut interval = time::interval(loop_interval);
-    let mut last_run_date = String::new(); 
+    let mut last_run_date = String::new();
+    let mut first_run = true; // Trigger immediately on startup
 
     loop {
         interval.tick().await;
@@ -44,7 +46,12 @@ pub async fn run_news_loop(
         // We will define "Today" based on local time.
         let today_ymd = now.format("%Y-%m-%d").to_string();
 
-        let should_run = if let Some(times) = &config.schedule_times {
+        // Run immediately on first iteration, then follow schedule
+        let should_run = if first_run {
+            first_run = false;
+            log::info!("Startup trigger: Running initial news cycle...");
+            true
+        } else if let Some(times) = &config.schedule_times {
             if times.contains(&current_time_str) {
                 if last_run_date == current_date_str {
                     false 
@@ -64,7 +71,7 @@ pub async fn run_news_loop(
         
         
         // Check for pending regeneration jobs
-        if let Ok(processed) = process_pending_jobs(&llm, &tts, &nexus, &retry).await {
+        if let Ok(processed) = process_pending_jobs(&llm, &tts, &nexus, &retry, &config.hosts).await {
             if processed {
                 // If we processed jobs, we can skip the heavy RSS fetch or just continue?
                 // Let's continue to RSS fetch as they are independent, but logging separation is good.
@@ -75,15 +82,15 @@ pub async fn run_news_loop(
         last_run_date = current_date_str;
         log::info!("Starting SMART news cycle at {}", current_time_str);
 
-        // 1. Fetch ALL items from ALL sources
+        // 1. Fetch ALL items from ALL sources (flat list)
         let mut all_candidate_items = Vec::new();
-        if let Some(categories) = &config.news {
-            for category_config in categories {
-                for url in &category_config.urls {
-                    match fetch_rss_items(url).await {
-                        Ok(items) => all_candidate_items.extend(items),
-                        Err(e) => log::warn!("Failed to fetch RSS {}: {}", url, e),
-                    }
+        let feed_count = config.rss_feeds.as_ref().map(|f| f.len()).unwrap_or(0);
+        log::info!("Configured RSS feeds: {}", feed_count);
+        if let Some(feeds) = &config.rss_feeds {
+            for url in feeds {
+                match fetch_rss_items(url).await {
+                    Ok(items) => all_candidate_items.extend(items),
+                    Err(e) => log::warn!("Failed to fetch RSS {}: {}", url, e),
                 }
             }
         }
@@ -162,9 +169,11 @@ pub async fn run_news_loop(
         // Group by Class
         let mut categorized_groups: std::collections::HashMap<String, Vec<(RssItem, ItemAnalysis)>> = std::collections::HashMap::new();
         
-        // Define allowable topics
-        let topics = vec!["AI", "Tech", "Economy", "Politics", "Gaming", "Science", "Other"];
-        let topics_str = topics.join(", ");
+        // Use categories from config (or fallback to defaults)
+        let categories = config.categories.clone().unwrap_or_else(|| {
+            vec!["Tech".to_string(), "Economy".to_string(), "Politics".to_string(), "Gaming".to_string(), "Other".to_string()]
+        });
+        let topics_str = categories.join(", ");
 
         for item in unique_items {
             let clean_desc = clean_text(&item.description, 1000); // Allow more context for analysis
@@ -206,21 +215,20 @@ pub async fn run_news_loop(
             if group_items.is_empty() { continue; }
             log::info!("Generating script for '{}' with {} items", category, group_items.len());
 
-            // Reduce items to list text
+            // Collect sources and context
             let mut context = String::new();
-            for (idx, (_original, analysis)) in group_items.iter().enumerate() {
+            let mut sources: Vec<crate::core::nexus::SourceInfo> = Vec::new();
+            for (idx, (original, analysis)) in group_items.iter().enumerate() {
                 context.push_str(&format!("{}. {}\nDetails: {}\n\n", idx+1, analysis.title, analysis.summary));
+                sources.push(crate::core::nexus::SourceInfo {
+                    url: original.link.clone(),
+                    title: analysis.title.clone(),
+                    summary: normalize_content(&original.description),
+                });
             }
-
-            // Create Payload Config (Mocking config for compatibility)
-            // We use the category name directly
-            let category_config = crate::core::config::NewsCategory {
-                category: category.clone(),
-                urls: vec![], // Not used in generation
-            };
             
-            // Re-use logic for script generation (modified to just take context)
-            if let Err(e) = generate_and_broadcast(&category_config, &context, &llm, &tts, &nexus, &retry).await {
+            // Generate and broadcast, with sources
+            if let Err(e) = generate_and_broadcast(&category, &context, &llm, &tts, &nexus, &retry, &config.hosts, sources).await {
                 log::error!("Failed to broadcast category {}: {}", category, e);
             }
             
@@ -239,11 +247,12 @@ async fn process_pending_jobs(
     tts: &TtsClient,
     nexus: &NexusClient,
     retry: &crate::core::retry::RetryManager,
+    hosts: &Option<Vec<crate::core::config::Host>>,
 ) -> Result<bool> {
     let pending_items = match nexus.fetch_pending_jobs().await {
         Ok(items) => items,
         Err(e) => {
-            log::warn!("Failed to fetch pending jobs: {}", e);
+            log::warn!("Regen: Failed to fetch pending jobs: {}", e);
             return Ok(false);
         }
     };
@@ -252,59 +261,109 @@ async fn process_pending_jobs(
         return Ok(false);
     }
 
-    log::info!("Found {} pending regeneration jobs", pending_items.len());
+    log::info!("Regen: Found {} pending jobs", pending_items.len());
 
     for item in pending_items {
-        // item.original_url holds the ID (hack from nexus client)
-        let id = match &item.original_url {
-            Some(id) => id,
-            None => continue,
+        // Use the ID field directly now
+        let id = match item.id {
+            Some(ref id) => id.clone(),
+            None => {
+                log::warn!("Regen: Item has no ID. Skipping.");
+                continue;
+            }
         };
+
+        log::info!("Regen [Item {}]: Starting full regeneration flow...", id);
+
+        // Extract category from title (format: "Category - Smart Daily")
+        let category = item.title.split(" - ").next().unwrap_or("").trim();
+        
+        // Find host for this category
+        let host = hosts.as_ref().and_then(|h| {
+            h.iter().find(|host| host.categories.iter().any(|c| c == category))
+        });
+        let host_voice = host.map(|h| h.voice.clone());
+        log::info!("Regen [Item {}]: Category='{}', Voice={:?}", id, category, host_voice.as_ref().map(|v| v.split('/').last().unwrap_or(v)));
 
         let summary = item.summary.clone().unwrap_or_default();
         if summary.is_empty() {
-             log::warn!("Pending job {} has no summary. Skipping.", id);
+             log::warn!("Regen [Item {}]: No content to regenerate. Skipping.", id);
              continue;
         }
 
-        log::info!("Regenerating item {}. Optimizing text...", id);
-
-        // 1. Optimize Text (Proofread)
+        // 1. Text Optimization (Proofread / Rewrite)
+        log::info!("Regen [Item {}]: Step 1/3 - Optimizing Text (LLM)...", id);
+        
+        // Get host name for this category
+        let host_name = host.map(|h| h.name.clone()).unwrap_or("主播".to_string());
+        
+        // Get time context for dynamic greetings
+        let now = chrono::Local::now();
+        let hour = now.hour();
+        let time_period = if hour < 6 { "深夜" } 
+            else if hour < 12 { "早上" }
+            else if hour < 14 { "中午" }
+            else if hour < 18 { "下午" }
+            else if hour < 21 { "晚上" }
+            else { "深夜" };
+        let weekday = match now.format("%A").to_string().as_str() {
+            "Saturday" | "Sunday" => "周末",
+            _ => "工作日"
+        };
+        
         let proofread_prompt = format!(
-            "请对以下新闻稿进行**优化润色**。\
+            "请对以下新闻稿进行**深度优化和润色**。\
+            \n\n**时间背景**：现在是{}，{}\
             \n\n核心要求：\
             \n1. **提升流畅度**：使语句更符合口语习惯，更加自然。\
             \n2. **修正错误**：修复任何潜在的错别字或语病。\
-            \n3. **保持原意**：不要改变新闻的核心事实和结构。\
-            \n4. **输出限制**：只输出优化后的全文。\
+            \n3. **保持结构**：保留核心事实，但可以微调句子结构以提高可读性。\
+            \n4. **动态开场**：根据时间背景调整问候语（如'{}{}'），然后说'欢迎收听FreshLoop {}版块，我是{}'。\
+            \n5. **动态结尾**：根据时间调整结束语（如{}可以说'祝您{}愉快'），最后说'我是{}，感谢您收听FreshLoop'。\
+            \n6. **输出限制**：只输出优化后的全文。\
             \n\n原文：\n{}",
-            summary
+            time_period, weekday, time_period, "好", category, host_name, weekday, weekday, host_name, summary
         );
 
         let final_summary = match llm.chat(&proofread_prompt).await {
             Ok(s) => {
                 let s_clean = s.trim().to_string();
+                log::info!("Regen [Item {}]: Text optimized. Size: {} -> {} chars", id, summary.len(), s_clean.len());
                 if s_clean.len() < 10 { summary.clone() } else { s_clean }
             },
             Err(e) => {
-                log::warn!("Optimization failed: {}. Using original.", e);
+                log::warn!("Regen [Item {}]: Optimization failed: {}. Using original.", id, e);
                 summary.clone()
             }
         };
 
-        // 2. Generate Audio
+        // 2. Audio Generation (Tts)
         let tts_text = clean_for_tts(&final_summary);
-        log::info!("Generating audio for item {}...", id);
+        log::info!("Regen [Item {}]: Step 2/3 - Generating Audio (TTS)...", id);
 
-        let audio_data = match tts.speak(&tts_text).await {
-            Ok(data) => data,
-            Err(e) => {
-                log::error!("TTS failed for item {}: {}", id, e);
-                continue;
+        // Use host-specific voice if available
+        let audio_data = if let Some(voice) = &host_voice {
+            log::info!("Regen [Item {}]: Using voice: {}", id, voice);
+            match tts.speak_with_voice(&tts_text, voice).await {
+                Ok(data) => data,
+                Err(e) => {
+                    log::error!("Regen [Item {}]: TTS failed: {}", id, e);
+                    continue;
+                }
+            }
+        } else {
+            match tts.speak(&tts_text).await {
+                Ok(data) => data,
+                Err(e) => {
+                    log::error!("Regen [Item {}]: TTS failed: {}", id, e);
+                    continue;
+                }
             }
         };
+        log::info!("Regen [Item {}]: Audio generated. Size: {} bytes", id, audio_data.len());
 
-        // 3. Upload Files
+        // 3. Upload & Complete
+        log::info!("Regen [Item {}]: Step 3/3 - Uploading and Completing...", id);
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let base_filename = format!("regen_{}_{}", id, timestamp);
         let text_filename = format!("{}.txt", base_filename);
@@ -333,10 +392,10 @@ async fn process_pending_jobs(
         };
 
         // 5. Complete Job
-        if let Err(e) = nexus.complete_job(id, &audio_url, &final_summary, duration_sec).await {
-            log::error!("Failed to complete job for item {}: {}", id, e);
+        if let Err(e) = nexus.complete_job(&id, &audio_url, &final_summary, duration_sec).await {
+            log::error!("Regen [Item {}]: Failed to update database: {}", id, e);
         } else {
-             log::info!("Successfully regenerated item {}", id);
+             log::info!("Regen [Item {}]: SUCCESS. Items updated.", id);
         }
     }
 
@@ -345,32 +404,56 @@ async fn process_pending_jobs(
 
 // Refactored from process_category
 async fn generate_and_broadcast(
-    category_config: &crate::core::config::NewsCategory,
+    category: &str,
     context_content: &str,
     llm: &LlmClient,
     tts: &TtsClient,
     nexus: &NexusClient,
     retry: &crate::core::retry::RetryManager,
+    hosts: &Option<Vec<crate::core::config::Host>>,
+    sources: Vec<crate::core::nexus::SourceInfo>,
 ) -> Result<()> {
     
-    let date_str = chrono::Local::now().format("%Y年%-m月%-d日 %H:%M").to_string();
+    // Find host for this category
+    let host = hosts.as_ref().and_then(|h| {
+        h.iter().find(|host| host.categories.iter().any(|c| c == category))
+    });
+    
+    let host_name = host.map(|h| h.name.clone()).unwrap_or("主播".to_string());
+    let host_voice = host.map(|h| h.voice.clone());
+    
+    log::info!("Category '{}' will be hosted by: {}", category, host_name);
+    
+    let now = chrono::Local::now();
+    let date_str = now.format("%Y年%-m月%-d日 %H:%M").to_string();
+    let weekday = match now.format("%A").to_string().as_str() {
+        "Monday" => "星期一", "Tuesday" => "星期二", "Wednesday" => "星期三",
+        "Thursday" => "星期四", "Friday" => "星期五", "Saturday" => "星期六",
+        "Sunday" => "星期天", _ => ""
+    };
+    let hour = now.hour();
+    let time_period = if hour < 6 { "深夜" } 
+        else if hour < 12 { "早上" }
+        else if hour < 14 { "中午" }
+        else if hour < 18 { "下午" }
+        else if hour < 21 { "晚上" }
+        else { "深夜" };
+    
     let prompt = format!(
-        "请为'{}'类别的新闻生成一份**详尽深入**的中文口播新闻稿。\
-        当前时间是 {}。\
+        "请为'{}'类别的新闻生成一份详尽深入的中文口播新闻稿。\
+        \n\n时间背景：现在是{}，{}{}。\
         \n\n核心要求：\
-        \n1. **详尽报道**：基于提供的摘要，整合成连贯的报道。\
-        \n2. **逻辑串联**：使用自然流畅的过渡词。\
-        \n3. **口语风格**：适合TTS语音播报。\
-        \n4. **结构安排**：\
-        \n   - **开场**：'听众朋友们大家好，这里是FreshLoop {}版块...'\
-        \n   - **主体**：按重要性排序。\
-        \n   - **结尾**：简短结束语。\
-        \n5. **绝对纯净输出**：只输出新闻稿内容。\
+        \n1. 详尽报道：基于提供的摘要，整合成连贯的报道。\
+        \n2. 逻辑串联：使用自然流畅的过渡词。\
+        \n3. 口语风格：适合TTS语音播报，禁止使用任何格式符号如星号、下划线等。\
+        \n4. 动态开场：根据时间背景设计亲切的问候语，例如'{}{}'、结合是否是周末/节假日等，然后自然引入'欢迎收听FreshLoop {}版块，我是{}'。\
+        \n5. 动态结尾：根据时间设计温暖的结束语，如早间可以说'祝您今天工作顺利'，晚间可以说'祝您晚安好梦'，周末可以说'祝您周末愉快'。最后说'我是{}，感谢您收听FreshLoop'。\
+        \n6. 绝对纯净输出：只输出新闻稿纯文本内容，禁止使用Markdown格式。\
         \n\n新闻素材摘要：\n{}",
-        category_config.category, date_str, category_config.category, context_content
+        category, date_str, weekday, time_period, time_period, "好", category, host_name, host_name, context_content
     );
 
-    log::info!("Generating script for {}", category_config.category);
+    log::info!("Generating script for {} (Host: {})", category, host_name);
     
     // ... (existing summary generation) ...
     let summary = match llm.chat(&prompt).await {
@@ -378,19 +461,19 @@ async fn generate_and_broadcast(
         Err(e) => {
             log::warn!("LLM script generation failed: {}", e);
             // Fallback: just read the summaries
-            format!("大家好，以下是{}的简讯。\n\n{}", category_config.category, context_content)
+            format!("大家好，以下是{}的简讯。\n\n{}", category, context_content)
         }
     };
     log::info!("Received summary, length: {}. Starting proofreading...", summary.len());
 
     // 3.5 Proofreading Step (User Request)
     let proofread_prompt = format!(
-        "请对以下新闻稿进行**校对和润色**。\
+        "请对以下新闻稿进行校对和润色。\
         \n\n核心要求：\
-        \n1. **纠正错别字**：修复明显的拼写、词语错误。\
-        \n2. **修正语法**：使句子更通顺，符合中文口语习惯。\
-        \n3. **严禁大改**：**绝对不要**改变原稿的结构、顺序或删减内容。只做必要的微调。\
-        \n4. **输出限制**：只输出修正后的全文，不要包含任何解释或开场白。\
+        \n1. 纠正错别字：修复明显的拼写、词语错误。\
+        \n2. 修正语法：使句子更通顺，符合中文口语习惯。\
+        \n3. 严禁大改：绝对不要改变原稿的结构、顺序或删减内容。只做必要的微调。\
+        \n4. 纯文本输出：只输出修正后的全文，禁止使用任何Markdown格式符号如星号、下划线等。\
         \n\n原文：\n{}",
         summary
     );
@@ -417,7 +500,7 @@ async fn generate_and_broadcast(
 
     // ... (File naming, Upload, TTS, Push Item logic same as before)
     
-    let safe_category = category_config.category.replace(" ", "_").to_lowercase();
+    let safe_category = category.replace(" ", "_").to_lowercase();
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let base_filename = format!("{}_{}", safe_category, timestamp);
     let text_filename = format!("{}.txt", base_filename);
@@ -429,7 +512,13 @@ async fn generate_and_broadcast(
     // Clean Markdown/HTML for TTS from the PROOFREAD summary
     let tts_text = clean_for_tts(&final_summary);
     
-    let audio_data = tts.speak(&tts_text).await?;
+    // Use host-specific voice if available
+    let audio_data = if let Some(voice) = &host_voice {
+        log::info!("Using voice: {}", voice);
+        tts.speak_with_voice(&tts_text, voice).await?
+    } else {
+        tts.speak(&tts_text).await?
+    };
     let mut audio_url = None;
     if !audio_data.is_empty() {
         // Upload logic
@@ -453,16 +542,27 @@ async fn generate_and_broadcast(
     };
 
     let payload = ItemPayload {
-        title: format!("{} - Smart Daily", category_config.category),
-        summary: Some(final_summary), // Use proofread summary in payload
-        original_url: None,
+        id: None,
+        title: format!("{} - Smart Daily", category),
+        summary: Some(final_summary),
+        original_url: None, // TODO: We lose the original source URL here because we aggregated multiple items. 
+                            // Ideally, we should store a list of sources, but Item structure is 1:1.
+                            // For regeneration, we are regenerating the *aggregated* script.
+                            // So we actually NO LONGER have a single source URL. 
         cover_image_url: None,
         audio_url,
         publish_time: Some(chrono::Utc::now().timestamp()),
         duration_sec,
     };
 
-    nexus.push_item(payload).await?;
+    let item_id = nexus.push_item(payload).await?;
+    
+    // Store source links for this item
+    if !sources.is_empty() {
+        log::info!("Storing {} sources for item {}", sources.len(), item_id);
+        let _ = nexus.push_sources(&item_id, sources).await;
+    }
+    
     Ok(())
 }
 
@@ -533,6 +633,46 @@ fn clean_for_tts(input: &str) -> String {
     cleaned = re_space.replace_all(&cleaned, " ").to_string();
 
     cleaned.trim().to_string()
+}
+
+/// Normalize RSS content to clean Markdown format
+/// Handles: HTML, CDATA, plain text, and mixed formats
+fn normalize_content(raw: &str) -> String {
+    let trimmed = raw.trim();
+    
+    // 1. Handle CDATA wrapper
+    let content = if trimmed.starts_with("<![CDATA[") && trimmed.ends_with("]]>") {
+        trimmed
+            .trim_start_matches("<![CDATA[")
+            .trim_end_matches("]]>")
+            .to_string()
+    } else {
+        trimmed.to_string()
+    };
+    
+    // 2. Detect if content contains HTML tags
+    let has_html = content.contains('<') && content.contains('>') 
+        && (content.contains("</") || content.contains("/>") || content.contains("<br") || content.contains("<p"));
+    
+    // 3. Process based on content type
+    let processed = if has_html {
+        // Convert HTML to Markdown
+        html2md::parse_html(&content)
+    } else {
+        // Already plain text or markdown - just clean entities
+        content
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+    };
+    
+    // 4. Final cleanup - collapse whitespace
+    let re_space = Regex::new(r"\s+").unwrap();
+    re_space.replace_all(&processed, " ").trim().to_string()
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

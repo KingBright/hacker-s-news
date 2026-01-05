@@ -7,9 +7,18 @@ pub struct Config {
     pub nexus: NexusConfig,
     pub llm: LlmConfig,
     pub tts: TtsConfig,
-    pub news: Option<Vec<NewsCategory>>,
+    pub rss_feeds: Option<Vec<String>>,  // Flat list of RSS URLs
+    pub categories: Option<Vec<String>>, // Categories for LLM classification
+    pub hosts: Option<Vec<Host>>,
     pub interval_min: Option<u64>,
     pub schedule_times: Option<Vec<String>>, // Format: "HH:MM"
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Host {
+    pub name: String,
+    pub voice: String,
+    pub categories: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -42,14 +42,25 @@ impl TtsClient {
         let engine = self.config.engine.as_deref().unwrap_or("voxcpm");
         
         if engine == "voxcpm" {
-            return self.speak_voxcpm(text).await;
+            return self.speak_voxcpm(text, None).await;
         }
 
         // Fallback or other engines
         Err(anyhow::anyhow!("Unsupported TTS engine: {}", engine))
     }
 
-    async fn speak_voxcpm(&self, text: &str) -> Result<Vec<u8>> {
+    /// Speak with a specific voice file (for multi-host support)
+    pub async fn speak_with_voice(&self, text: &str, voice_path: &str) -> Result<Vec<u8>> {
+        let engine = self.config.engine.as_deref().unwrap_or("voxcpm");
+        
+        if engine == "voxcpm" {
+            return self.speak_voxcpm(text, Some(voice_path.to_string())).await;
+        }
+
+        Err(anyhow::anyhow!("Unsupported TTS engine: {}", engine))
+    }
+
+    async fn speak_voxcpm(&self, text: &str, voice_override: Option<String>) -> Result<Vec<u8>> {
         let vox_config = self.config.voxcpm.as_ref()
             .ok_or_else(|| anyhow::anyhow!("VoxCPM config missing"))?;
             
@@ -121,7 +132,8 @@ impl TtsClient {
 
             // Parameters
             let prompt_text = vox_config.prompt_text.clone();
-            let prompt_wav_path = vox_config.prompt_wav_path.clone();
+            // Use voice_override if provided, otherwise use default from config
+            let prompt_wav_path = voice_override.clone().or(vox_config.prompt_wav_path.clone());
             
             let start = std::time::Instant::now();
             let audio_tensor = model.inference(

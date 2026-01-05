@@ -66,3 +66,76 @@ pub async fn complete_item(
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
+
+// === Source Links API ===
+
+#[derive(Deserialize)]
+pub struct SourceItem {
+    pub url: String,
+    pub title: String,
+    pub summary: String,
+}
+
+#[derive(Deserialize)]
+pub struct PushSourcesRequest {
+    pub sources: Vec<SourceItem>,
+}
+
+pub async fn push_sources(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Json(payload): Json<PushSourcesRequest>,
+) -> impl IntoResponse {
+    // Check Auth
+    let api_key = headers.get("X-NEXUS-KEY").and_then(|v| v.to_str().ok());
+    if api_key != Some(&state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "Invalid API Key").into_response();
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    
+    for source in payload.sources {
+        let id = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO item_sources (id, item_id, source_url, source_title, source_summary, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&id)
+        .bind(&item_id)
+        .bind(&source.url)
+        .bind(&source.title)
+        .bind(&source.summary)
+        .bind(now)
+        .execute(&state.db)
+        .await;
+    }
+
+    StatusCode::OK.into_response()
+}
+
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct ItemSource {
+    pub id: String,
+    pub item_id: String,
+    pub source_url: String,
+    pub source_title: Option<String>,
+    pub source_summary: Option<String>,
+    pub created_at: Option<i64>,
+}
+
+pub async fn get_sources(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+) -> impl IntoResponse {
+    let sources = sqlx::query_as::<_, ItemSource>(
+        "SELECT id, item_id, source_url, source_title, source_summary, created_at FROM item_sources WHERE item_id = ? ORDER BY created_at ASC"
+    )
+    .bind(&item_id)
+    .fetch_all(&state.db)
+    .await;
+
+    match sources {
+        Ok(sources) => Json(sources).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}

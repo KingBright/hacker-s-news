@@ -37,6 +37,14 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
             category TEXT NOT NULL,
             created_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS item_sources (
+            id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            source_title TEXT,
+            source_summary TEXT,
+            created_at INTEGER
+        );
         "#
     )
     .execute(&pool)
