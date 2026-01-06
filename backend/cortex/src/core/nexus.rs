@@ -20,6 +20,7 @@ pub struct ItemPayload {
     pub publish_time: Option<i64>,
     pub duration_sec: Option<i64>,
     pub sources: Option<Vec<SourceInfo>>,
+    pub category: Option<String>,
 }
 
 impl NexusClient {
@@ -83,6 +84,37 @@ impl NexusClient {
         Ok(item_id)
     }
 
+    pub async fn push_item_multipart(&self, item: ItemPayload, audio_data: Option<Vec<u8>>) -> Result<String> {
+        let url = format!("{}/api/internal/items/multipart", self.config.api_url);
+        
+        let mut form = multipart::Form::new()
+            .text("payload", serde_json::to_string(&item)?);
+
+        if let Some(audio) = audio_data {
+            let part = multipart::Part::bytes(audio)
+                .file_name("audio.mp3")
+                .mime_str("audio/mpeg")?;
+            form = form.part("file", part);
+        }
+
+        let res = self.client.post(&url)
+            .header("X-NEXUS-KEY", &self.config.auth_key)
+            .multipart(form)
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+             let status = res.status();
+             let text = res.text().await.unwrap_or_default();
+             return Err(anyhow!("Failed to push multipart item: {} - {}", status, text));
+        }
+        
+        // Parse response to get item ID
+        let json: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
+        let item_id = json["id"].as_str().unwrap_or("unknown").to_string();
+        Ok(item_id)
+    }
+
     pub async fn check_urls(&self, urls: Vec<String>) -> Result<Vec<String>> {
         let url = format!("{}/api/internal/dedup/check", self.config.api_url);
         let res = self.client.post(&url)
@@ -137,9 +169,41 @@ impl NexusClient {
                  publish_time: v["publish_time"].as_i64(),
                  duration_sec: v["duration_sec"].as_i64(),
                  sources: None,
+                 category: v["category"].as_str().map(|s| s.to_string()),
             }
         }).collect();
         
+        Ok(payloads)
+    }
+
+    pub async fn fetch_recent_items(&self, limit: u32) -> Result<Vec<ItemPayload>> {
+        let url = format!("{}/api/items?limit={}", self.config.api_url, limit);
+        let res = self.client.get(&url)
+            // No auth needed for public items, but sending key doesn't hurt if we want internal view?
+            // Actually list_items is usually public. 
+            // Check routes setup? Assuming public.
+            .send()
+            .await?;
+            
+        if !res.status().is_success() {
+             return Err(anyhow!("Failed to fetch recent items: {}", res.status()));
+        }
+
+        let items: Vec<serde_json::Value> = res.json().await?;
+        let payloads = items.into_iter().map(|v| {
+            ItemPayload {
+                 id: v["id"].as_str().map(|s| s.to_string()),
+                 title: v["title"].as_str().unwrap_or_default().to_string(),
+                 summary: v["summary"].as_str().map(|s| s.to_string()),
+                 original_url: v["original_url"].as_str().map(|s| s.to_string()),
+                 cover_image_url: v["cover_image_url"].as_str().map(|s| s.to_string()),
+                 audio_url: v["audio_url"].as_str().map(|s| s.to_string()),
+                 publish_time: v["publish_time"].as_i64(),
+                 duration_sec: v["duration_sec"].as_i64(),
+                 sources: None,
+                 category: v["category"].as_str().map(|s| s.to_string()),
+            }
+        }).collect();
         Ok(payloads)
     }
 

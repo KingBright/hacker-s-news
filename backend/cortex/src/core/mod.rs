@@ -4,3 +4,6 @@ pub mod tts;
 pub mod nexus;
 pub mod news;
 pub mod retry;
+pub mod topic_registry;
+pub mod news_buffer;
+pub mod aggregator;

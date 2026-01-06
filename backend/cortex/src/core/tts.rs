@@ -191,4 +191,38 @@ impl TtsClient {
         
         Ok(wav_bytes)
     }
+
+    /// Helper: Convert WAV bytes to MP3 using ffmpeg
+    pub fn convert_to_mp3(&self, wav_bytes: &[u8]) -> Result<Vec<u8>> {
+        use std::process::{Command, Stdio};
+        use std::io::Write;
+
+        let mut child = Command::new("ffmpeg")
+            .args(&[
+                "-f", "wav",       // Input format
+                "-i", "pipe:0",    // Read from stdin
+                "-f", "mp3",       // Output format
+                "-b:a", "128k",     // Bitrate (128k is good balance)
+                "pipe:1"           // Write to stdout
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()) // Suppress ffmpeg logs
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn ffmpeg: {}", e))?;
+
+        // Write WAV to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(wav_bytes)?;
+        }
+
+        // Read MP3 from stdout
+        let output = child.wait_with_output()?;
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("ffmpeg failed with status: {}", output.status));
+        }
+
+        Ok(output.stdout)
+    }
 }

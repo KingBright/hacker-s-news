@@ -67,7 +67,22 @@ tags = ["Tech", "Global"]
 
     let config = load_config(&config_path)?;
 
-    let llm = Arc::new(cortex::core::llm::LlmClient::new(config.llm.clone()));
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    
+    // LLM Audit Log & Cache Path
+    let llm_log_path = std::path::PathBuf::from(format!("{}/.freshloop/logs/llm_audit.log", home_dir));
+    let llm_cache_path = std::path::PathBuf::from(format!("{}/.freshloop/cache/llm_cache", home_dir));
+    
+    // Ensure log dir exists
+    if let Some(parent) = llm_log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Ensure cache dir exists
+    if let Some(parent) = llm_cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let llm = Arc::new(cortex::core::llm::LlmClient::new(config.llm.clone(), Some(llm_log_path), Some(llm_cache_path)));
     let tts = Arc::new(cortex::core::tts::TtsClient::new(config.tts.clone()));
     let nexus = Arc::new(cortex::core::nexus::NexusClient::new(config.nexus.clone()));
     
@@ -91,7 +106,7 @@ tags = ["Tech", "Global"]
     log::info!("Starting Cortex service...");
 
     // Run the main news loop
-    cortex::core::news::run_news_loop(config, llm, tts, nexus, retry_manager).await;
+    cortex::core::news::run_news_loop(config, llm, tts, nexus, retry_manager, cache_dir).await;
 
     Ok(())
 }

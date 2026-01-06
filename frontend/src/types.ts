@@ -12,4 +12,6 @@ export interface Item {
   tags?: string | null;
   is_deleted?: boolean | null;
   duration_sec?: number | null;
+  status?: string;
+  category?: string;
 }

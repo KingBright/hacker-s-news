@@ -29,7 +29,8 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
             rating INTEGER,
             tags TEXT,
             is_deleted BOOLEAN DEFAULT 0,
-            status TEXT DEFAULT 'published'
+            status TEXT DEFAULT 'published',
+            category TEXT
         );
         CREATE TABLE IF NOT EXISTS source_items (
             id TEXT PRIMARY KEY,
@@ -45,6 +46,18 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
             source_summary TEXT,
             created_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS user_history (
+            user_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            played_at INTEGER,
+            PRIMARY KEY (user_id, item_id)
+        );
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at INTEGER
+        );
         "#
     )
     .execute(&pool)
@@ -56,7 +69,8 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN tags TEXT").execute(&pool).await;
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN is_deleted BOOLEAN DEFAULT 0").execute(&pool).await;
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN duration_sec INTEGER").execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE items ADD COLUMN status TEXT DEFAULT 'published'").execute(&pool).await; // New status column
+    let _ = sqlx::query("ALTER TABLE items ADD COLUMN status TEXT DEFAULT 'published'").execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE items ADD COLUMN category TEXT").execute(&pool).await; // New category column
 
     Ok(pool)
 }
