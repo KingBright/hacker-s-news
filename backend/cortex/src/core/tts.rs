@@ -192,10 +192,11 @@ impl TtsClient {
         Ok(wav_bytes)
     }
 
-    /// Helper: Convert WAV bytes to MP3 using ffmpeg
-    pub fn convert_to_mp3(&self, wav_bytes: &[u8]) -> Result<Vec<u8>> {
-        use std::process::{Command, Stdio};
-        use std::io::Write;
+    /// Helper: Convert WAV bytes to MP3 using ffmpeg (Async to prevent deadlock)
+    pub async fn convert_to_mp3(&self, wav_bytes: &[u8]) -> Result<Vec<u8>> {
+        use tokio::process::Command;
+        use std::process::Stdio;
+        use tokio::io::AsyncWriteExt;
 
         let mut child = Command::new("ffmpeg")
             .args(&[
@@ -211,13 +212,18 @@ impl TtsClient {
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn ffmpeg: {}", e))?;
 
-        // Write WAV to stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(wav_bytes)?;
-        }
+        let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdin"))?;
+        let data = wav_bytes.to_vec();
+
+        // Spawn writer to avoid deadlock on large files
+        tokio::spawn(async move {
+            if let Err(e) = stdin.write_all(&data).await {
+                log::error!("Failed to write to ffmpeg stdin: {}", e);
+            }
+        });
 
         // Read MP3 from stdout
-        let output = child.wait_with_output()?;
+        let output = child.wait_with_output().await?;
 
         if !output.status.success() {
             return Err(anyhow::anyhow!("ffmpeg failed with status: {}", output.status));

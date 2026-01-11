@@ -256,8 +256,9 @@ export default function Home() {
   };
 
   // Derived sorted lists
+  // Backend already filters out played items for logged-in users
   const pendingItems = items
-    .filter(i => !playedIds.has(i.id))
+    .filter(i => !playedIds.has(i.id))  // Still filter locally for client-side state updates
     .sort((a, b) => (user ? (a.publish_time || 0) - (b.publish_time || 0) : (b.publish_time || 0) - (a.publish_time || 0))); // Old -> New
 
   // Correction: User requested Old->New (Oldest first). 
@@ -274,7 +275,11 @@ export default function Home() {
   const fetchItems = useCallback(async (pageNum: number, isRefresh = false) => {
     setIsLoading(true);
     try {
-      const res = await fetch(`/api/items?page=${pageNum}&limit=50`); // Fetch more to ensure we have a good buffer
+      const headers: HeadersInit = {};
+      if (user) {
+        headers['x-user-id'] = user.id;
+      }
+      const res = await fetch(`/api/items?page=${pageNum}&limit=50`, { headers }); // Fetch more to ensure we have a good buffer
       const data = await res.json();
 
       setItems(prev => {
@@ -291,7 +296,7 @@ export default function Home() {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [user]);
 
   // Initial Load (Auto-fetch)
   useEffect(() => {
@@ -1007,7 +1012,7 @@ export default function Home() {
                 <div className="flex items-center justify-between p-6 border-b border-white/5 shrink-0 bg-surface-dark/50 z-10 rounded-t-3xl">
                   <div className="pr-4">
                     <p className="text-[#93c8a8] text-xs font-bold uppercase tracking-wider mb-2">文稿</p>
-                    <h3 className="text-xl font-bold text-white leading-tight truncate">{transcriptItem.title}</h3>
+                    <h3 className="text-xl font-bold text-white leading-tight line-clamp-2 break-words">{transcriptItem.title}</h3>
                   </div>
                 </div>
 

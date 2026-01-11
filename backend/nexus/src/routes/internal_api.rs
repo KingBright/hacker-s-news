@@ -18,9 +18,11 @@ pub async fn list_pending_items(
         return (StatusCode::UNAUTHORIZED, "Invalid API Key").into_response();
     }
 
+    let cutoff = chrono::Utc::now().timestamp() - 72 * 3600; // 72 hours
     let items = sqlx::query_as::<_, Item>(
-        "SELECT id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at, rating, tags, is_deleted, duration_sec, status FROM items WHERE status = 'pending_regen'",
+        "SELECT id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at, rating, tags, is_deleted, duration_sec, status FROM items WHERE status = 'pending_regen' AND publish_time > ?",
     )
+    .bind(cutoff)
     .fetch_all(&state.db)
     .await;
 

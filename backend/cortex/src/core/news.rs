@@ -223,20 +223,33 @@ pub async fn run_news_loop(
 
         // 3. Classify and Buffer Steps (v2.0)
         let categories = config.categories.clone().unwrap_or_else(|| {
-            vec!["Tech".to_string(), "Economy".to_string(), "Politics".to_string(), "Gaming".to_string(), "Other".to_string()]
+            vec![
+                crate::core::config::CategoryDef { name: "Tech".to_string(), description: "Technology news".to_string() },
+                crate::core::config::CategoryDef { name: "Other".to_string(), description: "Other news".to_string() },
+            ]
         });
-        let topics_str = categories.join(", ");
+        let topics_str = categories.iter()
+            .map(|c| format!("- {}: {}", c.name, c.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        
+        // Build official category name list for validation
+        let valid_category_names: Vec<String> = categories.iter().map(|c| c.name.clone()).collect();
+        // Build explicit category name list for stricter prompt
+        let category_names_str = valid_category_names.join("、");
 
         for item in unique_items {
             let clean_desc = clean_text(&item.description, 1000); 
             let analysis_prompt = format!(
                 "Analyze this news item.\nTitle: {}\nContent: {}\n\n\
                 Task:\n\
-                1. Classify into ONE of: [{}].\n\
+                1. Classify into EXACTLY ONE of these categories:\n{}\n\
+                **IMPORTANT**: The category field MUST be one of: [{}]\n\
+                   Copy the name exactly. Do NOT use synonyms or variations.\n\
                 2. Summarize into 2 sentences (Chinese).\n\
-                3. translate title into Chinese.\n\
+                3. Translate title into Chinese.\n\
                 Output JSON only: {{ \"category\": \"...\", \"summary\": \"...\", \"title\": \"...\", \"score\": 8 }}",
-                item.title, clean_desc, topics_str
+                item.title, clean_desc, topics_str, category_names_str
             );
 
             // Sequential LLM calls (Pre-filter layer)
@@ -256,14 +269,44 @@ pub async fn run_news_loop(
                             continue;
                         }
 
-                        log::info!("Buffering item: [{}] {}", analysis.category, analysis.title);
+                        // Normalize category: match LLM output to official config names
+                        let normalized_category = {
+                            let llm_cat = analysis.category.trim();
+                            // 1. Exact match
+                            if valid_category_names.contains(&llm_cat.to_string()) {
+                                llm_cat.to_string()
+                            } else {
+                                // 2. Fuzzy match: check if LLM output contains/is contained by any valid name
+                                let mut matched = None;
+                                for valid_name in &valid_category_names {
+                                    // Check bidirectional containment (e.g., "硬件数码" contains "硬件")
+                                    if valid_name.contains(llm_cat) || llm_cat.contains(valid_name.as_str()) {
+                                        matched = Some(valid_name.clone());
+                                        break;
+                                    }
+                                }
+                                match matched {
+                                    Some(name) => {
+                                        log::info!("[CATEGORY FIX] Normalized '{}' -> '{}'", llm_cat, name);
+                                        name
+                                    }
+                                    None => {
+                                        // 3. Fallback: use "其他"
+                                        log::warn!("[CATEGORY FIX] Unknown category '{}', falling back to '其他'", llm_cat);
+                                        "其他".to_string()
+                                    }
+                                }
+                            }
+                        };
+
+                        log::info!("Buffering item: [{}] {}", normalized_category, analysis.title);
                         
                         // Push to Buffer with intelligent clustering
                         let pending = PendingNewsItem {
                             title: analysis.title,
                             link: item.link.clone(),
                             description: analysis.summary,
-                            category: analysis.category,
+                            category: normalized_category,
                             source_name: item.source_name.clone(),
                             timestamp: chrono::Utc::now().timestamp() as u64,
                         };

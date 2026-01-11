@@ -59,6 +59,8 @@ cat <<EOF > "$PLIST_PATH"
     <string>$WORK_DIR</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>RUST_LOG</key>
         <string>info</string>
     </dict>

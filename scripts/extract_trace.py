@@ -93,9 +93,9 @@ def find_matching_trace(target_item):
         if dt > publish_dt:
             continue
             
-        # 3. Window Check (Within 60 mins)
+        # 3. Window Check (Within 3 hours - generation can take a while)
         delta = publish_dt - dt
-        if delta.total_seconds() > 3600:
+        if delta.total_seconds() > 10800:
             continue
             
         candidates.append((delta.total_seconds(), f))
@@ -236,17 +236,34 @@ def generate_story_report(item, trace_content, sources):
     report += "## 🎬 Chapter 1: The Final Script\n\n"
     report += "> This is the final audio content delivered to the user.\n\n"
     
-    # Look for "Segment Writer Result" steps
+    # Look for "Segment Result" steps (new format)
+    # FIX: Track attempts per group - only use the LAST attempt's result
+    # Pattern: Segment Gen shows "attempt N" - when we see "attempt 1" for a new group,
+    # we finalize the previous group's last result
+    
     script_segments = []
-    for s in steps:
-        if "Segment Writer Result" in s['name']:
-            # Extract LLM Response content
+    current_group_last_result = None
+    
+    for i, s in enumerate(steps):
+        if "Segment Gen" in s['name']:
+            # Check if this is a new group (attempt 1)
+            content_str = "\n".join(s['content'][:5])  # Only check first few lines
+            if "attempt 1" in content_str:
+                # Starting a new group - save the previous group's last result
+                if current_group_last_result:
+                    script_segments.append(current_group_last_result)
+                current_group_last_result = None  # Reset for new group
+                
+        elif "Segment Result" in s['name']:
+            # Extract LLM Response content - always overwrite (keep last)
             content_str = "\n".join(s['content'])
-            # Simple regex to find content block inside ```text ... ```
-            # Note: The trace format has **LLM Response**:\n```text\n(content)\n```
             resp_match = re.search(r"\*\*LLM Response\*\*:\n```text\n(.*?)\n```", content_str, re.DOTALL)
             if resp_match:
-               script_segments.append(resp_match.group(1).strip())
+                current_group_last_result = resp_match.group(1).strip()
+    
+    # Don't forget the last group's result
+    if current_group_last_result:
+        script_segments.append(current_group_last_result)
     
     if script_segments:
         for i, seg in enumerate(script_segments):
@@ -261,38 +278,37 @@ def generate_story_report(item, trace_content, sources):
     report += "## 📐 Chapter 2: The Blueprint (Planning)\n\n"
     report += "> How the AI decided to arrange the stories.\n\n"
     
-    plan_step = next((s for s in steps if "Plan Episode Flow" in s['name']), None)
+    plan_step = next((s for s in steps if "Planning Phase 2" in s['name']), None)
     
     item_map = {} # ID -> Title mapping from Planning Prompt
     
     if plan_step:
         content_str = "\n".join(plan_step['content'])
         
-        # Extract Prompt Logic
-        prompt_match = re.search(r"\*\*LLM Prompt\*\*:.*?(Role:.*?)```", content_str, re.DOTALL)
-        if prompt_match:
-            prompt_text = prompt_match.group(1)
-            # Extract logic definitions (Principles)
-            principles = re.findall(r"(\d+\. \*\*.*?\*\*:.*)", prompt_text)
-            if principles:
-                report += "### Core Principles Used:\n" + "\n".join([f"- {p}" for p in principles]) + "\n\n"
+        # Extract Group -> Title Map from prompt (new format: Group N: Title)
+        group_map = {}  # group_index -> title
+        group_matches = re.findall(r"Group (\d+): (.+)", content_str)
+        for gid, gtitle in group_matches:
+            group_map[int(gid)] = gtitle.strip()
                 
-            # Extract ID -> Title Map from prompt
-            # Pattern: - 01dcf2a6: [Source] Title
-            # We use this to map Short IDs to Titles
-            raw_items = re.findall(r"- ([a-f0-9]+): (.*)", prompt_text)
-            for rid, rtitle in raw_items:
-                item_map[rid] = rtitle.strip()
-                
-        # Extract JSON Decision
+        # Extract JSON Decision (new format with group_index, action, transition_rationale)
         json_match = re.search(r"\*\*LLM Response\*\*:\n```text\n(\[.*?\])\n```", content_str, re.DOTALL)
         if json_match:
             try:
                 order = json.loads(json_match.group(1))
                 report += "### Planned Sequence:\n"
-                for i, short_id in enumerate(order):
-                    title = item_map.get(short_id, "Unknown Item")
-                    report += f"{i+1}. **{title}** (`{short_id}`)\n"
+                for i, step in enumerate(order):
+                    if isinstance(step, dict):
+                        group_idx = step.get('group_index', 0)
+                        action = step.get('action', 'sequence')
+                        rationale = step.get('transition_rationale', '')
+                        title = group_map.get(group_idx, f"Group {group_idx}")
+                        report += f"{i+1}. **{title}** [{action}]\n"
+                        if rationale:
+                            report += f"   > *Transition: {rationale}*\n"
+                    else:
+                        # Fallback for old format (just ID string)
+                        report += f"{i+1}. `{step}`\n"
             except:
                 report += "Failed to parse planning JSON.\n"
     else:
@@ -304,19 +320,20 @@ def generate_story_report(item, trace_content, sources):
     report += "## 🏭 Chapter 3: Production Log (Deep Dive)\n\n"
     report += "> Detailed view of sources and transformation for each segment.\n\n"
     
-    # We iterate through Segments again, but this time show Inputs -> Draft -> Final
-    # Note: Structure is "Segment Writer Result" contains the Prompt (with inputs) and Response (Draft).
+    # New format: Segment Gen has prompt, Segment Result has response
+    # We need to pair them together
+    gen_steps = [s for s in steps if "Segment Gen" in s['name']]
+    result_steps = [s for s in steps if "Segment Result" in s['name']]
     
-    writer_steps = [s for s in steps if "Segment Writer Result" in s['name']]
-    
-    for i, step in enumerate(writer_steps):
-        content_str = "\n".join(step['content'])
+    for i, gen_step in enumerate(gen_steps):
+        gen_content = "\n".join(gen_step['content'])
+        result_content = "\n".join(result_steps[i]['content']) if i < len(result_steps) else ""
         
         # Identify Batch Items from Prompt
         report += f"### Segment {i+1} Production\n"
         
         # Extract Prompt Materials
-        materials_match = re.search(r"【新闻素材】\n(.*?)\n【核心要求", content_str, re.DOTALL)
+        materials_match = re.search(r"【新闻素材】\n(.*?)\n【核心要求", gen_content, re.DOTALL)
         if materials_match:
             materials_raw = materials_match.group(1)
             report += "**Input Sources:**\n"
@@ -391,9 +408,9 @@ def generate_story_report(item, trace_content, sources):
                         report += f"  *Source: {item['source']}*\n"
             report += "\n"
         
-        # Extract Draft/Output
+        # Extract Draft/Output from the paired Segment Result step
         report += "**LLM Output (Final Draft)**:\n"
-        resp_match = re.search(r"\*\*LLM Response\*\*:\n```text\n(.*?)\n```", content_str, re.DOTALL)
+        resp_match = re.search(r"\*\*LLM Response\*\*:\n```text\n(.*?)\n```", result_content, re.DOTALL)
         if resp_match:
              report += "```text\n" + resp_match.group(1).strip() + "\n```\n"
         

@@ -2,7 +2,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use cortex::core::config::{load_config, NewsCategory};
+use cortex::core::config::load_config;
 use cortex::core::llm::LlmClient;
 use cortex::core::tts::TtsClient;
 use cortex::core::nexus::{NexusClient, ItemPayload};

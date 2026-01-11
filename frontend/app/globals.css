@@ -24,6 +24,9 @@ body {
   color: var(--foreground);
   background: var(--background);
   font-family: var(--font-display), sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
 }
 
 /* Custom scrollbar for webkit */
@@ -82,4 +85,10 @@ body {
   display: inline-block;
   vertical-align: middle;
   margin-right: -2px;
+}
+
+/* Prevent browser dictionary/quick answers on icon fonts */
+.material-symbols-outlined {
+  user-select: none;
+  -webkit-user-select: none;
 }

@@ -8,7 +8,7 @@ pub struct Config {
     pub llm: LlmConfig,
     pub tts: TtsConfig,
     pub rss_feeds: Option<Vec<String>>,  // Flat list of RSS URLs
-    pub categories: Option<Vec<String>>, // Categories for LLM classification
+    pub categories: Option<Vec<CategoryDef>>, // Categories with descriptions for LLM classification
     pub hosts: Option<Vec<Host>>,
     pub interval_min: Option<u64>,
     pub schedule_times: Option<Vec<String>>, // Format: "HH:MM"
@@ -48,9 +48,9 @@ pub struct VoxCPMConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct NewsCategory {
-    pub category: String,
-    pub urls: Vec<String>,
+pub struct CategoryDef {
+    pub name: String,
+    pub description: String,
 }
 
 pub fn load_config(path: &str) -> Result<Config> {

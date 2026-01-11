@@ -55,18 +55,43 @@ pub struct Pagination {
 
 pub async fn list_items(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(pagination): Query<Pagination>,
 ) -> impl IntoResponse {
     let limit = pagination.limit.unwrap_or(20);
     let offset = (pagination.page.unwrap_or(1) - 1) * limit;
 
-    let items = sqlx::query_as::<_, Item>(
-        "SELECT id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at, rating, tags, is_deleted, duration_sec, status, category FROM items WHERE is_deleted = 0 OR is_deleted IS NULL ORDER BY publish_time DESC LIMIT ? OFFSET ?",
-    )
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.db)
-    .await;
+    // Extract user_id from header for filtering listened items
+    let user_id = headers.get("x-user-id").and_then(|v| v.to_str().ok());
+
+    let items = if let Some(uid) = user_id {
+        // For logged-in users: exclude items in user_history
+        sqlx::query_as::<_, Item>(
+            r#"
+            SELECT i.id, i.title, i.summary, i.original_url, i.cover_image_url, i.audio_url, 
+                   i.publish_time, i.created_at, i.rating, i.tags, i.is_deleted, i.duration_sec, i.status, i.category
+            FROM items i
+            LEFT JOIN user_history uh ON i.id = uh.item_id AND uh.user_id = ?
+            WHERE (i.is_deleted = 0 OR i.is_deleted IS NULL) AND uh.item_id IS NULL
+            ORDER BY i.publish_time DESC 
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(uid)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await
+    } else {
+        // For guests: return all items
+        sqlx::query_as::<_, Item>(
+            "SELECT id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at, rating, tags, is_deleted, duration_sec, status, category FROM items WHERE is_deleted = 0 OR is_deleted IS NULL ORDER BY publish_time DESC LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await
+    };
 
     match items {
         Ok(items) => Json(items).into_response(),
@@ -87,6 +112,44 @@ pub async fn create_item(
 
     let id = Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().timestamp();
+
+    // === INGESTION FILTERING (Systematic Hardening) ===
+
+    // 1. Stale Check: Reject items older than 7 days
+    if let Some(pub_time) = payload.publish_time {
+        let now = created_at;
+        if pub_time < now - 7 * 24 * 3600 {
+            return Json(json!({ "id": "skipped", "status": "skipped_stale", "reason": "Older than 7 days" })).into_response();
+        }
+    }
+
+    // 2. Duplicate Check (URL)
+    if let Some(url) = &payload.original_url {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM items WHERE original_url = ?)")
+            .bind(url)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(false);
+        
+        if exists {
+            return Json(json!({ "id": "skipped", "status": "skipped_dupe_url" })).into_response();
+        }
+    }
+
+    // 3. Duplicate Check (Title) WITHIN 7 DAYS
+    {
+        let cutoff = created_at - 7 * 24 * 3600;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM items WHERE title = ? AND publish_time > ?)")
+            .bind(&payload.title)
+            .bind(cutoff)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(false);
+
+        if exists {
+            return Json(json!({ "id": "skipped", "status": "skipped_dupe_title" })).into_response();
+        }
+    }
 
     let result = sqlx::query(
         r#"

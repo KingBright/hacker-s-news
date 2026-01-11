@@ -512,6 +512,21 @@ impl NewsAggregator {
         for (idx, cluster) in clusters.iter().enumerate() {
             let summary = cluster.merged_summary.as_ref().unwrap_or(&cluster.main_item.description);
             let combined_text = format!("{} {}", cluster.main_item.title, summary);
+
+            // --- HARD TIME FILTER (Mechanism 1) ---
+            // If main item is older than 72 hours, discard it to prevent "Timeline Paradox"
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+                
+            if cluster.main_item.timestamp < now_ts - 72 * 3600 {
+                log::info!("Time Filter: Discarding stale cluster '{}' (Age: {}h)", 
+                    cluster.main_item.title, 
+                    (now_ts - cluster.main_item.timestamp) / 3600);
+                continue;
+            }
+            // --------------------------------------
             
             // Check global history for previously reported topics
             if let Ok(Some(prev_record)) = self.registry.is_duplicate(&combined_text) {
@@ -545,6 +560,7 @@ impl NewsAggregator {
                             source_name: cluster.main_item.source_name.as_deref().unwrap_or("Unknown").to_string(),
                             original_url: cluster.main_item.link.clone(),
                             is_update: true,
+                            publish_time: cluster.main_item.timestamp as i64,
                         });
                     },
                     Ok(None) => {
@@ -580,6 +596,7 @@ impl NewsAggregator {
                     source_name: cluster.main_item.source_name.as_deref().unwrap_or("Unknown").to_string(),
                     original_url: cluster.main_item.link.clone(),
                     is_update: false,
+                    publish_time: cluster.main_item.timestamp as i64,
                 });
             }
             
@@ -674,17 +691,21 @@ impl NewsAggregator {
             
             // Step A: Intelligent Structure Planning (Sort + Group)
             let tracer_clone = logger.clone();
-            let groups = match self.plan_episode_structure(item_list, tracer_clone).await {
-                Ok(g) => {
-                    log::info!("Smart Flow: Planned {} groups", g.len());
-                    g
+            let plans = match self.plan_episode_structure(item_list, tracer_clone).await {
+                Ok(p) => {
+                    log::info!("Smart Flow: Planned {} segments", p.len());
+                    p
                 },
                 Err(e) => {
                     logger.lock().await.log("Planning Failed", &format!("Error: {}. Fallback to simple grouping.", e));
                     log::warn!("Smart Flow Planning failed: {}, falling back.", e);
-                    // Fallback: chunks of 4
+                    // Fallback: chunks of 4 with default sequence action
                     let ids: Vec<usize> = item_list.iter().map(|i| i.id).collect();
-                    ids.chunks(4).map(|c| c.to_vec()).collect()
+                    ids.chunks(4).map(|c| SegmentPlan {
+                        action: "sequence".to_string(),
+                        ids: c.to_vec(),
+                        transition_rationale: None,
+                    }).collect()
                 }
             };
 
@@ -697,11 +718,13 @@ impl NewsAggregator {
             // Step B: Generate segments by groups
             let mut segments = Vec::new();
             let mut prev_context = String::new();
-            let total_groups = groups.len();
+            let mut last_opening_phrase = String::new();
+            let total_plans = plans.len();
             
-            for (group_idx, group_ids) in groups.iter().enumerate() {
-                let is_first = group_idx == 0;
-                let is_last = group_idx == total_groups - 1;
+            for (plan_idx, plan) in plans.iter().enumerate() {
+                let is_first = plan_idx == 0;
+                let is_last = plan_idx == total_plans - 1;
+                let group_ids = &plan.ids;
                 
                 // Get items for this group
                 let group_items: Vec<BroadcastItem> = group_ids.iter()
@@ -718,13 +741,22 @@ impl NewsAggregator {
                     &group_items,
                     &prev_context,
                     &holiday_context,
+                    &last_opening_phrase,
+                    &plan.action,
+                    plan.transition_rationale.as_deref(), // v3.1: Planner-Driven Transition
                     is_first,
                     is_last,
                     logger.clone()
                 ).await?;
                 
-                // Update context for next segment (last sentence)
-                prev_context = Self::extract_last_sentence(&segment);
+                // Update context for next segment (Rich Context: Summary + Last Sentence)
+                let last_sentence = Self::extract_last_sentence(&segment);
+                let group_titles = group_items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>().join("、");
+                prev_context = format!("【上文刚播报了】：{}。\n【上文结尾句是】：\"{}\"", group_titles, last_sentence);
+                
+                // Capture opening (first 15 chars) to avoid repetition
+                last_opening_phrase = segment.chars().take(15).collect();
+
                 segments.push(segment);
             }
 
@@ -793,7 +825,7 @@ impl NewsAggregator {
              
              // CONVERT TO MP3
              logger.lock().await.log("Audio Processing", &format!("WAV generated ({}s). Converting to MP3 (128k)...", duration));
-             match self.tts.convert_to_mp3(&wav_audio_bytes) {
+             match self.tts.convert_to_mp3(&wav_audio_bytes).await {
                  Ok(mp3_bytes) => Some(mp3_bytes),
                  Err(e) => {
                      logger.lock().await.log("Audio Processing Error", &format!("MP3 Conversion failed: {}", e));
@@ -978,6 +1010,9 @@ impl NewsAggregator {
         items: &[BroadcastItem],
         prev_context: &str,
         holiday_context: &str,
+        avoid_opening: &str,
+        plan_action: &str,
+        transition_instruction: Option<&str>, // v3.1: Planner-Driven Transition
         is_first: bool,
         is_last: bool,
         logger: Arc<Mutex<TraceLogger>>
@@ -1011,13 +1046,18 @@ impl NewsAggregator {
                 opening_template
             )
         } else {
-            "这是节目的中间部分。请自然承接上一段，继续播报本段新闻。".to_string()
+            // v3.1: Inject Planner-Driven Transition if available
+            if let Some(rationale) = transition_instruction {
+                format!("这是节目的中间部分。【过渡指令 - 必须遵守】：{}", rationale)
+            } else {
+                "这是节目的中间部分。请【自然承接】上文。可以使用简短的过渡句（如总结上文并引入下文），建立上文、过渡、下文的流畅衔接。但**严禁**使用干巴巴且无信息量的接下来为您带来这种废话。过渡必须服务于逻辑流。".to_string()
+            }
         };
 
         let closing_instruction = if is_last {
             format!("播报完最后一条新闻后，使用以下固定结束语：\n「{}」", closing_template)
         } else {
-            "用一句简短过渡语引入下一段（如「接下来还有更多资讯」）。禁止制造悬念或过度渲染。".to_string()
+            "结尾要求：播报完即止。**不要**预告下一段内容（如下一段会讲...），也不要生成“让我们继续关注”等废话。直接停在最后一条新闻的结尾。".to_string()
         };
 
         let mut prompt = format!(
@@ -1026,7 +1066,10 @@ impl NewsAggregator {
             人设: {} (专业、客观、亲和。以清晰准确传递信息为首要目标)。\n\
             \n\
             【当前任务】\n\
-            接住上文（\"{}\"），播报本段新闻。\n\
+            接住上文信息：\n\
+            {}\n\
+            \n\
+            任务：请根据【上文提要】（如有）及【上文结尾句】自然过渡，播报本段新闻。\n\
             1. {}\n\
             2. {}\n\
             \n\
@@ -1041,8 +1084,23 @@ impl NewsAggregator {
             5. **弹性字数**：以听众理解为准。快讯可简短，复杂报道需充分展开。\n\
             6. **校对**：绝不允许错别字、语病。\n\
             7. **格式**：直接输出口播稿，不要Markdown。\n\
-            8. **禁止念出来源**：严禁在文稿中包含“(来源：XXX)”或“(Source: XXX)”这样的括号标注。如果必须提及，请融入句子中（如“据XXX报道”）。",
-            category, host_name, prev_context, instruction, closing_instruction, content_block
+            8. **时间一致性**：今天是{}。请注意新闻的时效性，不要把去年的旧闻当成未来计划说。比今天更早的事情应使用过去式。\n\
+            9. **Negative Constraints (禁止项)**：\n\
+               - 严禁使用“上一则关于...”或“刚才提到的...”这类元总结（Meta-commentary）。直接用逻辑过渡。\n\
+               - 严禁滥用“与此同时”（Meanwhile）。请使用更丰富的贴合内容的转折（如“把目光转向...”、“而在硬件方面...”）。\n\
+            10. **动作指令**：{}\n\
+            ",
+            category, host_name, prev_context, instruction, closing_instruction, content_block, date_str,
+            
+            // Dynamic Instruction based on Plan Action
+            if plan_action == "merge" {
+                "【MERGE模式 - 强制合并】检测到这组新闻是完全重复或极度相似的报道。你必须将它们【融合成一条】完整的新闻播报！\n\
+                 - 严禁分条罗列（如“此外...另外...”）。\n\
+                 - 提炼所有独特信息点（5W1H），合成一个连贯的叙事。\n\
+                 - 如果有多家媒体，可以说“据多家媒体报道...”"
+            } else {
+                "【SEQUENCE模式 - 顺播】这组新闻是不同的故事。请使用自然过渡词（如“与此同时”、“在科技领域...”）将它们串联起来，保持条理清晰。"
+            }
         );
 
         // Writer-Editor Loop
@@ -1276,106 +1334,154 @@ impl NewsAggregator {
         Ok((review.pass, review.critique))
     }
 
-    /// Step 1: LLM-driven Intelligent Structure Planning
-    /// Simultaneously sorts AND groups items based on content length and nature
-    async fn plan_episode_structure(&self, items: &[BroadcastItem], logger: Arc<Mutex<TraceLogger>>) -> Result<Vec<Vec<usize>>> {
-        // Show full content info (title + summary length + preview) so LLM can make informed decisions
+    /// Step 1 (New): Entity-Based Grouping (Clustering Phase)
+    async fn group_items_by_entity(&self, items: &[BroadcastItem]) -> Result<Vec<Vec<usize>>> {
         let item_list: String = items.iter()
-            .map(|item| {
-                let summary_preview: String = item.summary.chars().take(80).collect();
-                format!(
-                    "ID {}: 《{}》\n   摘要长度: {} 字\n   预览: {}...",
-                    item.id, item.title, 
-                    item.summary.chars().count(),
-                    summary_preview
-                )
-            })
+            .map(|item| format!("ID {}: {}", item.id, item.title))
             .collect::<Vec<_>>()
-            .join("\n\n");
+            .join("\n");
             
-        let mut prompt = format!(
-            "Role: 节目策划 (Showrunner)。\n\n\
-            任务：为这期播客编排结构，同时完成【排序】和【分组】。\n\n\
-            【待编排新闻】\n{}\n\n\
-            【编排原则】\n\
-            1. **黄金开头**：最重磅的新闻放第一组\n\
-            2. **主题聚合**：相关话题放同一组\n\
-            3. **动态分组**：\n\
-               - 快讯/短消息（摘要≤80字）：可以4-5条一组\n\
-               - 普通新闻（摘要80-200字）：2-4条一组\n\
-               - 深度报道/长内容（摘要>200字）：1-2条一组，甚至单独成组\n\
-            4. **节奏感**：硬新闻和软新闻交替\n\
-            5. **Kicker**：最后一组放有趣/轻松的内容\n\n\
-            【输出格式】仅输出JSON二维数组，表示分组后的ID：\n\
-            [[3,1,4], [2], [5,6,7]]\n\
-            （表示：第一组播3,1,4号；第二组单独播2号深度内容；第三组播5,6,7号）",
+        let prompt = format!(
+            "Role: Data Clustering Engine.\n\
+            Task: Group these news items into Clusters based on Entity/Event.\n\
+            \n\
+            Items:\n{}\n\
+            \n\
+            Rules:\n\
+            1. **Strict Grouping**: Items regarding the SAME product, company release, or specific event MUST be grouped.\n\
+               (e.g. 'Logitech Mouse' and 'Logitech Keyboard' -> Group them if launched together. 'Apple Earnings' and 'Apple Stock' -> Group.)\n\
+            2. **Singleton**: If an item has no relation to others, it is a group of one.\n\
+            3. **Coverage**: Every ID from input MUST be in exactly one group.\n\
+            \n\
+            Output JSON only: array of number arrays.\n\
+            Example: [[1, 3], [2], [4, 5]]",
             item_list
         );
 
-        let input_ids: std::collections::HashSet<usize> = items.iter().map(|i| i.id).collect();
-        let mut attempts = 0;
-        const MAX_RETRIES: usize = 3;
-
-        loop {
-            attempts += 1;
-            log::info!("Planning structure attempt {}/{}", attempts, MAX_RETRIES);
-            
-            let response = self.llm.chat(&prompt, false).await?;
-            
-            logger.lock().await.log_llm("Planning Structure", &format!("Grouping Attempt {}", attempts), &prompt, &response);
-            
-            // Parse JSON 2D array [[...], [...]]
-            let json_clean = response.trim().trim_matches('`').trim();
-            let start = json_clean.find('[').unwrap_or(0);
-            let end = json_clean.rfind(']').unwrap_or(json_clean.len().saturating_sub(1));
-            
-            let parse_result: Result<Vec<Vec<usize>>, anyhow::Error> = if start <= end && end < json_clean.len() {
-                serde_json::from_str(&json_clean[start..=end]).map_err(|e| e.into())
-            } else {
-                Err(anyhow::anyhow!("Invalid JSON range"))
-            };
-            
-            match parse_result {
-                Ok(groups) => {
-                    // VALIDATION: Check all IDs are present exactly once
-                    let output_ids: Vec<usize> = groups.iter().flatten().cloned().collect();
-                    let output_set: std::collections::HashSet<usize> = output_ids.iter().cloned().collect();
-                    
-                    if output_ids.len() != items.len() {
-                        log::warn!("Invalid structure: count mismatch (expected {}, got {})", items.len(), output_ids.len());
-                    } else if output_set != input_ids {
-                        let missing: Vec<_> = input_ids.difference(&output_set).collect();
-                        let extra: Vec<_> = output_set.difference(&input_ids).collect();
-                        log::warn!("Invalid structure: IDs mismatch (missing: {:?}, extra: {:?})", missing, extra);
-                    } else if groups.iter().any(|g| g.is_empty()) {
-                        log::warn!("Invalid structure: contains empty groups");
-                    } else {
-                        // All good
-                        log::info!("Structure planned: {} groups, sizes: {:?}", groups.len(), groups.iter().map(|g| g.len()).collect::<Vec<_>>());
-                        return Ok(groups);
-                    }
-                },
-                Err(e) => {
-                    log::warn!("Failed to parse structure JSON: {}", e);
-                }
-            }
-            
-            if attempts >= MAX_RETRIES {
-                log::error!("Max retries reached for structure planning. Falling back to simple grouping.");
-                break;
-            }
-            
-            // Add hint for next attempt
-            prompt.push_str("\n\n警告：上一次输出的格式或ID有误。请确保：\n1. 输出JSON二维数组格式 [[...], [...]]\n2. 包含所有且仅包含待编排新闻的ID\n3. 每个ID只出现一次\n4. 不要有空组");
+        let response = self.llm.chat(&prompt, false).await?;
+        
+        // Parse JSON
+        let json_clean = response.trim().trim_matches('`').trim();
+        let start = json_clean.find('[').unwrap_or(0);
+        let end = json_clean.rfind(']').unwrap_or(json_clean.len().saturating_sub(1));
+        
+        if start <= end && end < json_clean.len() {
+             let json_str = &json_clean[start..=end];
+             if let Ok(groups) = serde_json::from_str::<Vec<Vec<usize>>>(json_str) {
+                 // Basic Validation (ensure IDs exist)
+                 return Ok(groups);
+             }
         }
         
-        // Fallback: Simple grouping with batch_size 4
-        let mut groups = Vec::new();
-        let ids: Vec<usize> = items.iter().map(|i| i.id).collect();
-        for chunk in ids.chunks(4) {
-            groups.push(chunk.to_vec());
+        // Fallback: Each item is its own group
+        Ok(items.iter().map(|i| vec![i.id]).collect())
+    }
+
+    /// Step 2: Intelligent Structure Planning (Two-Pass: Cluster -> Sequence)
+    async fn plan_episode_structure(&self, items: &[BroadcastItem], logger: Arc<Mutex<TraceLogger>>) -> Result<Vec<SegmentPlan>> {
+        // Phase 1: Clustering
+        log::info!("Phase 1: Clustering {} items by entity...", items.len());
+        let groups = match self.group_items_by_entity(items).await {
+            Ok(g) => g,
+            Err(e) => {
+                log::warn!("Clustering failed: {}. Falling back to singletons.", e);
+                items.iter().map(|i| vec![i.id]).collect()
+            }
+        };
+        logger.lock().await.log("Clustering Result", &format!("{:?}", groups));
+
+        // Phase 2: Sequencing the Groups
+        // Prepare Meta-Items
+        let mut group_descriptions = Vec::new();
+        for (idx, group_ids) in groups.iter().enumerate() {
+            let titles: Vec<String> = group_ids.iter()
+                .filter_map(|id| items.iter().find(|i| i.id == *id).map(|i| i.title.clone()))
+                .collect();
+            group_descriptions.push(format!("Group {}: {}", idx, titles.join(" / ")));
         }
-        Ok(groups)
+
+        let prompt = format!(
+            "Role: Showrunner.\n\
+            Task: Sequence these News Groups into a flow.\n\
+            \n\
+            Groups:\n{}\n\
+            \n\
+            Output JSON List of Group Indices representing the order.\n\
+            Action Logic:\n\
+            - If Group has >1 items: Action will be 'merge' (if strict dupes) or 'sequence' (if related). Planner decides.\n\
+            \n\
+            Wait, to simplify: Just return the ORDER of Group Indices.\n\
+            Example: [0, 2, 1]",
+            group_descriptions.join("\n")
+        );
+        
+        // Wait, I need accurate Action determination for each group.
+        // Let's ask LLM to output Full Plan based on Groups.
+        let prompt_v2 = format!(
+             "Role: Showrunner.\n\
+             Task: Arrange these Story Groups into an Episode structure.\n\
+             \n\
+             Available Story Groups:\n{}\n\
+             \n\
+             Instructions:\n\
+             1. **Sequence**: Order groups logically (e.g. Tech Giants -> Hardware -> Science).\n\
+             2. **Action Decision**:\n\
+                - If a Group has multiple items (e.g. 'Logitech Mouse', 'Logitech Keyboard'), decide:\n\
+                  - 'merge': If they are part of the same announcement/event.\n\
+                  - 'sequence': If they are distinct updates.\n\
+             3. **Transition Rationale** (REQUIRED for non-first groups):\n\
+                - Explain WHY each group follows the previous one.\n\
+                - This will guide the writer on how to transition.\n\
+             4. **Output format**: JSON List of objects.\n\
+                [{{\"action\": \"merge\", \"group_index\": 0, \"transition_rationale\": null}}, {{\"action\": \"sequence\", \"group_index\": 1, \"transition_rationale\": \"From software to hardware - both relate to AI performance\"}}]\n\
+             \n\
+             Output JSON only.",
+             group_descriptions.join("\n")
+        );
+
+        let response = self.llm.chat(&prompt_v2, false).await?;
+        logger.lock().await.log_llm("Planning Phase 2", "Sequencing", &prompt_v2, &response);
+
+        // Parse Plan
+        #[derive(serde::Deserialize)]
+        struct Step {
+            action: String,
+            group_index: usize,
+            #[serde(default)]
+            transition_rationale: Option<String>,
+        }
+        
+        let json_clean = response.trim().trim_matches('`').trim();
+         let start = json_clean.find('[').unwrap_or(0);
+        let end = json_clean.rfind(']').unwrap_or(json_clean.len().saturating_sub(1));
+        
+        let steps: Vec<Step> = if start <= end {
+            serde_json::from_str(&json_clean[start..=end]).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Convert back to SegmentPlan (Map GroupIndex -> Real IDs)
+        let mut final_plans = Vec::new();
+        for step in steps {
+            if let Some(real_ids) = groups.get(step.group_index) {
+                final_plans.push(SegmentPlan {
+                    action: step.action,
+                    ids: real_ids.clone(),
+                    transition_rationale: step.transition_rationale, // v3.1
+                });
+            }
+        }
+        
+        // Fallback if empty or failed
+        if final_plans.is_empty() {
+             log::warn!("Planning V2 failed/empty. Using raw groups.");
+             for ids in groups {
+                 final_plans.push(SegmentPlan { action: "sequence".to_string(), ids, transition_rationale: None });
+             }
+        }
+
+        Ok(final_plans)
     }
 
 }
@@ -1388,6 +1494,7 @@ struct BroadcastItem {
     source_name: String,
     original_url: String,
     is_update: bool,
+    pub publish_time: i64,
 }
 
 fn clean_for_tts(input: &str) -> String {
@@ -1403,4 +1510,12 @@ fn clean_for_tts(input: &str) -> String {
     cleaned = re_source_cn.replace_all(&cleaned, "").to_string();
 
     cleaned
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct SegmentPlan {
+    action: String, // "sequence" | "merge"
+    ids: Vec<usize>,
+    #[serde(default)]
+    transition_rationale: Option<String>, // Planner-Driven Transition Logic
 }
