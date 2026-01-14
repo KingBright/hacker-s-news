@@ -1,17 +1,18 @@
+use anyhow::Result;
 use serde::Deserialize;
 use std::fs;
-use anyhow::Result;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub nexus: NexusConfig,
     pub llm: LlmConfig,
     pub tts: TtsConfig,
-    pub rss_feeds: Option<Vec<String>>,  // Flat list of RSS URLs
+    pub rss_feeds: Option<Vec<String>>, // Flat list of RSS URLs
     pub categories: Option<Vec<CategoryDef>>, // Categories with descriptions for LLM classification
     pub hosts: Option<Vec<Host>>,
     pub interval_min: Option<u64>,
     pub schedule_times: Option<Vec<String>>, // Format: "HH:MM"
+    pub timezone_offset: Option<i32>,        // Offset from UTC in hours (e.g., 8 for CST)
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -1,15 +1,14 @@
+use crate::core::config::LlmConfig;
 use anyhow::Result;
+use chrono::Local;
 use reqwest::Client;
 use serde_json::json;
-use crate::core::config::LlmConfig;
-use std::path::PathBuf;
 use std::fs::OpenOptions;
 use std::io::Write;
-use chrono::Local;
+use std::path::PathBuf;
 
-use sha2::{Sha256, Digest};
-use serde::{Serialize, Deserialize};
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const CACHE_TTL_SECS: i64 = 7 * 24 * 3600; // 7 days
 
@@ -27,11 +26,13 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
-    pub fn new(config: LlmConfig, audit_log_path: Option<PathBuf>, cache_path: Option<PathBuf>) -> Self {
-        let cache = cache_path.and_then(|path| {
-            sled::open(path).ok()
-        });
-        
+    pub fn new(
+        config: LlmConfig,
+        audit_log_path: Option<PathBuf>,
+        cache_path: Option<PathBuf>,
+    ) -> Self {
+        let cache = cache_path.and_then(|path| sled::open(path).ok());
+
         // Spawn Background GC
         if let Some(db) = &cache {
             let db_clone = db.clone();
@@ -41,15 +42,15 @@ impl LlmClient {
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await; // Check every hour
                     let now = Local::now().timestamp();
                     let mut count = 0;
-                    
+
                     for item in db_clone.iter() {
                         if let Ok((key, value)) = item {
-                             if let Ok(entry) = serde_json::from_slice::<CacheEntry>(&value) {
-                                 if now - entry.created_at > CACHE_TTL_SECS {
-                                     let _ = db_clone.remove(key);
-                                     count += 1;
-                                 }
-                             }
+                            if let Ok(entry) = serde_json::from_slice::<CacheEntry>(&value) {
+                                if now - entry.created_at > CACHE_TTL_SECS {
+                                    let _ = db_clone.remove(key);
+                                    count += 1;
+                                }
+                            }
                         }
                     }
                     if count > 0 {
@@ -59,7 +60,7 @@ impl LlmClient {
                 }
             });
         }
-        
+
         Self {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(180))
@@ -74,8 +75,11 @@ impl LlmClient {
     fn log_audit(&self, stage: &str, content: &str) {
         if let Some(path) = &self.audit_log_path {
             let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-            let log_entry = format!("--------------------------------------------------\n[{}] [{}]\n{}\n", timestamp, stage, content);
-            
+            let log_entry = format!(
+                "--------------------------------------------------\n[{}] [{}]\n{}\n",
+                timestamp, stage, content
+            );
+
             if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
                 let _ = writeln!(file, "{}", log_entry);
             }
@@ -123,33 +127,40 @@ impl LlmClient {
         });
 
         // Assume api_url is like "http://localhost:1234/v1"
-        let url = format!("{}/chat/completions", self.config.api_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            self.config.api_url.trim_end_matches('/')
+        );
 
-        log::info!("Sending LLM request to {} (Prompt Length: {} chars)", url, prompt.len());
+        log::info!(
+            "Sending LLM request to {} (Prompt Length: {} chars)",
+            url,
+            prompt.len()
+        );
         self.log_audit("INPUT", prompt);
 
-        let res = match self.client.post(&url)
-            .json(&body)
-            .send()
-            .await {
-                Ok(response) => response,
-                Err(e) => {
-                     log::warn!("Failed to connect to LLM at {}: {}", url, e);
-                     return Err(anyhow::anyhow!("LLM Connection Failed: {}", e));
-                }
-            };
+        let res = match self.client.post(&url).json(&body).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                log::warn!("Failed to connect to LLM at {}: {}", url, e);
+                return Err(anyhow::anyhow!("LLM Connection Failed: {}", e));
+            }
+        };
 
         if !res.status().is_success() {
-             let status = res.status();
-             let error_text = res.text().await.unwrap_or_default();
-             log::error!("LLM Error {}: {}", status, error_text);
-             self.log_audit("ERROR", &format!("Status: {}, Body: {}", status, error_text));
-             return Err(anyhow::anyhow!("LLM API Error {}: {}", status, error_text));
+            let status = res.status();
+            let error_text = res.text().await.unwrap_or_default();
+            log::error!("LLM Error {}: {}", status, error_text);
+            self.log_audit(
+                "ERROR",
+                &format!("Status: {}, Body: {}", status, error_text),
+            );
+            return Err(anyhow::anyhow!("LLM API Error {}: {}", status, error_text));
         }
 
         let response_json: serde_json::Value = res.json().await?;
         log::info!("Received LLM response (JSON parsed success).");
-        
+
         // Parse OpenAI format: choices[0].message.content
         let mut summary = response_json["choices"][0]["message"]["content"]
             .as_str()
@@ -161,9 +172,9 @@ impl LlmClient {
 
         // Strip <think> tags if present
         if let Some(idx) = summary.find("</think>") {
-             let thought = &summary[..idx + "</think>".len()];
-             self.log_audit("THOUGHT", thought);
-             summary = summary[idx + "</think>".len()..].trim().to_string();
+            let thought = &summary[..idx + "</think>".len()];
+            self.log_audit("THOUGHT", thought);
+            summary = summary[idx + "</think>".len()..].trim().to_string();
         }
 
         self.log_audit("OUTPUT", &summary);
@@ -171,17 +182,17 @@ impl LlmClient {
         // 2. Write to Cache
         if let Some(key) = &cache_key {
             if let Some(db) = &self.cache {
-                 let entry = CacheEntry {
-                     created_at: Local::now().timestamp(),
-                     content: summary.clone(),
-                 };
-                 if let Ok(bytes) = serde_json::to_vec(&entry) {
-                     if let Err(e) = db.insert(key, bytes) {
-                         log::warn!("Failed to write to LLM cache: {}", e);
-                     } else {
-                         let _ = db.flush();
-                     }
-                 }
+                let entry = CacheEntry {
+                    created_at: Local::now().timestamp(),
+                    content: summary.clone(),
+                };
+                if let Ok(bytes) = serde_json::to_vec(&entry) {
+                    if let Err(e) = db.insert(key, bytes) {
+                        log::warn!("Failed to write to LLM cache: {}", e);
+                    } else {
+                        let _ = db.flush();
+                    }
+                }
             }
         }
 

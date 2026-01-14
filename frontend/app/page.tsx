@@ -83,6 +83,11 @@ export default function Home() {
   const [debugMinimized, setDebugMinimized] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
 
+  // Playback Speed State
+  const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
+  const [showSpeedPicker, setShowSpeedPicker] = useState(false);
+  const SPEED_OPTIONS = [1.0, 1.25, 1.5, 1.75, 2.0];
+
   // Capture Logs
   useEffect(() => {
     const originalLog = console.log;
@@ -132,7 +137,6 @@ export default function Home() {
   // Load persistence (History from API + Resume from Local)
   useEffect(() => {
     // 1. Fetch History from Backend
-    // 1. Fetch History from Backend
     const headers: HeadersInit = {};
     if (user) {
       headers['x-user-id'] = user.id;
@@ -153,8 +157,8 @@ export default function Home() {
       if (storedResumeId) setCurrentId(storedResumeId);
       if (storedResumeTime) {
         const t = parseFloat(storedResumeTime);
-        setProgress(t);
         setResumeTime(t);
+        shouldAutoPlay.current = false; // Ensure restored state is PAUSED
       }
     } catch (e) {
       console.error("Failed to load local persistence", e);
@@ -171,8 +175,6 @@ export default function Home() {
 
     localStorage.setItem('freshloop_resume_id', currentId);
     localStorage.setItem('freshloop_resume_time', progress.toString());
-    localStorage.setItem('freshloop_resume_id', currentId);
-    localStorage.setItem('freshloop_resume_time', progress.toString());
   }, [currentId, progress, initialized, resumeTime]);
 
   // Restore Auth
@@ -183,6 +185,15 @@ export default function Home() {
         setUser(JSON.parse(storedUser));
       } catch (e) {
         console.error("Failed to parse stored user", e);
+      }
+    }
+
+    // Restore Playback Speed
+    const storedSpeed = localStorage.getItem('freshloop_playback_speed');
+    if (storedSpeed) {
+      const speed = parseFloat(storedSpeed);
+      if (SPEED_OPTIONS.includes(speed)) {
+        setPlaybackSpeed(speed);
       }
     }
   }, []);
@@ -203,6 +214,9 @@ export default function Home() {
   // Audio ref
   const audioRef = useRef<HTMLAudioElement>(null);
   const observerTarget = useRef<HTMLDivElement>(null);
+  // Auto-play control: false on init, true after user interaction/queue progress
+  const shouldAutoPlay = useRef(false);
+  const isFirstLoad = useRef(true);
 
   // Weather State
   const [weather, setWeather] = useState<{ temp: number, code: number } | null>(null);
@@ -283,7 +297,12 @@ export default function Home() {
       const data = await res.json();
 
       setItems(prev => {
-        if (isRefresh) return data;
+        if (isRefresh) {
+          // Strict Consistency: A refresh (manual or full) resets the auto-play intent.
+          // This prevents "surprise" playback if the user simply wanted to update the list.
+          shouldAutoPlay.current = false;
+          return data;
+        }
         // Merge and dedup
         const seen = new Set(prev.map(i => i.id));
         const newItems = data.filter((d: Item) => !seen.has(d.id));
@@ -323,6 +342,7 @@ export default function Home() {
   }, [user]);
 
   const playItem = useCallback((id: string, url: string) => {
+    shouldAutoPlay.current = true; // User clicked -> auto-play
     if (currentId === id) {
       setIsPlaying(!isPlaying);
     } else {
@@ -385,6 +405,7 @@ export default function Home() {
     if (nextCandidates.length > 0) {
       const nextId = nextCandidates[0].id;
       console.log("[AutoPlay] Next item found:", nextId);
+      shouldAutoPlay.current = true; // Playlist flow -> auto-play
       setCurrentId(nextId);
       setIsPlaying(true);
     } else {
@@ -417,11 +438,13 @@ export default function Home() {
       .filter(i => playedIds.has(i.id))
       .sort((a, b) => (b.publish_time || 0) - (a.publish_time || 0)); // New -> Old
 
-    if (historyCandidates.length > 0) {
+    // Only fallback if nothing is selected (e.g. fresh load without persistence)
+    // AND never auto-play, just select it
+    if (!currentId && historyCandidates.length > 0) {
       setCurrentId(historyCandidates[0].id);
-      setIsPlaying(true);
+      setIsPlaying(false);
     }
-  }, [items, playedIds]);
+  }, [items, playedIds, currentId]);
 
   const togglePlay = () => {
     setIsPlaying(!isPlaying);
@@ -499,10 +522,34 @@ export default function Home() {
           audioRef.current.src = item.audio_url;
           // Reset progress only when changing tracks
           setProgress(0);
+          // Apply playback speed to new track
+          audioRef.current.playbackRate = playbackSpeed;
           // Resume time handling is done in onLoadedMetadata
-          audioRef.current.play()
-            .then(() => setIsPlaying(true))
-            .catch(e => console.error("Play failed", e));
+
+          // Only auto-play if explicitly triggered by user action or playlist continuation
+          // On page load/refresh (restoration), we want to load the state but stay paused
+
+          if (isFirstLoad.current) {
+            console.log("[Audio] First load/restore detected. Suppressing auto-play.");
+            setIsPlaying(false);
+            // Nuclear option: Force pause again after a tick to fight browser auto-resume
+            setTimeout(() => {
+              if (audioRef.current) audioRef.current.pause();
+            }, 0);
+            isFirstLoad.current = false;
+          } else if (shouldAutoPlay.current) {
+            audioRef.current.play()
+              .then(() => setIsPlaying(true))
+              .catch(e => console.error("Play failed", e));
+          } else {
+            setIsPlaying(false);
+          }
+        }
+      } else {
+        // currentId is set but item invalid -> Stop zombie audio
+        if (isPlaying) {
+          audioRef.current.pause();
+          setIsPlaying(false);
         }
       }
     } else {
@@ -519,6 +566,14 @@ export default function Home() {
       audioRef.current.pause();
     }
   }, [isPlaying]);
+
+  // Apply Playback Speed
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.playbackRate = playbackSpeed;
+    }
+    localStorage.setItem('freshloop_playback_speed', playbackSpeed.toString());
+  }, [playbackSpeed]);
 
   // Debug Trigger Logic
   const debugClicks = useRef(0);
@@ -555,7 +610,7 @@ export default function Home() {
     : (items.length > 0 ? 'Updated recently' : 'No content');
 
   return (
-    <div className="relative flex h-full min-h-screen w-full flex-col overflow-x-hidden max-w-md mx-auto shadow-2xl pb-32 bg-background-dark text-white font-display">
+    <div className="relative flex min-h-screen w-full flex-col overflow-x-hidden max-w-md mx-auto shadow-2xl pb-32 bg-background-dark text-white font-display">
       <audio
         ref={audioRef}
         onTimeUpdate={handleTimeUpdate}
@@ -799,29 +854,57 @@ export default function Home() {
                       </div>
 
                       {/* Main Controls */}
-                      <div className="flex items-center justify-center gap-8">
-                        <button onClick={(e) => { e.stopPropagation(); skipTime(-15); }} className="text-white/40 hover:text-white transition-colors p-2">
-                          <span className="material-symbols-outlined text-[28px]">replay_10</span>
+                      <div className="flex items-center justify-center gap-4">
+                        <button onClick={(e) => { e.stopPropagation(); skipTime(-15); }} className="text-white/40 hover:text-white transition-colors p-1.5">
+                          <span className="material-symbols-outlined text-[26px]">replay_10</span>
                         </button>
-                        <button onClick={(e) => { e.stopPropagation(); playPrev(); }} className="text-white/60 hover:text-white transition-colors p-2">
-                          <span className="material-symbols-outlined text-[36px]">skip_previous</span>
+                        <button onClick={(e) => { e.stopPropagation(); playPrev(); }} className="text-white/60 hover:text-white transition-colors p-1.5">
+                          <span className="material-symbols-outlined text-[32px]">skip_previous</span>
                         </button>
-                        <button onClick={(e) => { e.stopPropagation(); togglePlay(); }} className="text-white hover:text-primary transition-colors p-2 scale-110">
+                        <button onClick={(e) => { e.stopPropagation(); togglePlay(); }} className="text-white hover:text-primary transition-colors p-1.5 scale-110">
                           {isBuffering ? (
-                            <div className="size-[64px] rounded-full border-4 border-white/20 border-t-primary animate-spin" />
+                            <div className="size-[56px] rounded-full border-4 border-white/20 border-t-primary animate-spin" />
                           ) : (
-                            <span className="material-symbols-outlined text-[64px] filled">
+                            <span className="material-symbols-outlined text-[56px] filled">
                               {isPlaying ? 'pause_circle' : 'play_circle'}
                             </span>
                           )}
                         </button>
-                        <button onClick={(e) => { e.stopPropagation(); playNext(); }} className="text-white/60 hover:text-white transition-colors p-2">
-                          <span className="material-symbols-outlined text-[36px]">skip_next</span>
+                        <button onClick={(e) => { e.stopPropagation(); playNext(); }} className="text-white/60 hover:text-white transition-colors p-1.5">
+                          <span className="material-symbols-outlined text-[32px]">skip_next</span>
                         </button>
-                        <button onClick={(e) => { e.stopPropagation(); skipTime(30); }} className="text-white/40 hover:text-white transition-colors p-2">
-                          <span className="material-symbols-outlined text-[28px]">forward_30</span>
+                        <button onClick={(e) => { e.stopPropagation(); skipTime(30); }} className="text-white/40 hover:text-white transition-colors p-1.5">
+                          <span className="material-symbols-outlined text-[26px]">forward_30</span>
                         </button>
+                        {/* Speed Selector */}
+                        <div className="relative" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setShowSpeedPicker(!showSpeedPicker); }}
+                            className="text-white/40 hover:text-white transition-colors p-1.5 flex items-center justify-center"
+                            title="播放速度"
+                          >
+                            <span className="text-[12px] font-bold tabular-nums">{playbackSpeed}x</span>
+                          </button>
+                          {showSpeedPicker && (
+                            <>
+                              {/* Click-outside overlay */}
+                              <div className="fixed inset-0 z-40" onClick={() => setShowSpeedPicker(false)} />
+                              <div className="absolute top-full right-0 mt-2 bg-[#2a2a2a] rounded-xl shadow-2xl ring-1 ring-white/10 overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200 z-50">
+                                {SPEED_OPTIONS.map(speed => (
+                                  <button
+                                    key={speed}
+                                    onClick={() => { setPlaybackSpeed(speed); setShowSpeedPicker(false); }}
+                                    className={`block w-full px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap ${playbackSpeed === speed ? 'bg-primary text-black' : 'text-white/80 hover:bg-white/10'}`}
+                                  >
+                                    {speed}x
+                                  </button>
+                                ))}
+                              </div>
+                            </>
+                          )}
+                        </div>
                       </div>
+
                     </div>
                   </div>
 

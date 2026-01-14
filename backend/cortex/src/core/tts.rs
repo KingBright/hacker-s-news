@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use candle_core::{Device, DType};
 use tts::voxcpm::generate::VoxCPMGenerate;
 use tts::utils::audio_utils::get_audio_wav_u8;
+use regex::Regex;
 
 pub struct TtsClient {
     config: TtsConfig,
@@ -60,7 +61,29 @@ impl TtsClient {
         Err(anyhow::anyhow!("Unsupported TTS engine: {}", engine))
     }
 
-    async fn speak_voxcpm(&self, text: &str, voice_override: Option<String>) -> Result<Vec<u8>> {
+    async fn speak_voxcpm(&self, raw_text: &str, voice_override: Option<String>) -> Result<Vec<u8>> {
+        // Pre-TTS Normalization
+        // Pre-TTS Normalization
+        let mut text = raw_text
+            .replace("%", "百分之")
+            .replace("℃", "度")
+            .replace("$", "美元")
+            .replace("**", "") // Remove MD bold
+            .replace("##", "") // Remove MD header
+            .replace("  ", " "); // Collapse spaces
+
+        // Safety Filter: Remove parentheses content and banned ending phrases
+        // Regex for parentheses (CN/EN) and brackets
+        if let Ok(re) = Regex::new(r"（.*?）|\(.*?\)|【.*?】") {
+            text = re.replace_all(&text, "").to_string();
+        }
+
+        // Remove banned phrases strictly
+        text = text.replace("本条播放完毕", "")
+                   .replace("本条新闻播报结束", "")
+                   .replace("谢谢收听", "")
+                   .replace("报道结束", "");
+
         let vox_config = self.config.voxcpm.as_ref()
             .ok_or_else(|| anyhow::anyhow!("VoxCPM config missing"))?;
             
@@ -74,7 +97,7 @@ impl TtsClient {
         let mut current_chunk = String::new();
         
         let terminators = ['。', '！', '？', '\n'];
-        let secondary_terminators = ['，', '；'];
+        let secondary_terminators = ['，', '；', '：', '、']; // Added colon and dunhao
         
         for char in text.chars() {
             current_chunk.push(char);
@@ -90,23 +113,27 @@ impl TtsClient {
                 continue;
             }
 
-            // 2. Primary split: Sentence Endings (if length is sufficient)
-            // We aim for chunks around 50-150 chars for optimal flow
-            if terminators.contains(&char) && len > 50 {
+            // 2. Primary split: Sentence Endings
+            // Optimal range: 20-80 chars. 
+            if terminators.contains(&char) && len > 20 {
                 chunks.push(current_chunk.clone());
                 current_chunk.clear();
                 continue;
             }
 
-            // 3. Safety valve: If chunk gets too long (>300), split at next comma/semicolon
-            if len > 300 && secondary_terminators.contains(&char) {
+            // 3. Secondary split: Commas/Semicolons
+            // Relaxed to 120 chars to minimize mid-sentence breaks (prosody risk)
+            // Only split here if we are approaching the danger zone.
+            if len > 120 && secondary_terminators.contains(&char) {
                  chunks.push(current_chunk.clone());
                  current_chunk.clear();
                  continue;
             }
             
-            // 4. Emergency: > 500 chars, split anyway (very rare)
-            if len > 500 {
+            // 4. Hard safety limit: 150 chars (approx 30-40s)
+            // Prevent model collapse on extremely long sequences
+            if len > 150 {
+                // If we hit this, just cut it. It's better than audio artifacting.
                 chunks.push(current_chunk.clone());
                 current_chunk.clear();
             }

@@ -64,7 +64,11 @@ def find_matching_trace(target_item):
     2. Trace time is BEFORE Item Publish Time
     3. Trace time is closest to Publish Time (within 1 hour window)
     """
-    target_category = target_item.get('category', '').replace(' ', '_')
+    target_item_category = target_item.get('category', '')
+    if not target_item_category: 
+        target_item_category = 'Unknown'
+        
+    target_category = target_item_category.replace(' ', '_')
     # Nexus publish_time is Unix timestamp (seconds)
     publish_ts = target_item.get('publish_time')
     if not publish_ts:
@@ -111,7 +115,7 @@ def main():
     print(f"--- FreshLoop Data Journey Extractor ---")
     
     # 1. Get Items
-    items = get_recent_items()
+    items = get_recent_items(limit=20) # Increase limit to find older items
     if not items:
         print("No items found in Nexus. Ensure Backend is running at http://localhost:8000")
         sys.exit(1)
@@ -123,14 +127,22 @@ def main():
         print(f"[{i}] {title} ({cat})")
         
     # 2. Select
-    try:
-        selection = input("\nSelect Item index [0]: ").strip()
-        idx = int(selection) if selection else 0
-        target_item = items[idx]
-    except (ValueError, IndexError):
-        print("Invalid selection.")
-        sys.exit(1)
-        
+    if len(sys.argv) > 1:
+        target_id_prefix = sys.argv[1]
+        print(f"\nSearching for item with ID prefix: {target_id_prefix}")
+        target_item = next((i for i in items if i['id'].startswith(target_id_prefix)), None)
+        if not target_item:
+            print("Item not found in recent list. Try increasing limit or check ID.")
+            sys.exit(1)
+    else:
+        try:
+            selection = input("\nSelect Item index [0]: ").strip()
+            idx = int(selection) if selection else 0
+            target_item = items[idx]
+        except (ValueError, IndexError):
+            print("Invalid selection.")
+            sys.exit(1)
+            
     print(f"\nSelected: {target_item.get('title')}")
     
     # 3. Find Trace
@@ -236,41 +248,67 @@ def generate_story_report(item, trace_content, sources):
     report += "## 🎬 Chapter 1: The Final Script\n\n"
     report += "> This is the final audio content delivered to the user.\n\n"
     
-    # Look for "Segment Result" steps (new format)
-    # FIX: Track attempts per group - only use the LAST attempt's result
-    # Pattern: Segment Gen shows "attempt N" - when we see "attempt 1" for a new group,
-    # we finalize the previous group's last result
+    # Group logic: detailed grouping of attempts
+    logical_groups = []
     
-    script_segments = []
-    current_group_last_result = None
+    # Check for Unified Generation first
+    unified_step = next((s for s in steps if "Unified Result" in s['name']), None)
     
-    for i, s in enumerate(steps):
-        if "Segment Gen" in s['name']:
-            # Check if this is a new group (attempt 1)
-            content_str = "\n".join(s['content'][:5])  # Only check first few lines
-            if "attempt 1" in content_str:
-                # Starting a new group - save the previous group's last result
-                if current_group_last_result:
-                    script_segments.append(current_group_last_result)
-                current_group_last_result = None  # Reset for new group
-                
-        elif "Segment Result" in s['name']:
-            # Extract LLM Response content - always overwrite (keep last)
-            content_str = "\n".join(s['content'])
-            resp_match = re.search(r"\*\*LLM Response\*\*:\n```text\n(.*?)\n```", content_str, re.DOTALL)
-            if resp_match:
-                current_group_last_result = resp_match.group(1).strip()
-    
-    # Don't forget the last group's result
-    if current_group_last_result:
-        script_segments.append(current_group_last_result)
-    
-    if script_segments:
-        for i, seg in enumerate(script_segments):
-            report += f"### Segment {i+1}\n\n{seg}\n\n"
-    else:
-        report += "*No script segments found in trace log.*\n\n"
+    if unified_step:
+        content = "\n".join(unified_step['content'])
+        resp_match = re.search(r"\*\*LLM Response\*\*:\n```text\n(.*?)\n```", content, re.DOTALL)
+        script_content = resp_match.group(1).strip() if resp_match else "*No output captured*"
+        report += f"### Full Episode Script (Unified Generation)\n\n{script_content}\n\n"
         
+        # Populate logical_groups for Production Log
+        logical_groups.append({
+            'attempts': [{
+                'gen_step': unified_step, 
+                'result_content': content
+            }]
+        })
+    else:
+        # Fallback to Fragmented/Legacy Logic
+        current_group = None
+        
+        # State machine to group steps
+        for i, s in enumerate(steps):
+            name = s['name']
+            content = "\n".join(s['content'])
+            
+            if "Segment Gen" in name:
+                # Check if this is a new group or a retry
+                # If prompted with "Generating group ... attempt 1", it's new.
+                is_new = "attempt 1" in content or "attempt 1" in name
+                
+                if is_new or current_group is None:
+                    if current_group:
+                        logical_groups.append(current_group)
+                    current_group = { "attempts": [] }
+                
+                # Look ahead for result
+                result_content = ""
+                if i + 1 < len(steps) and "Segment Result" in steps[i+1]['name']:
+                     result_content = "\n".join(steps[i+1]['content'])
+                
+                current_group['attempts'].append({
+                    "gen_step": s,
+                    "result_content": result_content
+                })
+                
+        if current_group:
+            logical_groups.append(current_group)
+                
+        # Generate Chapter 1 (Final Scripts only)
+        if logical_groups:
+            for i, group in enumerate(logical_groups):
+                if not group['attempts']: continue
+                last_attempt = group['attempts'][-1]
+                resp_match = re.search(r"\*\*LLM Response\*\*:\n```text\n(.*?)\n```", last_attempt['result_content'], re.DOTALL)
+                script_content = resp_match.group(1).strip() if resp_match else "*No output captured*"
+                report += f"### Segment {i+1}\n\n{script_content}\n\n"
+        else:
+            report += "*No script segments found in trace log.*\n\n"
         
     report += "---\n\n"
     
@@ -280,18 +318,16 @@ def generate_story_report(item, trace_content, sources):
     
     plan_step = next((s for s in steps if "Planning Phase 2" in s['name']), None)
     
-    item_map = {} # ID -> Title mapping from Planning Prompt
-    
     if plan_step:
         content_str = "\n".join(plan_step['content'])
         
-        # Extract Group -> Title Map from prompt (new format: Group N: Title)
-        group_map = {}  # group_index -> title
+        # Extract Group -> Title Map
+        group_map = {}
         group_matches = re.findall(r"Group (\d+): (.+)", content_str)
         for gid, gtitle in group_matches:
             group_map[int(gid)] = gtitle.strip()
                 
-        # Extract JSON Decision (new format with group_index, action, transition_rationale)
+        # Extract JSON Decision
         json_match = re.search(r"\*\*LLM Response\*\*:\n```text\n(\[.*?\])\n```", content_str, re.DOTALL)
         if json_match:
             try:
@@ -305,9 +341,8 @@ def generate_story_report(item, trace_content, sources):
                         title = group_map.get(group_idx, f"Group {group_idx}")
                         report += f"{i+1}. **{title}** [{action}]\n"
                         if rationale:
-                            report += f"   > *Transition: {rationale}*\n"
+                             report += f"   > *Transition: {rationale}*\n"
                     else:
-                        # Fallback for old format (just ID string)
                         report += f"{i+1}. `{step}`\n"
             except:
                 report += "Failed to parse planning JSON.\n"
@@ -316,105 +351,68 @@ def generate_story_report(item, trace_content, sources):
         
     report += "\n---\n\n"
     
-    # 4. Production Log (Deep Dive)
+    # 4. Production Log (Detailed)
     report += "## 🏭 Chapter 3: Production Log (Deep Dive)\n\n"
-    report += "> Detailed view of sources and transformation for each segment.\n\n"
+    report += "> Detailed view of sources and transformation for each segment (including retries).\n\n"
     
-    # New format: Segment Gen has prompt, Segment Result has response
-    # We need to pair them together
-    gen_steps = [s for s in steps if "Segment Gen" in s['name']]
-    result_steps = [s for s in steps if "Segment Result" in s['name']]
-    
-    for i, gen_step in enumerate(gen_steps):
-        gen_content = "\n".join(gen_step['content'])
-        result_content = "\n".join(result_steps[i]['content']) if i < len(result_steps) else ""
+    for i, group in enumerate(logical_groups):
+        report += f"### Group {i+1} Production\n"
         
-        # Identify Batch Items from Prompt
-        report += f"### Segment {i+1} Production\n"
-        
-        # Extract Prompt Materials
-        materials_match = re.search(r"【新闻素材】\n(.*?)\n【核心要求", gen_content, re.DOTALL)
-        if materials_match:
-            materials_raw = materials_match.group(1)
-            report += "**Input Sources:**\n"
+        for att_idx, attempt in enumerate(group['attempts']):
+            gen_content = "\n".join(attempt['gen_step']['content'])
+            report += f"#### Attempt {att_idx+1}\n"
             
-            # Robust Parsing for Multi-line Bullet Points
-            # Structure:
-            # - Title
-            #   摘要: Summary
-            #   来源: Source
-            
-            raw_items = []
-            current_item = None
-            
-            for line in materials_raw.strip().split('\n'):
-                line = line.strip()
-                if not line: continue
+            # Extract Prompt Materials
+            # Try both Legacy and Unified headers
+            materials_match = re.search(r"(?:【新闻素材】|【输入 - 详细素材】)\n(.*?)\n(?:【核心要求|【撰写要求】)", gen_content, re.DOTALL)
+            if materials_match and att_idx == 0: 
+                materials_raw = materials_match.group(1)
+                report += "**Input Sources:**\n"
                 
-                if line.startswith("- "):
-                    # Start of new item
-                    if current_item:
-                         raw_items.append(current_item)
-                    current_item = {
-                        'title_line': line[2:], # Remove "- "
-                        'summary': "",
-                        'source': ""
-                    }
-                elif current_item:
-                    # Content of current item
-                    if line.startswith("摘要:"):
-                        current_item['summary'] += line.replace("摘要:", "").strip()
-                    elif line.startswith("来源:"):
-                        current_item['source'] += line.replace("来源:", "").strip()
+                # Parse Raw Items
+                raw_items = []
+                current_item = None
+                for line in materials_raw.strip().split('\n'):
+                    line = line.strip()
+                    if not line: continue
+                    if line.startswith("- "):
+                        if current_item: raw_items.append(current_item)
+                        current_item = {'title_line': line[2:], 'summary': "", 'source': ""}
+                    elif current_item:
+                        if line.startswith("摘要:"): current_item['summary'] += line.replace("摘要:", "").strip()
+                        elif line.startswith("来源:"): current_item['source'] += line.replace("来源:", "").strip()
+                        else: current_item['summary'] += " " + line
+                if current_item: raw_items.append(current_item)
+                
+                for item in raw_items:
+                    title = item['title_line']
+                    # Try to match source from DB
+                    clean_title = re.sub(r"^\[.*?\]\s*", "", title).strip()
+                    matched_source = None
+                    for ns in sources:
+                        ns_title = ns.get('source_title', '') or ''
+                        if ns_title and (ns_title in title or clean_title in ns_title or title in ns_title):
+                            matched_source = ns
+                            break
+                    
+                    if matched_source:
+                        report += f"- 🟢 **{matched_source.get('source_title')}**\n"
+                        db_summ = matched_source.get('source_summary', '').replace('\n', ' ')
+                        final_summ = db_summ if db_summ and len(db_summ) > len(item['summary']) else item['summary']
+                        report += f"  > {final_summ}\n  *Source: {matched_source.get('source_url')}*\n"
                     else:
-                        # Append to summary if not explicitly source? or just generic content
-                        current_item['summary'] += " " + line
+                        report += f"- ⚪ **{title}**\n  > {item['summary']}\n"
+                report += "\n"
             
-            if current_item:
-                raw_items.append(current_item)
-                
-            # Now Match against DB
-            for item in raw_items:
-                title = item['title_line']
-                # Try cleanup [Tag] from title for matching
-                clean_title = re.sub(r"^\[.*?\]\s*", "", title).strip()
-                
-                matched_source = None
-                
-                # Check against Nexus Sources
-                for ns in sources:
-                    ns_title = ns.get('source_title', '') or ''
-                    if ns_title and (ns_title in title or clean_title in ns_title or title in ns_title):
-                        matched_source = ns
-                        break
-                        
-                if matched_source:
-                    report += f"- 🟢 **{matched_source.get('source_title')}**\n"
-                    
-                    # Use DB Summary if available, else Fallback to Trace Summary
-                    db_summary = matched_source.get('source_summary', '').replace('\n', ' ')
-                    trace_summary = item['summary']
-                    
-                    final_summary = db_summary if db_summary and len(db_summary) > len(trace_summary) else trace_summary
-                    
-                    report += f"  > {final_summary}\n\n"
-                    report += f"  *Source: {matched_source.get('source_url')}*\n"
-                else:
-                    # Fallback: Show data from Trace
-                    report += f"- ⚪ **{title}** *(From Log)*\n"
-                    if item['summary']:
-                        report += f"  > {item['summary']}\n\n"
-                    if item['source']:
-                        report += f"  *Source: {item['source']}*\n"
+            # Show Output
+            resp_match = re.search(r"\*\*LLM Response\*\*:\n```text\n(.*?)\n```", attempt['result_content'], re.DOTALL)
+            if resp_match:
+                 report += "**LLM Output**:\n```text\n" + resp_match.group(1).strip() + "\n```\n"
+            else:
+                 report += "*No output captured*\n"
+            
             report += "\n"
-        
-        # Extract Draft/Output from the paired Segment Result step
-        report += "**LLM Output (Final Draft)**:\n"
-        resp_match = re.search(r"\*\*LLM Response\*\*:\n```text\n(.*?)\n```", result_content, re.DOTALL)
-        if resp_match:
-             report += "```text\n" + resp_match.group(1).strip() + "\n```\n"
-        
-        report += "\n"
+        report += "---\n"
 
     return report
 

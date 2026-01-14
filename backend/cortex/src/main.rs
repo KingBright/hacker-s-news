@@ -1,11 +1,7 @@
-
 use anyhow::Result;
 use std::sync::Arc;
 
 use cortex::core::config::load_config;
-use cortex::core::llm::LlmClient;
-use cortex::core::tts::TtsClient;
-use cortex::core::nexus::{NexusClient, ItemPayload};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,8 +16,14 @@ async fn main() -> Result<()> {
         fn log(&self, record: &log::Record) {
             if self.enabled(record.metadata()) {
                 let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%SZ");
-                let msg = format!("[{}] [{}] [{}] {}", timestamp, record.level(), record.target(), record.args());
-                
+                let msg = format!(
+                    "[{}] [{}] [{}] {}",
+                    timestamp,
+                    record.level(),
+                    record.target(),
+                    record.args()
+                );
+
                 // Error and Warn go to stderr (cortex.err.log)
                 // Info and below go to stdout (cortex.out.log)
                 if record.level() <= log::Level::Warn {
@@ -68,11 +70,13 @@ tags = ["Tech", "Global"]
     let config = load_config(&config_path)?;
 
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    
+
     // LLM Audit Log & Cache Path
-    let llm_log_path = std::path::PathBuf::from(format!("{}/.freshloop/logs/llm_audit.log", home_dir));
-    let llm_cache_path = std::path::PathBuf::from(format!("{}/.freshloop/cache/llm_cache", home_dir));
-    
+    let llm_log_path =
+        std::path::PathBuf::from(format!("{}/.freshloop/logs/llm_audit.log", home_dir));
+    let llm_cache_path =
+        std::path::PathBuf::from(format!("{}/.freshloop/cache/llm_cache", home_dir));
+
     // Ensure log dir exists
     if let Some(parent) = llm_log_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -82,14 +86,21 @@ tags = ["Tech", "Global"]
         std::fs::create_dir_all(parent)?;
     }
 
-    let llm = Arc::new(cortex::core::llm::LlmClient::new(config.llm.clone(), Some(llm_log_path), Some(llm_cache_path)));
+    let llm = Arc::new(cortex::core::llm::LlmClient::new(
+        config.llm.clone(),
+        Some(llm_log_path),
+        Some(llm_cache_path),
+    ));
     let tts = Arc::new(cortex::core::tts::TtsClient::new(config.tts.clone()));
     let nexus = Arc::new(cortex::core::nexus::NexusClient::new(config.nexus.clone()));
-    
+
     // Initialize Retry Manager
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let cache_dir = format!("{}/.freshloop/cache", home_dir);
-    let retry_manager = Arc::new(cortex::core::retry::RetryManager::new(&cache_dir, nexus.clone()).expect("Failed to init RetryManager"));
+    let retry_manager = Arc::new(
+        cortex::core::retry::RetryManager::new(&cache_dir, nexus.clone())
+            .expect("Failed to init RetryManager"),
+    );
 
     // Spawn Retry Background Loop
     let retry_mgr_clone = retry_manager.clone();

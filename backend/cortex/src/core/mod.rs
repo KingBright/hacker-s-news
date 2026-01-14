@@ -1,9 +1,10 @@
+pub mod aggregator;
 pub mod config;
 pub mod llm;
-pub mod tts;
-pub mod nexus;
 pub mod news;
+pub mod news_buffer;
+pub mod nexus;
 pub mod retry;
 pub mod topic_registry;
-pub mod news_buffer;
-pub mod aggregator;
+pub mod tts;
+pub mod utils;

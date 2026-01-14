@@ -1,5 +1,5 @@
 use crate::core::config::Host;
-use chrono::{Local, Datelike};
+
 use chinese_lunisolar_calendar::LunisolarDate;
 use anyhow::Result;
 use std::sync::Arc;
@@ -529,7 +529,48 @@ impl NewsAggregator {
             // --------------------------------------
             
             // Check global history for previously reported topics
-            if let Ok(Some(prev_record)) = self.registry.is_duplicate(&combined_text) {
+            // Relaxed threshold: 12 (catch more candidates)
+            let existing_record = self.registry.is_duplicate(&combined_text, 12)?;
+            
+            let mut is_follow_up = false;
+            let mut matched_record = None;
+
+            if let Some((candidate_record, distance)) = existing_record {
+                 if distance < 3 {
+                     // Strong match: Assume it is the same/related topic without LLM (Fast path)
+                     log::info!("Strong history match (Dist: {}): {}", distance, candidate_record.title);
+                     matched_record = Some(candidate_record);
+                     is_follow_up = true;
+                 } else {
+                     // Borderline match (3 <= distance < 12): Verify with LLM
+                     log::info!("Borderline history match (Dist: {}). Verifying...", distance);
+                     
+                     // Use existing verify logic but adapted for history check
+                     // Need to construct a temp pending item to reuse logic or make a new prompt?
+                     // Let's make a direct prompt here for clarity.
+                     let prompt = format!(
+                        "判断这两条新闻是否属于同一事件或强相关后续？\n\n\
+                        历史报道:\n标题: {}\n摘要: {}\n\n\
+                        今日新闻:\n标题: {}\n摘要: {}\n\n\
+                        判断标准：\n- YES: 同一具体事件的后续进展、同一产品的更新、同一人物的动态。\n- NO: 仅仅是同类话题（如都讲AI但不同公司）。\n\
+                        仅回答 YES 或 NO。",
+                        candidate_record.title, candidate_record.summary,
+                        cluster.main_item.title, summary
+                    );
+                    
+                    let response = self.llm.chat(&prompt, false).await?;
+                    if response.to_uppercase().contains("YES") {
+                        log::info!("LLM confirmed history match: {}", cluster.main_item.title);
+                        matched_record = Some(candidate_record);
+                        is_follow_up = true;
+                    } else {
+                        log::info!("LLM rejected history match. Treating as NEW.");
+                    }
+                 }
+            }
+
+            if is_follow_up {
+                let prev_record = matched_record.unwrap();
                 // Topic was previously reported - check if there's new information
                 match self.check_for_updates(&cluster, summary, &prev_record).await {
                     Ok(Some(update_summary)) => {
@@ -705,63 +746,27 @@ impl NewsAggregator {
                         action: "sequence".to_string(),
                         ids: c.to_vec(),
                         transition_rationale: None,
+                        group_theme: None,
+                        merge_reason: None,
                     }).collect()
                 }
             };
 
             // Step A.5: Compress long summaries
             let mut all_items: Vec<BroadcastItem> = item_list.to_vec();
-            if let Err(e) = self.compress_summaries(&mut all_items, 180).await {
+            if let Err(e) = self.compress_summaries(&mut all_items, 4000).await {
                 log::warn!("Summary compression failed: {}", e);
             }
 
-            // Step B: Generate segments by groups
-            let mut segments = Vec::new();
-            let mut prev_context = String::new();
-            let mut last_opening_phrase = String::new();
-            let total_plans = plans.len();
-            
-            for (plan_idx, plan) in plans.iter().enumerate() {
-                let is_first = plan_idx == 0;
-                let is_last = plan_idx == total_plans - 1;
-                let group_ids = &plan.ids;
-                
-                // Get items for this group
-                let group_items: Vec<BroadcastItem> = group_ids.iter()
-                    .filter_map(|id| all_items.iter().find(|i| i.id == *id).cloned())
-                    .collect();
-                
-                if group_items.is_empty() {
-                    continue;
-                }
-                
-                let segment = self.generate_segment_for_group(
-                    category,
-                    &host_name,
-                    &group_items,
-                    &prev_context,
-                    &holiday_context,
-                    &last_opening_phrase,
-                    &plan.action,
-                    plan.transition_rationale.as_deref(), // v3.1: Planner-Driven Transition
-                    is_first,
-                    is_last,
-                    logger.clone()
-                ).await?;
-                
-                // Update context for next segment (Rich Context: Summary + Last Sentence)
-                let last_sentence = Self::extract_last_sentence(&segment);
-                let group_titles = group_items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>().join("、");
-                prev_context = format!("【上文刚播报了】：{}。\n【上文结尾句是】：\"{}\"", group_titles, last_sentence);
-                
-                // Capture opening (first 15 chars) to avoid repetition
-                last_opening_phrase = segment.chars().take(15).collect();
-
-                segments.push(segment);
-            }
-
-            log::info!("Smart Flow: Generated {} segments", segments.len());
-            let script = segments.join("\n\n");
+            // Step B (Unified): Generate Full Episode Script
+            let script = self.generate_full_episode_script(
+                category,
+                &host_name,
+                &item_list,
+                &plans,
+                &holiday_context,
+                logger.clone()
+            ).await?;
             
             // Step C: Extract title from content
             let title = match self.extract_episode_title(item_list, category).await {
@@ -913,18 +918,6 @@ impl NewsAggregator {
 
     // --- New Helper Functions ---
 
-    /// Extract the last sentence from text for context passing
-    fn extract_last_sentence(text: &str) -> String {
-        text.rsplit(|c| c == '。' || c == '！' || c == '？')
-            .filter(|s| !s.trim().is_empty())
-            .next()
-            .unwrap_or("")
-            .trim()
-            .chars()
-            .take(100)
-            .collect()
-    }
-
     /// Compress long summaries before segmentation
     async fn compress_summaries(&self, items: &mut Vec<BroadcastItem>, max_chars: usize) -> Result<()> {
         for item in items.iter_mut() {
@@ -942,6 +935,117 @@ impl NewsAggregator {
             }
         }
         Ok(())
+    }
+
+    /// Step 3 (Unified): Generate Full Episode Script
+    async fn generate_full_episode_script(
+        &self,
+        category: &str,
+        host_name: &str,
+        items: &[BroadcastItem],
+        plans: &[SegmentPlan],
+        holiday_context: &str,
+        logger: Arc<Mutex<TraceLogger>>
+    ) -> Result<String> {
+        let total_items = items.len();
+        log::info!("Unified Generation: {} groups, {} items", plans.len(), total_items);
+
+        // 1. Build Full Run of Show (Plan)
+        let mut ros = String::new();
+        ros.push_str(&format!("【节目单 - {}频道】\n", category));
+        ros.push_str(&format!("时间: {}\n", chrono::Local::now().format("%Y-%m-%d")));
+        ros.push_str(&format!("主播: {}\n", host_name));
+        if !holiday_context.is_empty() {
+             ros.push_str(&format!("节日: {}\n", holiday_context));
+        }
+        ros.push_str("\n--- 播报流程 ---\n");
+
+        for (idx, plan) in plans.iter().enumerate() {
+            let theme = plan.group_theme.as_deref().unwrap_or("新闻组");
+            let action = &plan.action;
+            let rationale = plan.transition_rationale.as_deref().unwrap_or("自然过渡");
+            ros.push_str(&format!("{}. [{}] 主题：{} (过渡策略：{})\n", idx + 1, action.to_uppercase(), theme, rationale));
+        }
+
+        // 2. Build Content Block (Grouped)
+        let mut content = String::new();
+        for (idx, plan) in plans.iter().enumerate() {
+            content.push_str(&format!("\n=== 第 {} 组 (主题：{}) ===\n", idx + 1, plan.group_theme.as_deref().unwrap_or("Untitled")));
+            
+            for id in &plan.ids {
+                if let Some(item) = items.iter().find(|i| i.id == *id) {
+                     content.push_str(&format!("--- Item ---\n标题: {}\n来源: {}\n摘要: {}\n", 
+                        item.title, item.source_name, item.summary));
+                }
+            }
+        }
+
+        // 3. Prompt Construction
+        let now = chrono::Local::now();
+        let date_str = now.format("%Y年%-m月%-d日").to_string();
+        let run_of_show = ros; // Renamed for clarity in prompt
+        let full_content_block = content; // Renamed for clarity in prompt
+
+        // Create the mega-prompt
+        let prompt = format!(
+            "Role: FreshLoop 顶流播客主持人 (Host: {})。\n\
+            频道: {}\n\
+            当前日期: {} (请务必基于此日期播报，今天是普通工作日，除非明确提到节日，否则不要编造“新年”、“春节”等背景)\n\
+            {}\n\
+            \n\
+            【任务目标】\n\
+            基于以下【节目编排表 (Run of Show)】和【详细新闻素材】，撰写一份完整的、连贯的单人口播稿。\n\
+            \n\
+            【节目编排表 (Run of Show)】\n\
+            导演已经为你规划好了叙事逻辑，请严格遵循这个顺序进行播报：\n\
+            {}\n\
+            \n\
+            【详细新闻素材】\n\
+            {}\n\
+            \n\
+            【撰写要求 (Critical)】\n\
+            1. **结构完整**：必须包含 [开场白] -> [正文(按顺序串联)] -> [结束语]。\n\
+               - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (包含日期，**禁止**胡编乱造当前天气、环境等未提供的信息)\n\
+               - 结束语: \"以上就是本期内容...\" \n\
+            2. **素材忠诚度 (Strict Content Fidelity)**：\n\
+               - **以素材为准**：你的播报内容必须基于提供的【详细新闻素材】。禁止引入你训练记忆中可能冲突的事实。\n\
+               - **政治/身份状态**：今天是 2026 年，请根据素材描述对待人物身份。例如，如果素材暗示某人是现任领导人，即使你的记忆中他是“前任”，你也必须按素材描述为准。\n\
+               - **禁止幻觉**：严禁编造任何时间、地点、天气、具体数字或素材中未提及的背景故事。\n\
+            3. **流畅衔接**：段落之间必须有自然的过渡词或逻辑关联（如\"与此相关的是...\"、\"把目光转向...\"），严禁生硬拼接。\n\
+            4. **口语化**：使用自然、亲切的广播腔。拒绝机械的念稿感。多用\"我们看到\"、\"值得注意的是\"等引导语。\n\
+            5. **信息准确**：保留新闻核心要素(Who/What/When)，但去除冗余细节。\n\
+            6. **篇幅控制**：总时长约 5-8 分钟。每条新闻控制在 100-150 字。\n\
+            \n\
+            【格式禁忌 (Strict Mocks)】\n\
+            1. **纯文本输出**：输出必须是【纯纯的口播稿】！\n\
+            2. **严禁包含任何标记**：\n\
+               - ❌ 严禁出现 【正文】、【Segment】、【Group】、【Chapter】 等结构标记！\n\
+               - ❌ 严禁出现 [Music]、[Sound Effect] 等音效标记！\n\
+               - ❌ 严禁出现 (记者报道)、(来源:XXX) 等元数据！\n\
+               - ❌ 严禁出现 \"播报结束\"、\"End of Script\" 等提示语！\n\
+            3. **严禁小标题**：不要给每条新闻加标题，直接用话术过渡。\n\
+            \n\
+            现在，请开始你的表演，从开场白开始，一气呵成播报完全部内容（Intro -> Body -> Outro）：",
+            host_name, category, date_str, 
+            if !holiday_context.is_empty() { format!("节日背景: {}", holiday_context) } else { String::new() },
+            run_of_show,
+            full_content_block,
+            category
+        );
+
+        // 4. LLM Call
+        logger.lock().await.log("Unified Gen", "Starting full episode generation...");
+        let response = self.llm.chat(&prompt, false).await?;
+        
+        logger.lock().await.log_llm("Unified Result", "Full Script", &prompt, &response);
+
+        // 5. Post-Processing / Safety
+        let cleaned = clean_content(response);
+        if cleaned.len() < 300 {
+             return Err(anyhow::anyhow!("Generated script too short (<300 chars). Likely just an intro."));
+        }
+
+        Ok(cleaned)
     }
 
     /// Extract episode title from news content
@@ -1002,359 +1106,37 @@ impl NewsAggregator {
         Ok(raw.to_string())
     }
 
-    /// Generate a single segment for a group of items (with improved prompts)
-    async fn generate_segment_for_group(
-        &self,
-        category: &str,
-        host_name: &str,
-        items: &[BroadcastItem],
-        prev_context: &str,
-        holiday_context: &str,
-        avoid_opening: &str,
-        plan_action: &str,
-        transition_instruction: Option<&str>, // v3.1: Planner-Driven Transition
-        is_first: bool,
-        is_last: bool,
-        logger: Arc<Mutex<TraceLogger>>
-    ) -> Result<String> {
-        // Build content block
-        let content_block: String = items.iter().map(|item| {
-            format!("- 《{}》\n  摘要: {}\n  来源: {}", item.title, item.summary, item.source_name)
-        }).collect::<Vec<_>>().join("\n\n");
-
-        // Fixed templates for opening and closing
-        let now = chrono::Local::now();
-        let date_str = now.format("%Y年%-m月%-d日").to_string();
-        let weekdays = ["一", "二", "三", "四", "五", "六", "日"];
-        let weekday = weekdays[now.weekday().num_days_from_monday() as usize];
-        
-        let opening_template = format!(
-            "大家好，欢迎收听 FreshLoop {}频道，我是{}。今天是{}，星期{}。{}",
-            category, host_name, date_str, weekday,
-            if !holiday_context.is_empty() { format!(" {}", holiday_context) } else { String::new() }
-        );
-        
-        let closing_template = format!(
-            "以上就是本期 FreshLoop {}频道的全部内容。感谢收听，我是{}，下期再见。",
-            category, host_name
-        );
-
-        // Dynamic instructions
-        let instruction = if is_first {
-            format!(
-                "这是节目的开场部分。请使用以下固定开场语开始：\n「{}」\n然后自然引入第一条新闻。\n⚠️ 禁止编造天气或其他未提供的信息。",
-                opening_template
-            )
-        } else {
-            // v3.1: Inject Planner-Driven Transition if available
-            if let Some(rationale) = transition_instruction {
-                format!("这是节目的中间部分。【过渡指令 - 必须遵守】：{}", rationale)
-            } else {
-                "这是节目的中间部分。请【自然承接】上文。可以使用简短的过渡句（如总结上文并引入下文），建立上文、过渡、下文的流畅衔接。但**严禁**使用干巴巴且无信息量的接下来为您带来这种废话。过渡必须服务于逻辑流。".to_string()
-            }
-        };
-
-        let closing_instruction = if is_last {
-            format!("播报完最后一条新闻后，使用以下固定结束语：\n「{}」", closing_template)
-        } else {
-            "结尾要求：播报完即止。**不要**预告下一段内容（如下一段会讲...），也不要生成“让我们继续关注”等废话。直接停在最后一条新闻的结尾。".to_string()
-        };
-
-        let mut prompt = format!(
-            "Role: FreshLoop 新闻主播。\n\
-            频道: {}\n\
-            人设: {} (专业、客观、亲和。以清晰准确传递信息为首要目标)。\n\
-            \n\
-            【当前任务】\n\
-            接住上文信息：\n\
-            {}\n\
-            \n\
-            任务：请根据【上文提要】（如有）及【上文结尾句】自然过渡，播报本段新闻。\n\
-            1. {}\n\
-            2. {}\n\
-            \n\
-            【新闻素材】\n\
-            {}\n\
-            \n\
-            【核心要求】：\n\
-            1. **信息第一**：完整保留每条新闻的5W1H（人名、数字、日期、地点）。禁止模糊化。\n\
-            2. **客观传递**：仅陈述事实，禁止添加主观推测。评论/感叹每段最多1处。\n\
-            3. **简洁过渡**：新闻之间用一句话过渡（如「另一边」「说到XX」）。\n\
-            4. **禁止重复**：上一段已播内容不得复述。\n\
-            5. **弹性字数**：以听众理解为准。快讯可简短，复杂报道需充分展开。\n\
-            6. **校对**：绝不允许错别字、语病。\n\
-            7. **格式**：直接输出口播稿，不要Markdown。\n\
-            8. **时间一致性**：今天是{}。请注意新闻的时效性，不要把去年的旧闻当成未来计划说。比今天更早的事情应使用过去式。\n\
-            9. **Negative Constraints (禁止项)**：\n\
-               - 严禁使用“上一则关于...”或“刚才提到的...”这类元总结（Meta-commentary）。直接用逻辑过渡。\n\
-               - 严禁滥用“与此同时”（Meanwhile）。请使用更丰富的贴合内容的转折（如“把目光转向...”、“而在硬件方面...”）。\n\
-            10. **动作指令**：{}\n\
-            ",
-            category, host_name, prev_context, instruction, closing_instruction, content_block, date_str,
-            
-            // Dynamic Instruction based on Plan Action
-            if plan_action == "merge" {
-                "【MERGE模式 - 强制合并】检测到这组新闻是完全重复或极度相似的报道。你必须将它们【融合成一条】完整的新闻播报！\n\
-                 - 严禁分条罗列（如“此外...另外...”）。\n\
-                 - 提炼所有独特信息点（5W1H），合成一个连贯的叙事。\n\
-                 - 如果有多家媒体，可以说“据多家媒体报道...”"
-            } else {
-                "【SEQUENCE模式 - 顺播】这组新闻是不同的故事。请使用自然过渡词（如“与此同时”、“在科技领域...”）将它们串联起来，保持条理清晰。"
-            }
-        );
-
-        // Writer-Editor Loop
-        let mut attempts = 0;
-        let mut current_script;
-        const MAX_RETRIES: usize = 3;
-
-        loop {
-            attempts += 1;
-            logger.lock().await.log("Segment Gen", &format!("Generating group of {} items, attempt {}", items.len(), attempts));
-            
-            current_script = self.llm.chat(&prompt, false).await?;
-            logger.lock().await.log_llm("Segment Result", &format!("Group generation attempt {}", attempts), &prompt, &current_script);
-
-            // Safety check
-            if current_script.len() > 5000 {
-                log::warn!("Script too long ({} chars). Rejecting.", current_script.len());
-                if attempts < MAX_RETRIES {
-                    prompt.push_str("\n\n【警告】上一版过长。请精简，只播报本段新闻。");
-                    continue;
-                } else {
-                    current_script.truncate(5000);
-                }
-            }
-
-            // Editor review
-            let (passed, critique) = self.review_segment(&current_script, prev_context, logger.clone()).await?;
-            
-            if passed {
-                break;
-            }
-            
-            if attempts >= MAX_RETRIES {
-                log::warn!("Editor rejected 3 times. Forcing acceptance. Critique: {}", critique);
-                break;
-            }
-
-            log::info!("Editor rejected (Attempt {}): {}. Regenerating...", attempts, critique);
-            prompt.push_str(&format!("\n\n【主编反馈】{}。请修正后重新撰写。", critique));
-        }
-
-        Ok(current_script)
-    }
-
-    // Proofread function removed (merged into editor loop)
 
 
-    /// Step 3: Recursive Segment Generation
-    async fn generate_segment(
-        &self, 
-        category: &str, 
-        host_name: &str,
-        items: &[BroadcastItem], 
-        start_idx: usize, 
-        batch_size: usize,
-        prev_context: &str,
-        holiday_context: &str,
-        is_first: bool,
-        logger: Arc<Mutex<TraceLogger>>
-    ) -> Result<Vec<String>> {
-        if start_idx >= items.len() {
-            return Ok(Vec::new());
-        }
-
-        let end_idx = std::cmp::min(start_idx + batch_size, items.len());
-        let current_batch = &items[start_idx..end_idx];
-        let is_last = end_idx == items.len();
-
-        // Build prompt for this segment
-        let content_block: String = current_batch.iter().map(|item| {
-            format!("- {}\n  摘要: {}\n  来源: {}", item.title, item.summary, item.source_name)
-        }).collect::<Vec<_>>().join("\n\n");
-
-        let instruction = if is_first {
-            "这是节目的开场部分。请以热情、专业的语调做开场白（包含问候、日期、节日/天气等），然后自然引入第一条新闻。"
-        } else {
-            "这是节目的中间部分。请自然地承接上一段内容（不要生硬的'接下来'），继续播报本段新闻。"
-        };
-
-        let closing_instruction = if is_last {
-            "播报完所有新闻后，请进行总结并做结束语（感谢收听 FreshLoop，我是[主持人]，下次见）。"
-        } else {
-            "播报完本段新闻后，做一个自然的过渡，准备引入下一段内容（但不要具体说下一段是什么，只做悬念或平滑过渡）。"
-        };
-
-        let mut prompt = format!(
-            "Role: Host of 'FreshLoop' (顶流播客主持人)。\n\
-            频道: {}\n\
-            人设: {} (幽默、犀利或温暖，视内容而定。拒绝播音腔，要像真人在对话)。\n\
-            节日: {}\n\
-            \n\
-            【当前任务】\n\
-            接住上文语音流（\"{}\"），播报本段新闻。\n\
-            1. {}\n\
-            2. {}\n\
-            \n\
-            【新闻素材】\n\
-            {}\n\
-            \n\
-            【核心要求 - 必须同时完成】：\n\
-            1. **交流感**：使用第二人称（你），多用反问句、感叹句。用“signposting”技巧引导听众（如“这事儿有点意思...”）。\n\
-            2. **逻辑串联**：严禁呆板的“首先、其次”。要用内在逻辑（因果、对比、层递）把新闻串起来。\n\
-            3. **校对（关键）**：输出必须是【终稿】。生成时请自我检查，**绝不允许出现错别字、语病或翻译腔**。\n\
-            4. **格式**：直接输出口播稿。不要Markdown。\n\
-            5. **禁止念出来源**：严禁包含“(来源：XXX)”等标注。",
-            category, host_name, holiday_context, prev_context, instruction, closing_instruction, content_block
-        );
-
-        // Writer-Editor Loop
-        let mut attempts = 0;
-        let mut current_script;
-        const MAX_WRITER_RETRIES: usize = 3;
-
-        loop {
-            attempts += 1;
-            // 1. Writer generates
-            attempts += 1;
-            // 1. Writer generates
-            logger.lock().await.log("Segment Gen", &format!("Generating batch {}-{}, attempt {} (Prompt len: {})", start_idx, end_idx, attempts, prompt.len()));
-            
-            current_script = self.llm.chat(&prompt, false).await?;
-            
-            logger.lock().await.log_llm("Segment Writer Result", &format!("Segment {} Batch", start_idx), &prompt, &current_script);
-
-            // SAFETY CHECK: Hallucination/Repetition Guard
-            if current_script.len() > 5000 {
-                log::warn!("Generated script too long ({} chars). Likely repetition loop. Rejecting.", current_script.len());
-                if attempts < MAX_WRITER_RETRIES {
-                    prompt.push_str("\n\n【系统警告】上一版生成的内容过长（可能陷入了重复）。请务必精简，只播报约定的几条新闻，不要重复。");
-                    continue;
-                } else {
-                    // Force truncate if max retries reached to avoid crashing next steps
-                    current_script.truncate(5000);
-                    current_script.push_str("\n(Truncated due to excessive length)");
-                }
-            }
-
-            // 2. Editor reviews (Skip for first segment as it has no prev context to mis-match, 
-            // though we could still check internal flow. Let's check all.)
-            // 2. Editor reviews (Skip for first segment as it has no prev context to mis-match, 
-            // though we could still check internal flow. Let's check all.)
-            let (passed, critique) = self.review_segment(&current_script, prev_context, logger.clone()).await?;
-            
-            if passed {
-                break;
-            }
-            
-            if attempts >= MAX_WRITER_RETRIES {
-                log::warn!("Editor rejected segment 3 times. Forcing acceptance. Critique: {}", critique);
-                break;
-            }
-
-            log::info!("Editor rejected segment (Attempt {}): {}. Regenerating...", attempts, critique);
-            prompt.push_str(&format!("\n\n【主编反馈】\n你的上一版草稿被打回了，原因：{}\n请根据意见重新撰写。", critique));
-        }
-
-        // Proofreading merged into generation loop
-        let refined_script = current_script;
-        
-        let mut segments = vec![refined_script.clone()];
-        
-        // Context for next segment (last 200 chars)
-        // Context for next segment (last 200 chars, UTF-8 safe)
-        let next_context_val = if refined_script.chars().count() > 200 {
-            refined_script.chars().rev().take(200).collect::<String>().chars().rev().collect::<String>()
-        } else {
-            refined_script.clone()
-        };
-        let next_context = next_context_val.as_str();
-
-        // Recursive call
-        if !is_last {
-            let mut next_segments = Box::pin(self.generate_segment(
-                category, host_name, items, end_idx, batch_size, next_context, holiday_context, false, logger
-            )).await?;
-            segments.append(&mut next_segments);
-        }
-
-        Ok(segments)
-    }
-
-    /// Helper: Editor Review (Enhanced)
-    async fn review_segment(&self, script: &str, prev_context: &str, logger: Arc<Mutex<TraceLogger>>) -> Result<(bool, String)> {
-        if script.trim().len() < 10 {
-            return Ok((false, "Content too short".to_string()));
-        }
-
-        let prompt = format!(
-            "Role: 资深音频制作人 & 校对员。任务：质量控制。\n\n\
-            【上文】\"{}\"\n\
-            【稿件】\"{}\"\n\n\
-            审核标准（违反任一则 Fail）：\n\
-            1. **Flow**：读起来是否顺畅？衔接是否自然？\n\
-            2. **Persona**：是否像专业新闻主播？有没有AI味？\n\
-            3. **Proofreading**：CRITICAL - 任何错别字、病句、多字漏字必须打回！\n\
-            4. **信息完整性**：每条新闻的核心数字、人名是否保留？被省略则打回！\n\
-            5. **主观性**：每段超过1处主观评论/感叹应打回！\n\
-            6. **重复检查**：是否复述了上一段已播内容？如有则打回！\n\
-            7. **实体一致性**：人名/公司名与素材一致？（如「英伟锐」应为「英伟达」则打回）\n\
-            8. **过渡质量**：段落过渡是否自然流畅？生硬则打回！\n\n\
-            输出格式（JSON）：\n\
-            {{ \"pass\": true, \"critique\": \"通过\" }}\n\
-            或\n\
-            {{ \"pass\": false, \"critique\": \"具体问题描述...\" }}",
-            prev_context, script
-        );
-
-        let response = self.llm.chat(&prompt, false).await?;
-        logger.lock().await.log_llm("Segment Review", "Critique Logic invoked", &prompt, &response);
-        
-        // Simple JSON parse
-        let json_str = response.trim().trim_matches('`').trim();
-        let start = json_str.find('{').unwrap_or(0);
-        let end = json_str.rfind('}').unwrap_or(json_str.len().saturating_sub(1));
-        
-        let json_valid = if start <= end && end < json_str.len() {
-             &json_str[start..=end]
-        } else {
-             "{}"
-        };
-        
-        #[derive(serde::Deserialize)]
-        struct Review {
-            pass: bool,
-            critique: String,
-        }
-
-        let review: Review = serde_json::from_str(json_valid)
-            .unwrap_or(Review { pass: true, critique: "JSON Parse Error, assuming pass".to_string() });
-            
-        Ok((review.pass, review.critique))
-    }
-
-    /// Step 1 (New): Entity-Based Grouping (Clustering Phase)
-    async fn group_items_by_entity(&self, items: &[BroadcastItem]) -> Result<Vec<Vec<usize>>> {
+    /// Step 1 (New): Entity-Based Grouping with Rich Context
+    async fn group_items_by_entity(&self, items: &[BroadcastItem]) -> Result<Vec<ClusterGroup>> {
         let item_list: String = items.iter()
-            .map(|item| format!("ID {}: {}", item.id, item.title))
+            .map(|item| format!("ID {}: {} ({})", item.id, item.title, item.source_name))
             .collect::<Vec<_>>()
             .join("\n");
             
         let prompt = format!(
-            "Role: Data Clustering Engine.\n\
-            Task: Group these news items into Clusters based on Entity/Event.\n\
+            "Role: 新闻编辑助理 - 聚类专家。\n\
+            Task: 将以下新闻按主题/实体分组，并说明分组理由。\n\
             \n\
-            Items:\n{}\n\
+            新闻列表:\n{}\n\
             \n\
-            Rules:\n\
-            1. **Strict Grouping**: Items regarding the SAME product, company release, or specific event MUST be grouped.\n\
-               (e.g. 'Logitech Mouse' and 'Logitech Keyboard' -> Group them if launched together. 'Apple Earnings' and 'Apple Stock' -> Group.)\n\
-            2. **Singleton**: If an item has no relation to others, it is a group of one.\n\
-            3. **Coverage**: Every ID from input MUST be in exactly one group.\n\
+            规则:\n\
+            1. **严格分组**: 同一公司/产品/事件的新闻必须放在一起\n\
+               (如 'Logitech鼠标' 和 'Logitech键盘' → 同组, 'Apple财报' 和 'Apple股价' → 同组)\n\
+            2. **单条新闻**: 无关联的新闻自成一组\n\
+            3. **全覆盖**: 每条新闻必须且只能出现在一个组中\n\
             \n\
-            Output JSON only: array of number arrays.\n\
-            Example: [[1, 3], [2], [4, 5]]",
+            输出 JSON 数组，每个元素包含:\n\
+            - ids: 新闻ID数组\n\
+            - theme: 这组新闻的主题 (简短，如\"Meta核能计划\"、\"GameStop战略调整\")\n\
+            - clustering_reason: 为什么这些新闻放一起 (如\"同一公司的不同产品发布\"、\"同一事件的多角度报道\")\n\
+            \n\
+            示例输出:\n\
+            [\n\
+              {{\"ids\": [1, 3], \"theme\": \"Logitech产品线\", \"clustering_reason\": \"同一公司在同一发布会上发布的多款产品\"}},\n\
+              {{\"ids\": [2], \"theme\": \"Apple财报\", \"clustering_reason\": \"独立新闻\"}}\n\
+            ]",
             item_list
         );
 
@@ -1367,75 +1149,72 @@ impl NewsAggregator {
         
         if start <= end && end < json_clean.len() {
              let json_str = &json_clean[start..=end];
-             if let Ok(groups) = serde_json::from_str::<Vec<Vec<usize>>>(json_str) {
-                 // Basic Validation (ensure IDs exist)
-                 return Ok(groups);
+             if let Ok(groups) = serde_json::from_str::<Vec<ClusterGroup>>(json_str) {
+                 // Validate all IDs exist
+                 let valid_ids: std::collections::HashSet<usize> = items.iter().map(|i| i.id).collect();
+                 let all_valid = groups.iter().all(|g| g.ids.iter().all(|id| valid_ids.contains(id)));
+                 if all_valid && !groups.is_empty() {
+                     return Ok(groups);
+                 }
              }
         }
         
-        // Fallback: Each item is its own group
-        Ok(items.iter().map(|i| vec![i.id]).collect())
+        // Fallback: Each item is its own group with generic theme
+        Ok(items.iter().map(|i| ClusterGroup {
+            ids: vec![i.id],
+            theme: i.title.chars().take(20).collect::<String>() + "...",
+            clustering_reason: "独立新闻".to_string(),
+        }).collect())
     }
 
     /// Step 2: Intelligent Structure Planning (Two-Pass: Cluster -> Sequence)
     async fn plan_episode_structure(&self, items: &[BroadcastItem], logger: Arc<Mutex<TraceLogger>>) -> Result<Vec<SegmentPlan>> {
-        // Phase 1: Clustering
+        // Phase 1: Clustering with Rich Context
         log::info!("Phase 1: Clustering {} items by entity...", items.len());
-        let groups = match self.group_items_by_entity(items).await {
+        let cluster_groups = match self.group_items_by_entity(items).await {
             Ok(g) => g,
             Err(e) => {
                 log::warn!("Clustering failed: {}. Falling back to singletons.", e);
-                items.iter().map(|i| vec![i.id]).collect()
+                items.iter().map(|i| ClusterGroup {
+                    ids: vec![i.id],
+                    theme: i.title.chars().take(20).collect::<String>() + "...",
+                    clustering_reason: "聚类失败回退".to_string(),
+                }).collect()
             }
         };
-        logger.lock().await.log("Clustering Result", &format!("{:?}", groups));
+        logger.lock().await.log("Clustering Result", &format!("{:?}", cluster_groups));
 
         // Phase 2: Sequencing the Groups
-        // Prepare Meta-Items
+        // Build descriptions with theme info
         let mut group_descriptions = Vec::new();
-        for (idx, group_ids) in groups.iter().enumerate() {
-            let titles: Vec<String> = group_ids.iter()
+        for (idx, group) in cluster_groups.iter().enumerate() {
+            let titles: Vec<String> = group.ids.iter()
                 .filter_map(|id| items.iter().find(|i| i.id == *id).map(|i| i.title.clone()))
                 .collect();
-            group_descriptions.push(format!("Group {}: {}", idx, titles.join(" / ")));
+            group_descriptions.push(format!(
+                "Group {}: 【主题: {}】{} (聚类原因: {})", 
+                idx, group.theme, titles.join(" / "), group.clustering_reason
+            ));
         }
 
-        let prompt = format!(
-            "Role: Showrunner.\n\
-            Task: Sequence these News Groups into a flow.\n\
-            \n\
-            Groups:\n{}\n\
-            \n\
-            Output JSON List of Group Indices representing the order.\n\
-            Action Logic:\n\
-            - If Group has >1 items: Action will be 'merge' (if strict dupes) or 'sequence' (if related). Planner decides.\n\
-            \n\
-            Wait, to simplify: Just return the ORDER of Group Indices.\n\
-            Example: [0, 2, 1]",
-            group_descriptions.join("\n")
-        );
-        
-        // Wait, I need accurate Action determination for each group.
-        // Let's ask LLM to output Full Plan based on Groups.
         let prompt_v2 = format!(
-             "Role: Showrunner.\n\
-             Task: Arrange these Story Groups into an Episode structure.\n\
+             "Role: 节目编排导演。\n\
+             Task: 将以下新闻组编排成完整的节目结构。\n\
              \n\
-             Available Story Groups:\n{}\n\
+             新闻组列表:\n{}\n\
              \n\
-             Instructions:\n\
-             1. **Sequence**: Order groups logically (e.g. Tech Giants -> Hardware -> Science).\n\
-             2. **Action Decision**:\n\
-                - If a Group has multiple items (e.g. 'Logitech Mouse', 'Logitech Keyboard'), decide:\n\
-                  - 'merge': If they are part of the same announcement/event.\n\
-                  - 'sequence': If they are distinct updates.\n\
-             3. **Transition Rationale** (REQUIRED for non-first groups):\n\
-                - Explain WHY each group follows the previous one.\n\
-                - This will guide the writer on how to transition.\n\
-             4. **Output format**: JSON List of objects.\n\
-                [{{\"action\": \"merge\", \"group_index\": 0, \"transition_rationale\": null}}, {{\"action\": \"sequence\", \"group_index\": 1, \"transition_rationale\": \"From software to hardware - both relate to AI performance\"}}]\n\
+             编排指令:\n\
+             1. **排序**: 按逻辑顺序排列 (如 科技巨头 -> 硬件 -> 科学)\n\
+             2. **Action决策**:\n\
+                - 'merge': 如果组内多条新闻是完全重复或同一事件\n\
+                - 'sequence': 如果组内新闻是相关但独立的更新\n\
+             3. **Transition Rationale** (非首组必填):\n\
+                - 简要说明为什么这组跟在上一组后面\n\
+                - 这将指导主播如何过渡\n\
+             4. **输出格式**: JSON 数组\n\
+                [{{\"action\": \"merge\", \"group_index\": 0, \"transition_rationale\": null}}, {{\"action\": \"sequence\", \"group_index\": 1, \"transition_rationale\": \"从软件转向硬件——两者都与AI性能相关\"}}]\n\
              \n\
-             Output JSON only.",
+             仅输出 JSON。",
              group_descriptions.join("\n")
         );
 
@@ -1452,7 +1231,7 @@ impl NewsAggregator {
         }
         
         let json_clean = response.trim().trim_matches('`').trim();
-         let start = json_clean.find('[').unwrap_or(0);
+        let start = json_clean.find('[').unwrap_or(0);
         let end = json_clean.rfind(']').unwrap_or(json_clean.len().saturating_sub(1));
         
         let steps: Vec<Step> = if start <= end {
@@ -1461,14 +1240,20 @@ impl NewsAggregator {
             Vec::new()
         };
 
-        // Convert back to SegmentPlan (Map GroupIndex -> Real IDs)
+        // Convert back to SegmentPlan with rich context from ClusterGroup
         let mut final_plans = Vec::new();
         for step in steps {
-            if let Some(real_ids) = groups.get(step.group_index) {
+            if let Some(cluster) = cluster_groups.get(step.group_index) {
                 final_plans.push(SegmentPlan {
-                    action: step.action,
-                    ids: real_ids.clone(),
-                    transition_rationale: step.transition_rationale, // v3.1
+                    action: step.action.clone(),
+                    ids: cluster.ids.clone(),
+                    transition_rationale: step.transition_rationale,
+                    group_theme: Some(cluster.theme.clone()),
+                    merge_reason: if step.action == "merge" { 
+                        Some(cluster.clustering_reason.clone()) 
+                    } else { 
+                        None 
+                    },
                 });
             }
         }
@@ -1476,8 +1261,14 @@ impl NewsAggregator {
         // Fallback if empty or failed
         if final_plans.is_empty() {
              log::warn!("Planning V2 failed/empty. Using raw groups.");
-             for ids in groups {
-                 final_plans.push(SegmentPlan { action: "sequence".to_string(), ids, transition_rationale: None });
+             for cluster in cluster_groups {
+                 final_plans.push(SegmentPlan { 
+                     action: "sequence".to_string(), 
+                     ids: cluster.ids, 
+                     transition_rationale: None,
+                     group_theme: Some(cluster.theme),
+                     merge_reason: None,
+                 });
              }
         }
 
@@ -1518,4 +1309,61 @@ struct SegmentPlan {
     ids: Vec<usize>,
     #[serde(default)]
     transition_rationale: Option<String>, // Planner-Driven Transition Logic
+    #[serde(default)]
+    group_theme: Option<String>,          // 这组新闻的主题 (如 "科技巨头动态")
+    #[serde(default)]
+    merge_reason: Option<String>,         // 为什么合并 (如 "同一公司的多个产品发布")
+}
+
+/// Rich clustering result with reasoning
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ClusterGroup {
+    ids: Vec<usize>,
+    theme: String,           // 这组的主题
+    clustering_reason: String, // 为什么放在一起
+}
+
+// Helper function to clean LLM output
+fn clean_content(text: String) -> String {
+    use regex::Regex;
+    let mut cleaned = text;
+
+    // 1. Remove [Structure Markers] and 【Structure Markers】
+    // e.g. 【正文】, [Music], 【MERGE】
+    let re_brackets = Regex::new(r"【.*?】|\[.*?\]").unwrap();
+    cleaned = re_brackets.replace_all(&cleaned, "").to_string();
+
+    // 2. Remove specific banned phrases (Ending cues that might slip through)
+    let banned = [
+        "本条播放完毕",
+        "（播报结束）", 
+        "播报结束",
+        "谢谢收听",
+        "以上是",
+    ];
+    for phrase in banned {
+        cleaned = cleaned.replace(phrase, "");
+    }
+
+    // 3. Remove Title/Source lines often hallucinated
+    // e.g. "Title: ..." or "Source: ..." or "### Segment 1"
+    let re_meta = Regex::new(r"(?im)^(Title|Source|Category|###|Group|Segment)\s*[:：].*$").unwrap();
+    cleaned = re_meta.replace_all(&cleaned, "").to_string();
+    
+    // 4. Remove standalone ### headers
+    let re_h3 = Regex::new(r"(?m)^###.*$").unwrap();
+    cleaned = re_h3.replace_all(&cleaned, "").to_string();
+
+    // 5. Remove parenthetical source citations (Safe to remove all parenthesized sources)
+    // format: (Source: XXX) or (来源: XXX)
+    let re_source = Regex::new(r"(?i)[（\(]\s*(source|来源)[:：].*?[）\)]").unwrap();
+    cleaned = re_source.replace_all(&cleaned, "").to_string();
+
+    // 6. Final whitespace cleanup
+    cleaned = cleaned.trim().to_string();
+    // Remove multiple newlines
+    let re_newlines = Regex::new(r"\n{3,}").unwrap();
+    cleaned = re_newlines.replace_all(&cleaned, "\n\n").to_string();
+
+    cleaned
 }

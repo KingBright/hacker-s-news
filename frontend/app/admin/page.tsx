@@ -15,6 +15,8 @@ export default function AdminPage() {
     const [newUserStart, setNewUserStart] = useState('');
     const [createdCreds, setCreatedCreds] = useState<{ username: string, password: string } | null>(null);
 
+    const [copiedId, setCopiedId] = useState<string | null>(null);
+
     useEffect(() => {
         const storedKey = localStorage.getItem('nexus_key');
         const storedUser = localStorage.getItem('nexus_user'); // Optional persistence
@@ -37,6 +39,16 @@ export default function AdminPage() {
         } else {
             alert("Invalid Username or Password. (Try user: admin)");
         }
+    };
+
+    const handleCopy = (text: string, id: string) => {
+        if (!text) return;
+        navigator.clipboard.writeText(text).then(() => {
+            setCopiedId(id);
+            setTimeout(() => setCopiedId(null), 2000);
+        }).catch(err => {
+            console.error('Failed to copy matches:', err);
+        });
     };
 
     const fetchUsers = (key: string) => {
@@ -289,24 +301,38 @@ export default function AdminPage() {
                                                 />
                                             </td>
                                             <td className="p-5 align-top text-center">
-                                                <button
-                                                    onClick={() => handleRegenerate(item.id)}
-                                                    className="text-slate-400 dark:text-white/20 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 p-2.5 rounded-full transition-all mr-1"
-                                                    title="Regenerate"
-                                                >
-                                                    <span className="material-symbols-outlined text-[20px]">refresh</span>
-                                                </button>
-                                                <button
-                                                    onClick={() => {
-                                                        if (confirm('Are you sure you want to delete this item?')) {
-                                                            updateItem(item.id, { is_deleted: true });
-                                                        }
-                                                    }}
-                                                    className="text-slate-400 dark:text-white/20 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 p-2.5 rounded-full transition-all"
-                                                    title="Delete"
-                                                >
-                                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
-                                                </button>
+                                                <div className="flex justify-center gap-1">
+                                                    <button
+                                                        onClick={() => handleCopy(item.summary || '', item.id)}
+                                                        className={`p-2.5 rounded-full transition-all mr-1 ${copiedId === item.id
+                                                            ? 'text-green-500 bg-green-50 dark:bg-green-900/20'
+                                                            : 'text-slate-400 dark:text-white/20 hover:text-indigo-500 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/20'
+                                                            }`}
+                                                        title="Copy Script"
+                                                    >
+                                                        <span className="material-symbols-outlined text-[20px]">
+                                                            {copiedId === item.id ? 'check' : 'content_copy'}
+                                                        </span>
+                                                    </button>
+                                                    <button
+                                                        onClick={() => handleRegenerate(item.id)}
+                                                        className="text-slate-400 dark:text-white/20 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 p-2.5 rounded-full transition-all mr-1"
+                                                        title="Regenerate"
+                                                    >
+                                                        <span className="material-symbols-outlined text-[20px]">refresh</span>
+                                                    </button>
+                                                    <button
+                                                        onClick={() => {
+                                                            if (confirm('Are you sure you want to delete this item?')) {
+                                                                updateItem(item.id, { is_deleted: true });
+                                                            }
+                                                        }}
+                                                        className="text-slate-400 dark:text-white/20 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 p-2.5 rounded-full transition-all"
+                                                        title="Delete"
+                                                    >
+                                                        <span className="material-symbols-outlined text-[20px]">delete</span>
+                                                    </button>
+                                                </div>
                                             </td>
                                         </tr>
                                     ))}
