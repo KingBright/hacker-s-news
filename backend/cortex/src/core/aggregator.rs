@@ -439,11 +439,11 @@ impl NewsAggregator {
          // Simple JSON parse
         let json_str = response.trim().trim_matches('`').trim();
         let start = json_str.find('{').unwrap_or(0);
-        let end = json_str.rfind('}').unwrap_or(json_str.len().saturating_sub(1));
+        let end = json_str.rfind('}').map(|i| i + 1).unwrap_or(json_str.len());
         
         // Ensure range is valid
-        let json_valid = if start <= end && end < json_str.len() {
-             &json_str[start..=end]
+        let json_valid = if start < end && end <= json_str.len() {
+             &json_str[start..end]
         } else {
              "{}"
         };
@@ -994,13 +994,13 @@ impl NewsAggregator {
         let weekday = weekdays[now.weekday().num_days_from_monday() as usize];
         
         let opening_template = format!(
-            "大家好，欢迎收听 FreshLoop {}频道，我是{}。今天是{}，星期{}。{}",
+            "大家好，欢迎收听 FreshLoop {}频道，我是你的播报员{}。今天是{}，星期{}。{}在这个信息爆炸的时代，我们将为您精选最有价值的资讯。",
             category, host_name, date_str, weekday,
-            if !holiday_context.is_empty() { format!(" {}", holiday_context) } else { String::new() }
+            if !holiday_context.is_empty() { format!("{} ", holiday_context) } else { String::new() }
         );
         
         let closing_template = format!(
-            "以上就是本期 FreshLoop {}频道的全部内容。感谢收听，我是{}，下期再见。",
+            "以上就是本期 FreshLoop {}频道的全部内容。希望这些资讯能为您带来新的启发。感谢您的聆听，我是{}，期待与您在下期再见，祝您有个美好的一天。",
             category, host_name
         );
 
@@ -1256,10 +1256,10 @@ impl NewsAggregator {
         // Simple JSON parse
         let json_str = response.trim().trim_matches('`').trim();
         let start = json_str.find('{').unwrap_or(0);
-        let end = json_str.rfind('}').unwrap_or(json_str.len().saturating_sub(1));
+        let end = json_str.rfind('}').map(|i| i + 1).unwrap_or(json_str.len());
         
-        let json_valid = if start <= end && end < json_str.len() {
-             &json_str[start..=end]
+        let json_valid = if start < end && end <= json_str.len() {
+             &json_str[start..end]
         } else {
              "{}"
         };
