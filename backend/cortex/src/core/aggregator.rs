@@ -439,11 +439,11 @@ impl NewsAggregator {
          // Simple JSON parse
         let json_str = response.trim().trim_matches('`').trim();
         let start = json_str.find('{').unwrap_or(0);
-        let end = json_str.rfind('}').unwrap_or(json_str.len().saturating_sub(1));
+        let end = json_str.rfind('}').map(|i| i + 1).unwrap_or(json_str.len());
         
         // Ensure range is valid
-        let json_valid = if start <= end && end < json_str.len() {
-             &json_str[start..=end]
+        let json_valid = if start < end && end <= json_str.len() {
+             &json_str[start..end]
         } else {
              "{}"
         };
@@ -1256,10 +1256,10 @@ impl NewsAggregator {
         // Simple JSON parse
         let json_str = response.trim().trim_matches('`').trim();
         let start = json_str.find('{').unwrap_or(0);
-        let end = json_str.rfind('}').unwrap_or(json_str.len().saturating_sub(1));
+        let end = json_str.rfind('}').map(|i| i + 1).unwrap_or(json_str.len());
         
-        let json_valid = if start <= end && end < json_str.len() {
-             &json_str[start..=end]
+        let json_valid = if start < end && end <= json_str.len() {
+             &json_str[start..end]
         } else {
              "{}"
         };

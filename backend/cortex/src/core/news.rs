@@ -244,8 +244,8 @@ pub async fn run_news_loop(
                 Ok(json_str) => {
                     let json_clean = json_str.trim().trim_matches('`').trim();
                     let start = json_clean.find('{').unwrap_or(0);
-                    let end = json_clean.rfind('}').unwrap_or(json_clean.len()) + 1;
-                    let potential_json = &json_clean[start..end];
+                    let end = json_clean.rfind('}').map(|i| i + 1).unwrap_or(json_clean.len());
+                    let potential_json = if start < end { &json_clean[start..end] } else { "{}" };
 
                     if let Ok(analysis) = serde_json::from_str::<ItemAnalysis>(potential_json) {
                         // Filter out Advertisements and Low Score
