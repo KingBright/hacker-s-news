@@ -1,7 +1,8 @@
 use sqlx::migrate::MigrateDatabase;
-use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Pool, Sqlite};
 use std::env;
+use std::time::Duration;
 
 pub type DbPool = Pool<Sqlite>;
 
@@ -27,7 +28,15 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
         Sqlite::create_database(&database_url).await?;
     }
 
-    let pool = SqlitePool::connect(&database_url).await?;
+    // Configure connection pool with proper settings
+    let pool = SqlitePoolOptions::new()
+        .max_connections(10)              // Maximum concurrent connections
+        .min_connections(2)               // Minimum idle connections
+        .acquire_timeout(Duration::from_secs(30))  // Timeout for acquiring connection
+        .idle_timeout(Some(Duration::from_secs(600))) // Close idle connections after 10 mins
+        .max_lifetime(Some(Duration::from_secs(3600))) // Connection lifetime 1 hour
+        .connect(&database_url)
+        .await?;
 
     sqlx::query(
         r#"
@@ -35,7 +44,7 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             summary TEXT,
-            original_url TEXT,
+            original_url TEXT UNIQUE,
             cover_image_url TEXT,
             audio_url TEXT,
             publish_time INTEGER,
@@ -97,6 +106,32 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN category TEXT")
         .execute(&pool)
         .await; // New category column
+
+    // Add unique index on original_url for deduplication (idempotent)
+    // First, clean up existing data to prevent index creation failures
+    // 1. Remove duplicate original_urls (keep the newest by publish_time)
+    let _ = sqlx::query(
+        r#"
+        DELETE FROM items WHERE id NOT IN (
+            SELECT id FROM (
+                SELECT id, ROW_NUMBER() OVER (
+                    PARTITION BY original_url ORDER BY publish_time DESC, created_at DESC
+                ) as rn
+                FROM items
+                WHERE original_url IS NOT NULL AND original_url != ''
+            ) WHERE rn = 1
+        ) AND original_url IS NOT NULL AND original_url != ''
+        "#
+    )
+    .execute(&pool)
+    .await;
+
+    // 2. Create the unique index (IF NOT EXISTS makes this idempotent)
+    let _ = sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_original_url ON items(original_url)"
+    )
+    .execute(&pool)
+    .await;
 
     Ok(pool)
 }

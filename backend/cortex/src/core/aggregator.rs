@@ -524,6 +524,14 @@ impl NewsAggregator {
                 log::info!("Time Filter: Discarding stale cluster '{}' (Age: {}h)", 
                     cluster.main_item.title, 
                     (now_ts - cluster.main_item.timestamp) / 3600);
+                
+                // Build a short vector and remove immediately
+                let stale_ids = vec![cluster.id.clone()];
+                let buf = self.buffer.lock().await;
+                if let Err(e) = buf.remove_clusters(category, &stale_ids) {
+                    log::error!("Failed to remove stale cluster from DB: {}", e);
+                }
+                
                 continue;
             }
             // --------------------------------------
@@ -725,9 +733,56 @@ impl NewsAggregator {
         let logger = Arc::new(Mutex::new(TraceLogger::new(category)));
         logger.lock().await.log("Start", &format!("Producing Episode for [{}]. Regen: {}", category, is_regen));
 
+        // -- TTS DRAFT CACHE PRE-CHECK --
+        use std::hash::Hasher;
+        let mut tts_cache_path = None;
+        let mut cached_script = None;
+        let mut cached_title = None;
+
+        if let Some(item_list) = items {
+            if !is_regen {
+                // Generate a deterministic hash from the sorted URLs of the items
+                let mut hasher = twox_hash::XxHash64::with_seed(0);
+                let mut urls: Vec<String> = item_list.iter().map(|i| i.original_url.clone()).collect();
+                urls.sort();
+                for url in urls {
+                    hasher.write(url.as_bytes());
+                }
+                let hash = hasher.finish();
+                
+                let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+                let draft_dir = home.join(".freshloop/cache/tts_drafts").join(category);
+                let _ = std::fs::create_dir_all(&draft_dir);
+                let draft_file = draft_dir.join(format!("{:016x}.json", hash));
+                
+                #[derive(serde::Deserialize, serde::Serialize)]
+                struct TtsDraft {
+                    raw_script: String,
+                    generated_title: Option<String>,
+                }
+
+                if draft_file.exists() {
+                    match std::fs::read_to_string(&draft_file) {
+                        Ok(contents) => {
+                            if let Ok(draft) = serde_json::from_str::<TtsDraft>(&contents) {
+                                log::info!("TTS DRAFT CACHE HIT! Using pre-generated script for cluster hash {:016x}", hash);
+                                logger.lock().await.log("Cache Hit", "Recovered LLM generated script from disk.");
+                                cached_script = Some(draft.raw_script);
+                                cached_title = draft.generated_title;
+                            }
+                        }
+                        Err(e) => log::warn!("Failed to read TTS draft cache: {}", e),
+                    }
+                }
+                tts_cache_path = Some(draft_file);
+            }
+        }
+
         // SMART FLOW (Unified)
-        // New: Structure Planning → Compress → Generate by Groups → Extract Title
-        let (raw_script, generated_title) = if let Some(item_list) = items {
+        // Check if we recovered from cache
+        let (raw_script, generated_title) = if let Some(script) = cached_script {
+             (script, cached_title)
+        } else if let Some(item_list) = items {
             log::info!("Starting Smart Episode Generation for {} items...", item_list.len());
             
             // Step A: Intelligent Structure Planning (Sort + Group)
@@ -777,6 +832,23 @@ impl NewsAggregator {
                 }
             };
             
+            // Cache the newly generated script and title to disk
+            if let Some(path) = &tts_cache_path {
+                 #[derive(serde::Serialize)]
+                 struct TtsDraft<'a> {
+                     raw_script: &'a str,
+                     generated_title: Option<&'a String>,
+                 }
+                 let draft = TtsDraft { raw_script: &script, generated_title: title.as_ref() };
+                 if let Ok(json) = serde_json::to_string(&draft) {
+                     if let Err(e) = std::fs::write(path, json) {
+                         log::warn!("Failed to save TTS draft to disk: {}", e);
+                     } else {
+                         log::info!("Saved TTS draft to disk: {:?}", path);
+                     }
+                 }
+            }
+
             (script, title)
 
         } else {
@@ -844,6 +916,14 @@ impl NewsAggregator {
 
         if let Err(e) = logger.lock().await.save() {
             log::error!("Failed to save execution trace: {}", e);
+        }
+
+        // 8. Clean up TTS Cache on pure success
+        if let Some(path) = tts_cache_path {
+             if path.exists() && final_audio.is_some() {
+                  let _ = std::fs::remove_file(&path);
+                  log::info!("Cleaned up TTS draft cache file.");
+             }
         }
 
         Ok((script_body, final_title, final_audio, duration, false))

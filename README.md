@@ -44,6 +44,18 @@
 ./scripts/install_local_service.sh
 ```
 
+Cortex 启动后会同时运行：
+- **定时调度器**：按 `config.toml` 中的 `schedule_times` 自动执行新闻周期
+- **触发 API**：监听 `http://localhost:3721`，支持手动触发和状态查询
+
+```bash
+# 手动触发一次完整新闻周期（RSS抓取 + 聚类 + 生成 + TTS）
+curl -X POST http://localhost:3721/api/trigger
+
+# 查看当前状态（运行中/空闲、待处理集群数、各频道统计）
+curl http://localhost:3721/api/status
+```
+
 ### 3. 一键部署前端和 Nexus 服务
 ```bash
 ./scripts/deploy.sh

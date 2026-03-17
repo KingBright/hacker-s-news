@@ -6,11 +6,13 @@ use crate::core::nexus::NexusClient;
 use crate::core::topic_registry::TopicRegistry;
 use crate::core::tts::TtsClient;
 use anyhow::Result;
+use axum::{extract::State, routing::{get, post}, Json, Router};
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
 use tokio_cron_scheduler::{Job, JobScheduler};
+use sysinfo::{System, get_current_pid};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ItemAnalysis {
@@ -37,8 +39,9 @@ async fn run_one_cycle(
     let feed_count = config.rss_feeds.as_ref().map(|f| f.len()).unwrap_or(0);
     log::info!("Configured RSS feeds: {}", feed_count);
     if let Some(feeds) = &config.rss_feeds {
+        let proxy = config.http_proxy.as_deref();
         for url in feeds {
-            match fetch_rss_items(url).await {
+            match fetch_rss_items(url, proxy).await {
                 Ok(items) => all_candidate_items.extend(items),
                 Err(e) => log::warn!("Failed to fetch RSS {}: {}", url, e),
             }
@@ -93,21 +96,35 @@ async fn run_one_cycle(
         return Ok(());
     }
 
-    // Deduplication against Nexus
+    // Deduplication against Nexus with 5 retries
     let urls: Vec<String> = today_items.iter().map(|i| i.link.clone()).collect();
-    let existing_urls = match nexus.check_urls(urls.clone()).await {
-        Ok(u) => {
-            let buf = buffer.lock().await;
-            for url in &u {
-                buf.mark_link_processed(url).ok();
+    let mut existing_urls = Vec::new();
+
+    for attempt in 0..5 {
+        match nexus.check_urls(urls.clone()).await {
+            Ok(u) => {
+                existing_urls = u;
+                let buf = buffer.lock().await;
+                for url in &existing_urls {
+                    buf.mark_link_processed(url).ok();
+                }
+                log::info!("Deduplication successful on attempt {}/5", attempt + 1);
+                break;
             }
-            u
+            Err(e) => {
+                log::warn!("Check URLs failed (attempt {}/5): {}", attempt + 1, e);
+                if attempt < 4 {
+                    // Exponential backoff: 1s, 2s, 4s, 8s
+                    let delay = std::time::Duration::from_secs(2_u64.pow(attempt as u32));
+                    log::info!("Retrying deduplication in {:?}...", delay);
+                    tokio::time::sleep(delay).await;
+                } else {
+                    log::error!("Failed to connect to Nexus for deduplication after 5 attempts");
+                    return Err(anyhow::anyhow!("Failed to connect to Nexus for deduplication after 5 attempts: {}", e));
+                }
+            }
         }
-        Err(e) => {
-            log::error!("Dedup failed: {}", e);
-            return Err(e);
-        }
-    };
+    }
 
     let new_items: Vec<_> = today_items
         .into_iter()
@@ -192,9 +209,11 @@ async fn run_one_cycle(
                             llm_cat.to_string()
                         } else {
                             let mut matched = None;
+                            let llm_cat_clean = llm_cat.replace(" ", "");
                             for valid_name in &valid_category_names {
-                                if valid_name.contains(llm_cat)
-                                    || llm_cat.contains(valid_name.as_str())
+                                let valid_name_clean = valid_name.replace(" ", "");
+                                if valid_name_clean.contains(&llm_cat_clean)
+                                    || llm_cat_clean.contains(&valid_name_clean)
                                 {
                                     matched = Some(valid_name.clone());
                                     break;
@@ -229,6 +248,7 @@ async fn run_one_cycle(
                         category: normalized_category,
                         source_name: item.source_name.clone(),
                         timestamp: chrono::Utc::now().timestamp() as u64,
+                        original_text: clean_desc.clone(),
                     };
 
                     match aggregator.push_with_clustering(pending).await {
@@ -262,6 +282,10 @@ pub async fn run_news_loop(
     cache_dir: String,
 ) {
     let config = Arc::new(config);
+    log::info!(
+        "Scheduler configured with timezone_offset: {:?}",
+        config.timezone_offset
+    );
     // Initialize v2.0 Components
     let buffer = Arc::new(tokio::sync::Mutex::new(
         NewsBuffer::new(&cache_dir).expect("Failed to init NewsBuffer"),
@@ -302,37 +326,86 @@ pub async fn run_news_loop(
         }
     });
 
+    // Background Link Prune Task (daily)
+    let buffer_clone = buffer.clone();
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(24 * 3600)); // Daily
+        interval.tick().await; // Skip first tick
+        loop {
+            interval.tick().await;
+            let buf = buffer_clone.lock().await;
+            match buf.prune_old_links(3 * 24 * 3600) { // 3 days TTL
+                Ok(n) => {
+                    if n > 0 {
+                        log::info!("Link Prune: Removed {} old processed links", n);
+                    }
+                }
+                Err(e) => log::warn!("Link Prune failed: {}", e),
+            }
+        }
+    });
+
+    // Background Cluster Prune Task (daily - removes orphaned clusters older than 7 days)
+    let buffer_clone2 = buffer.clone();
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(24 * 3600)); // Daily
+        interval.tick().await; // Skip first tick
+        loop {
+            interval.tick().await;
+            let buf = buffer_clone2.lock().await;
+            match buf.prune_old_clusters(7 * 24 * 3600) { // 7 days TTL
+                Ok(n) => {
+                    if n > 0 {
+                        log::info!("Cluster Prune: Removed {} old clusters", n);
+                    }
+                }
+                Err(e) => log::warn!("Cluster Prune failed: {}", e),
+            }
+        }
+    });
+
+    // Background Trace Log Cleanup (daily - removes trace files older than 7 days)
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(24 * 3600)); // Daily
+        interval.tick().await; // Skip first tick
+        loop {
+            interval.tick().await;
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            let trace_dir = std::path::PathBuf::from(&home).join(".freshloop/logs/traces");
+            if let Ok(entries) = std::fs::read_dir(&trace_dir) {
+                let cutoff = std::time::SystemTime::now()
+                    .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600))
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                let mut removed = 0;
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            if modified < cutoff {
+                                let _ = std::fs::remove_file(entry.path());
+                                removed += 1;
+                            }
+                        }
+                    }
+                }
+                if removed > 0 {
+                    log::info!("Trace Prune: Removed {} old trace files", removed);
+                }
+            }
+        }
+    });
+
     let sched = JobScheduler::new()
         .await
         .expect("Failed to create scheduler");
     let timezone_config = config.clone();
     let get_now = move || {
-        if let Some(offset) = timezone_config.timezone_offset {
-            let tz = chrono::FixedOffset::east_opt(offset * 3600)
-                .unwrap_or(chrono::FixedOffset::east_opt(8 * 3600).unwrap());
-            chrono::Utc::now().with_timezone(&tz)
-        } else {
-            chrono::Local::now().fixed_offset()
-        }
+        let offset = timezone_config.timezone_offset.unwrap_or(8);
+        let tz = chrono::FixedOffset::east_opt(offset * 3600)
+            .unwrap_or(chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        chrono::Utc::now().with_timezone(&tz)
     };
 
-    // 1. Initial run on startup
-    {
-        let c = config.clone();
-        let l = llm.clone();
-        let n = nexus.clone();
-        let a = aggregator.clone();
-        let b = buffer.clone();
-        let now = get_now();
-        tokio::spawn(async move {
-            log::info!("Startup trigger: Running initial news cycle...");
-            if let Err(e) = run_one_cycle(c, l, n, a, b, now).await {
-                log::error!("Initial news cycle failed: {}", e);
-            }
-        });
-    }
-
-    // 2. Scheduled runs
+    // Scheduled runs
     if let Some(times) = &config.schedule_times {
         for time_str in times {
             let parts: Vec<&str> = time_str.split(':').collect();
@@ -426,9 +499,276 @@ pub async fn run_news_loop(
     sched.start().await.expect("Failed to start scheduler");
     log::info!("Job scheduler started successfully.");
 
-    // Keep loop alive
-    loop {
-        tokio::time::sleep(Duration::from_secs(3600)).await;
+    // Start HTTP trigger server (replaces the idle sleep loop)
+    let app_state = Arc::new(TriggerState {
+        config: config.clone(),
+        llm: llm.clone(),
+        nexus: nexus.clone(),
+        aggregator: aggregator.clone(),
+        buffer: buffer.clone(),
+        registry: registry.clone(),
+        get_now: Box::new(get_now),
+        running: tokio::sync::Mutex::new(false),
+    });
+
+    let app = Router::new()
+        .route("/api/trigger", post(handle_trigger))
+        .route("/api/status", get(handle_status))
+        .route("/api/memory", get(handle_memory))
+        .route("/api/health/nexus", get(handle_nexus_health))
+        .with_state(app_state);
+
+    let bind_addr = "0.0.0.0:3721";
+    log::info!("Cortex trigger API listening on {}", bind_addr);
+    let listener = tokio::net::TcpListener::bind(bind_addr).await.expect("Failed to bind trigger API");
+    axum::serve(listener, app).await.expect("Trigger API server failed");
+}
+
+// --- HTTP Trigger API ---
+
+struct TriggerState {
+    config: Arc<Config>,
+    llm: Arc<LlmClient>,
+    nexus: Arc<NexusClient>,
+    aggregator: Arc<NewsAggregator>,
+    buffer: Arc<tokio::sync::Mutex<NewsBuffer>>,
+    registry: Arc<TopicRegistry>,
+    get_now: Box<dyn Fn() -> chrono::DateTime<chrono::FixedOffset> + Send + Sync>,
+    running: tokio::sync::Mutex<bool>,
+}
+
+#[derive(serde::Serialize)]
+struct TriggerResponse {
+    success: bool,
+    message: String,
+}
+
+async fn handle_trigger(
+    State(state): State<Arc<TriggerState>>,
+) -> Json<TriggerResponse> {
+    // Prevent concurrent triggers
+    {
+        let mut running = state.running.lock().await;
+        if *running {
+            return Json(TriggerResponse {
+                success: false,
+                message: "A cycle is already running. Please wait.".to_string(),
+            });
+        }
+        *running = true;
+    }
+
+    let now = (state.get_now)();
+    log::info!("[Trigger API] Manual cycle triggered at {}", now);
+
+    let config = state.config.clone();
+    let llm = state.llm.clone();
+    let nexus = state.nexus.clone();
+    let aggregator = state.aggregator.clone();
+    let buffer = state.buffer.clone();
+    let state_clone = state.clone();
+
+    // Run in background so the HTTP response returns immediately
+    tokio::spawn(async move {
+        let result = run_one_cycle(config, llm, nexus, aggregator, buffer, now).await;
+        match &result {
+            Ok(()) => log::info!("[Trigger API] Manual cycle completed successfully"),
+            Err(e) => log::error!("[Trigger API] Manual cycle failed: {}", e),
+        }
+        *state_clone.running.lock().await = false;
+    });
+
+    Json(TriggerResponse {
+        success: true,
+        message: format!("Cycle triggered at {}. Running in background.", now),
+    })
+}
+
+async fn handle_status(
+    State(state): State<Arc<TriggerState>>,
+) -> Json<serde_json::Value> {
+    let running = *state.running.lock().await;
+    let category_stats = {
+        let buf = state.buffer.lock().await;
+        buf.get_category_stats().unwrap_or_default()
+    };
+    let total_clusters: usize = category_stats.values().map(|(c, _)| c).sum();
+    let now = (state.get_now)();
+
+    Json(serde_json::json!({
+        "status": if running { "running" } else { "idle" },
+        "current_time": now.to_string(),
+        "pending_clusters": total_clusters,
+        "categories": category_stats.iter().map(|(k, (count, oldest))| {
+            serde_json::json!({ "name": k, "clusters": count, "oldest_ts": oldest })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+// --- Memory Diagnostics API ---
+
+#[derive(serde::Serialize)]
+struct MemorySnapshot {
+    timestamp: String,
+    process: ProcessMemoryInfo,
+    system: SystemMemoryInfo,
+    components: ComponentMemoryInfo,
+}
+
+#[derive(serde::Serialize)]
+struct ProcessMemoryInfo {
+    pid: u32,
+    name: String,
+    memory_mb: f64,
+    virtual_memory_mb: f64,
+    cpu_percent: f64,
+}
+
+#[derive(serde::Serialize)]
+struct SystemMemoryInfo {
+    total_mb: f64,
+    used_mb: f64,
+    free_mb: f64,
+    used_percent: f64,
+}
+
+#[derive(serde::Serialize)]
+struct ComponentMemoryInfo {
+    // NewsBuffer stats
+    news_buffer_clusters: usize,
+    news_buffer_categories: usize,
+    news_buffer_db_size_mb: f64,
+
+    // TopicRegistry stats
+    topic_registry_topics: usize,
+    topic_registry_estimate_mb: f64,
+
+    // LLM Cache stats
+    llm_cache_entries: usize,
+    llm_cache_estimate_mb: f64,
+
+    // Retry queue stats
+    retry_queue_size: usize,
+    retry_queue_estimate_mb: f64,
+
+    // TTS stats (if active)
+    tts_active_chunks: usize,
+    tts_audio_buffer_mb: f64,
+
+    // Nexus connection health
+    nexus_healthy: bool,
+    nexus_latency_ms: u64,
+}
+
+async fn handle_memory(
+    State(state): State<Arc<TriggerState>>,
+) -> Json<MemorySnapshot> {
+    let mut system = System::new_all();
+    system.refresh_all();
+
+    let pid = get_current_pid().unwrap_or_else(|_| sysinfo::Pid::from_u32(0));
+    let process = system.process(pid).map(|p| ProcessMemoryInfo {
+        pid: pid.as_u32(),
+        name: p.name().to_str().unwrap_or("unknown").to_string(),
+        memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
+        virtual_memory_mb: p.virtual_memory() as f64 / 1024.0 / 1024.0,
+        cpu_percent: p.cpu_usage() as f64,
+    }).unwrap_or_else(|| ProcessMemoryInfo {
+        pid: pid.as_u32(),
+        name: "unknown".to_string(),
+        memory_mb: 0.0,
+        virtual_memory_mb: 0.0,
+        cpu_percent: 0.0,
+    });
+
+    let total_memory = system.total_memory();
+    let used_memory = system.used_memory();
+
+    let system_info = SystemMemoryInfo {
+        total_mb: total_memory as f64 / 1024.0 / 1024.0,
+        used_mb: used_memory as f64 / 1024.0 / 1024.0,
+        free_mb: (total_memory - used_memory) as f64 / 1024.0 / 1024.0,
+        used_percent: (used_memory as f64 / total_memory as f64) * 100.0,
+    };
+
+    // Get component stats
+    let (cluster_count, category_count, news_buffer_size) = {
+        let buf = state.buffer.lock().await;
+        let stats = buf.get_category_stats().unwrap_or_default();
+        let clusters: usize = stats.values().map(|(c, _)| c).sum();
+        let size_bytes = buf.get_db_size().unwrap_or(0);
+        (clusters, stats.len(), size_bytes)
+    };
+
+    // Get topic registry stats
+    let (topic_count, topic_size) = state.registry.get_stats().unwrap_or((0, 0));
+
+    // Get LLM cache stats
+    let (llm_cache_count, llm_cache_size) = state.llm.get_cache_stats().unwrap_or((0, 0));
+
+    // Get Nexus health status
+    let nexus_health = state.nexus.get_health().await;
+
+    let components = ComponentMemoryInfo {
+        news_buffer_clusters: cluster_count,
+        news_buffer_categories: category_count,
+        news_buffer_db_size_mb: news_buffer_size as f64 / 1024.0 / 1024.0,
+
+        topic_registry_topics: topic_count,
+        topic_registry_estimate_mb: topic_size as f64 / 1024.0 / 1024.0,
+
+        llm_cache_entries: llm_cache_count,
+        llm_cache_estimate_mb: llm_cache_size as f64 / 1024.0 / 1024.0,
+
+        // TODO: Add retry queue stats when RetryManager is accessible from state
+        retry_queue_size: 0,
+        retry_queue_estimate_mb: 0.0,
+
+        // TODO: Add TTS stats when TTS is processing
+        tts_active_chunks: 0,
+        tts_audio_buffer_mb: 0.0,
+
+        // Nexus connection health
+        nexus_healthy: nexus_health.is_healthy,
+        nexus_latency_ms: nexus_health.latency_ms,
+    };
+
+    Json(MemorySnapshot {
+        timestamp: chrono::Local::now().to_rfc3339(),
+        process,
+        system: system_info,
+        components,
+    })
+}
+
+/// Trigger a fresh health check to Nexus (bypasses DNS cache)
+async fn handle_nexus_health(
+    State(state): State<Arc<TriggerState>>,
+) -> Json<serde_json::Value> {
+    match state.nexus.health_check().await {
+        Ok(health) => {
+            Json(serde_json::json!({
+                "success": true,
+                "healthy": health.is_healthy,
+                "latency_ms": health.latency_ms,
+                "last_check": health.last_check,
+                "error_count": health.error_count,
+                "last_error": health.last_error,
+                "message": if health.is_healthy {
+                    "Nexus is healthy"
+                } else {
+                    "Nexus health check failed"
+                }
+            }))
+        }
+        Err(e) => {
+            Json(serde_json::json!({
+                "success": false,
+                "healthy": false,
+                "error": e.to_string(),
+                "message": "Failed to check Nexus health"
+            }))
+        }
     }
 }
 
@@ -492,12 +832,31 @@ struct RssItem {
     source_name: Option<String>,
 }
 
-async fn fetch_rss_items(url: &str) -> Result<Vec<RssItem>> {
-    let client = reqwest::Client::builder()
+async fn fetch_rss_items(url: &str, proxy_url: Option<&str>) -> Result<Vec<RssItem>> {
+    let client_builder = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .build()?;
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10));
 
-    let content = client.get(url).send().await?.bytes().await?;
+    let client = client_builder.build()?;
+    
+    let mut response = client.get(url).send().await;
+
+    // Retry with proxy if direct fetch fails and proxy is configured
+    if response.is_err() {
+        if let Some(proxy) = proxy_url {
+            log::info!("Direct fetch failed for {}, retrying with proxy: {}", url, proxy);
+            let proxy_client = reqwest::Client::builder()
+                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .proxy(reqwest::Proxy::all(proxy)?)
+                .build()?;
+            response = proxy_client.get(url).send().await;
+        }
+    }
+
+    let content = response?.bytes().await?;
     let cursor = std::io::Cursor::new(content);
     let feed = feed_rs::parser::parse(cursor)?;
 

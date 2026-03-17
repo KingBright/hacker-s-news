@@ -1,7 +1,16 @@
 "use client";
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Item } from '../../src/types';
+
+// Session timeout in milliseconds (1 hour)
+const SESSION_TIMEOUT_MS = 60 * 60 * 1000;
+
+interface SessionData {
+    key: string;
+    user: string;
+    expiresAt: number;
+}
 
 export default function AdminPage() {
     // Auth & Content State
@@ -10,6 +19,7 @@ export default function AdminPage() {
     const [items, setItems] = useState<Item[]>([]);
     const [isAuthenticated, setIsAuthenticated] = useState(false);
     const [loading, setLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
 
     const [users, setUsers] = useState<any[]>([]);
     const [newUserStart, setNewUserStart] = useState('');
@@ -17,28 +27,81 @@ export default function AdminPage() {
 
     const [copiedId, setCopiedId] = useState<string | null>(null);
 
+    // Check and restore session from sessionStorage
+    const checkSession = useCallback(() => {
+        try {
+            const sessionData = sessionStorage.getItem('nexus_session');
+            if (sessionData) {
+                const session: SessionData = JSON.parse(sessionData);
+                // Check if session has expired
+                if (Date.now() < session.expiresAt) {
+                    setPassword(session.key);
+                    setUsername(session.user);
+                    setIsAuthenticated(true);
+                    return session.key;
+                } else {
+                    // Session expired, clear it
+                    sessionStorage.removeItem('nexus_session');
+                }
+            }
+        } catch (e) {
+            console.error("Failed to restore session", e);
+            sessionStorage.removeItem('nexus_session');
+        }
+        return null;
+    }, []);
+
     useEffect(() => {
-        const storedKey = localStorage.getItem('nexus_key');
-        const storedUser = localStorage.getItem('nexus_user'); // Optional persistence
-        if (storedKey && storedUser === 'admin') {
-            setPassword(storedKey);
-            setUsername(storedUser);
-            setIsAuthenticated(true);
+        const storedKey = checkSession();
+        if (storedKey) {
             fetchItems(storedKey);
             fetchUsers(storedKey);
         }
-    }, []);
+    }, [checkSession]);
+
+    // Set up session expiration check
+    useEffect(() => {
+        if (isAuthenticated) {
+            const interval = setInterval(() => {
+                const sessionData = sessionStorage.getItem('nexus_session');
+                if (sessionData) {
+                    const session: SessionData = JSON.parse(sessionData);
+                    if (Date.now() >= session.expiresAt) {
+                        handleLogout();
+                    }
+                }
+            }, 60000); // Check every minute
+
+            return () => clearInterval(interval);
+        }
+    }, [isAuthenticated]);
 
     const handleLogin = () => {
+        setError(null);
         if (username === 'admin' && password) {
-            localStorage.setItem('nexus_key', password);
-            localStorage.setItem('nexus_user', username);
+            // Use sessionStorage instead of localStorage for better security
+            // Session expires after SESSION_TIMEOUT_MS
+            const session: SessionData = {
+                key: password,
+                user: username,
+                expiresAt: Date.now() + SESSION_TIMEOUT_MS
+            };
+            sessionStorage.setItem('nexus_session', JSON.stringify(session));
             setIsAuthenticated(true);
             fetchItems(password);
             fetchUsers(password);
         } else {
-            alert("Invalid Username or Password. (Try user: admin)");
+            setError("Invalid Username or Password. (Try user: admin)");
         }
+    };
+
+    const handleLogout = () => {
+        sessionStorage.removeItem('nexus_session');
+        setPassword('');
+        setUsername('');
+        setIsAuthenticated(false);
+        setItems([]);
+        setUsers([]);
     };
 
     const handleCopy = (text: string, id: string) => {
@@ -51,17 +114,24 @@ export default function AdminPage() {
         });
     };
 
-    const fetchUsers = (key: string) => {
+    const fetchUsers = useCallback((key: string) => {
         fetch('/api/admin/users', {
             headers: { 'X-API-KEY': key }
         })
-            .then(res => res.json())
+            .then(res => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return res.json();
+            })
             .then(data => setUsers(data || []))
-            .catch(e => console.error("Failed to fetch users", e));
-    };
+            .catch(e => {
+                console.error("Failed to fetch users", e);
+                setError("Failed to fetch users. Session may have expired.");
+            });
+    }, []);
 
     const createUser = async () => {
         if (!newUserStart) return;
+        setError(null);
         try {
             const res = await fetch('/api/admin/users', {
                 method: 'POST',
@@ -71,31 +141,43 @@ export default function AdminPage() {
                 },
                 body: JSON.stringify({ username: newUserStart })
             });
-            if (!res.ok) throw new Error("Failed");
+            if (!res.ok) {
+                if (res.status === 401) {
+                    handleLogout();
+                    throw new Error("Session expired. Please login again.");
+                }
+                throw new Error("Failed to create user");
+            }
             const data = await res.json();
             setCreatedCreds({ username: data.username, password: data.password_generated });
             setNewUserStart('');
             fetchUsers(password);
-        } catch (e) {
-            alert("Failed to create user");
+        } catch (e: any) {
+            setError(e.message || "Failed to create user");
         }
     };
 
-    const fetchItems = (key: string) => {
+    const fetchItems = useCallback((key: string) => {
         setLoading(true);
+        setError(null);
         fetch('/api/items?limit=100')
-            .then(res => res.json())
+            .then(res => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return res.json();
+            })
             .then(data => {
                 setItems(data);
                 setLoading(false);
             })
             .catch(err => {
                 console.error(err);
+                setError("Failed to fetch items");
                 setLoading(false);
             });
-    };
+    }, []);
 
     const updateItem = async (id: string, updates: any) => {
+        setError(null);
         try {
             const res = await fetch(`/api/admin/items/${id}`, {
                 method: 'PATCH',
@@ -106,22 +188,29 @@ export default function AdminPage() {
                 body: JSON.stringify(updates)
             });
 
-            if (!res.ok) throw new Error('Update failed');
+            if (!res.ok) {
+                if (res.status === 401) {
+                    handleLogout();
+                    throw new Error("Session expired. Please login again.");
+                }
+                throw new Error('Update failed');
+            }
 
             // Update local state
-            setItems(items.map(i => i.id === id ? { ...i, ...updates } : i));
+            setItems(prev => prev.map(i => i.id === id ? { ...i, ...updates } : i));
 
             if (updates.is_deleted) {
-                setItems(items.filter(i => i.id !== id));
+                setItems(prev => prev.filter(i => i.id !== id));
             }
 
         } catch (err: any) {
-            alert('Failed to update item: ' + err);
+            setError('Failed to update item: ' + err.message);
         }
     };
 
     const handleRegenerate = async (id: string) => {
         if (!confirm('Regenerate audio for this item? This will overwrite the current files.')) return;
+        setError(null);
 
         try {
             const res = await fetch(`/api/admin/items/${id}/regenerate`, {
@@ -131,13 +220,75 @@ export default function AdminPage() {
                 }
             });
 
-            if (!res.ok) throw new Error('Regeneration request failed');
+            if (!res.ok) {
+                if (res.status === 401) {
+                    handleLogout();
+                    throw new Error("Session expired. Please login again.");
+                }
+                throw new Error('Regeneration request failed');
+            }
 
             alert('Regeneration started. Please allow a few minutes for processing.');
-        } catch (err) {
-            alert('Failed to start regeneration: ' + err);
+        } catch (err: any) {
+            setError('Failed to start regeneration: ' + err.message);
         }
     };
+
+    // Login Form (when not authenticated)
+    if (!isAuthenticated) {
+        return (
+            <div className="min-h-screen bg-background-light dark:bg-background-dark flex items-center justify-center p-4">
+                <div className="bg-white dark:bg-surface-dark rounded-3xl shadow-xl p-8 w-full max-w-md border border-slate-200 dark:border-white/5">
+                    <div className="text-center mb-8">
+                        <h1 className="text-3xl font-bold text-slate-900 dark:text-white mb-2">Admin Login</h1>
+                        <p className="text-slate-500 dark:text-[#93c8a8]">Enter your credentials to continue</p>
+                    </div>
+
+                    {error && (
+                        <div className="bg-red-500/10 border border-red-500/20 text-red-600 dark:text-red-400 p-4 rounded-xl mb-6">
+                            {error}
+                        </div>
+                    )}
+
+                    <div className="space-y-4">
+                        <div>
+                            <label className="block text-sm font-medium text-slate-700 dark:text-white/70 mb-2">Username</label>
+                            <input
+                                type="text"
+                                className="w-full p-3 bg-slate-50 dark:bg-black/20 rounded-xl outline-none focus:ring-2 focus:ring-primary text-slate-900 dark:text-white"
+                                placeholder="Enter username"
+                                value={username}
+                                onChange={e => setUsername(e.target.value)}
+                                onKeyDown={e => e.key === 'Enter' && handleLogin()}
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-slate-700 dark:text-white/70 mb-2">API Key</label>
+                            <input
+                                type="password"
+                                className="w-full p-3 bg-slate-50 dark:bg-black/20 rounded-xl outline-none focus:ring-2 focus:ring-primary text-slate-900 dark:text-white"
+                                placeholder="Enter API key"
+                                value={password}
+                                onChange={e => setPassword(e.target.value)}
+                                onKeyDown={e => e.key === 'Enter' && handleLogin()}
+                            />
+                        </div>
+                        <button
+                            onClick={handleLogin}
+                            disabled={!username || !password}
+                            className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-3 rounded-xl font-bold transition-colors disabled:opacity-50"
+                        >
+                            Login
+                        </button>
+                    </div>
+
+                    <p className="text-xs text-slate-400 dark:text-white/40 text-center mt-6">
+                        Session expires after 1 hour of inactivity
+                    </p>
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div className="min-h-screen bg-background-light dark:bg-background-dark text-slate-900 dark:text-white font-display p-6 md:p-10">
@@ -149,13 +300,25 @@ export default function AdminPage() {
                     </div>
                     <div className="flex gap-3">
                         <button
-                            onClick={() => { localStorage.removeItem('nexus_key'); window.location.reload(); }}
+                            onClick={handleLogout}
                             className="bg-slate-200 dark:bg-surface-highlight hover:bg-red-100 dark:hover:bg-red-900/30 text-slate-700 dark:text-white hover:text-red-600 dark:hover:text-red-400 px-5 py-2.5 rounded-full font-semibold transition-colors"
                         >
                             Logout
                         </button>
                     </div>
                 </header>
+
+                {error && (
+                    <div className="bg-red-500/10 border border-red-500/20 text-red-600 dark:text-red-400 p-4 rounded-xl mb-6">
+                        {error}
+                        <button
+                            onClick={() => setError(null)}
+                            className="ml-4 text-sm underline hover:no-underline"
+                        >
+                            Dismiss
+                        </button>
+                    </div>
+                )}
 
                 {/* User Management Section */}
                 <div className="mb-12 bg-white dark:bg-surface-dark rounded-3xl p-8 border border-slate-200 dark:border-white/5 shadow-sm">

@@ -12,6 +12,9 @@ pub struct PendingNewsItem {
     pub category: String,
     pub source_name: Option<String>,
     pub timestamp: u64,
+    /// Original RSS article text (preserved for downstream generation)
+    #[serde(default)]
+    pub original_text: String,
 }
 
 /// A cluster of related news items (same topic from different sources)
@@ -72,7 +75,12 @@ pub struct NewsBuffer {
 impl NewsBuffer {
     pub fn new(cache_dir: &str) -> Result<Self> {
         // Use v3 to avoid conflict with old data format
-        let db = sled::open(Path::new(cache_dir).join("news_buffer_v3"))?;
+        // Configure with cache size limit to prevent excessive memory usage (128MB)
+        let db = sled::Config::new()
+            .path(Path::new(cache_dir).join("news_buffer_v3"))
+            .cache_capacity(128 * 1024 * 1024) // 128MB cache limit
+            .flush_every_ms(Some(5000)) // Flush every 5 seconds
+            .open()?;
         Ok(Self { db })
     }
 
@@ -140,12 +148,19 @@ impl NewsBuffer {
     /// Pop all clusters for a category (for generation)
     pub fn pop_category_clusters(&self, category: &str) -> Result<Vec<ClusterData>> {
         let mut clusters = Vec::new();
+        let mut keys_to_remove = Vec::new();
         let prefix = format!("{}#", category.replace("#", "_"));
 
+        // First pass: collect clusters and keys
         for item in self.db.scan_prefix(prefix.as_bytes()) {
             let (key, val) = item?;
             let cluster: ClusterData = serde_json::from_slice(&val)?;
             clusters.push(cluster);
+            keys_to_remove.push(key);
+        }
+
+        // Second pass: remove keys (after iteration is complete)
+        for key in keys_to_remove {
             self.db.remove(key)?;
         }
 
@@ -203,5 +218,58 @@ impl NewsBuffer {
         }
         tree.flush()?;
         Ok(count)
+    }
+
+    /// Prune clusters older than retention period (e.g., 7 days)
+    pub fn prune_old_clusters(&self, retention_secs: u64) -> Result<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+
+        let mut count = 0;
+        for item in self.db.iter() {
+            let (key, val) = item?;
+            // Only process cluster keys (contain '#')
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.contains('#') {
+                continue;
+            }
+
+            if let Ok(cluster) = serde_json::from_slice::<ClusterData>(&val) {
+                if now > cluster.created_at + retention_secs {
+                    self.db.remove(key)?;
+                    count += 1;
+                }
+            }
+        }
+
+        if count > 0 {
+            self.db.flush()?;
+        }
+        Ok(count)
+    }
+
+    /// Get database size estimate in bytes
+    pub fn get_db_size(&self) -> Result<u64> {
+        let mut total_size: u64 = 0;
+        // Estimate size by iterating all entries
+        for item in self.db.iter() {
+            let (key, val) = item?;
+            total_size += key.len() as u64 + val.len() as u64;
+        }
+        // Also count processed_links tree
+        if let Ok(tree) = self.db.open_tree("processed_links") {
+            for item in tree.iter() {
+                let (key, val) = item?;
+                total_size += key.len() as u64 + val.len() as u64;
+            }
+        }
+        Ok(total_size)
+    }
+
+    /// Get count of processed links
+    pub fn get_processed_links_count(&self) -> Result<usize> {
+        let tree = self.db.open_tree("processed_links")?;
+        Ok(tree.iter().count())
     }
 }

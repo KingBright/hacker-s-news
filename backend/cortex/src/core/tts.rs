@@ -5,10 +5,16 @@ use candle_core::{Device, DType};
 use tts::voxcpm::generate::VoxCPMGenerate;
 use tts::utils::audio_utils::get_audio_wav_u8;
 use regex::Regex;
+use qwen3_tts::{Qwen3TTS, AudioBuffer, Language};
+
+// Maximum total characters to prevent excessive memory usage
+// ~5000 chars ≈ 10-15 minutes audio ≈ 50-100MB memory
+const MAX_TOTAL_CHARS: usize = 5000;
 
 pub struct TtsClient {
     config: TtsConfig,
     voxcpm_model: Option<Arc<Mutex<VoxCPMGenerate>>>,
+    qwen3_model: Option<Arc<Mutex<Qwen3TTS>>>,
 }
 
 impl TtsClient {
@@ -19,7 +25,8 @@ impl TtsClient {
         let mut voxcpm_model = None;
 
         // Check if engine is voxcpm (default or explicit)
-        let engine = config.engine.as_deref().unwrap_or("voxcpm");
+        let engine = config.engine.as_deref().unwrap_or("voxcpm").trim();
+        let mut qwen3_model = None;
 
         if engine == "voxcpm" {
             if let Some(vox_config) = &config.voxcpm {
@@ -31,38 +38,73 @@ impl TtsClient {
             } else {
                 log::warn!("VoxCPM engine selected but no config provided");
             }
+        } else if engine == "qwen3" {
+            if let Some(qwen_config) = &config.qwen3 {
+                log::info!("Initializing Qwen3-TTS model from: {}", qwen_config.model_dir);
+                let model_result = if qwen_config.model_dir.contains('/') && !std::path::Path::new(&qwen_config.model_dir).exists() {
+                     log::info!("Downloading Qwen3-TTS weights from Hugging Face Hub (this may take a while)...");
+                     qwen3_tts::ModelPaths::download(Some(&qwen_config.model_dir))
+                        .and_then(|paths| Qwen3TTS::from_paths(&paths, device.clone()))
+                } else {
+                     Qwen3TTS::from_pretrained(&qwen_config.model_dir, device.clone())
+                };
+
+                match model_result {
+                    Ok(model) => qwen3_model = Some(Arc::new(Mutex::new(model))),
+                    Err(e) => log::error!("Failed to load Qwen3-TTS model: {}", e),
+                }
+            } else {
+                log::warn!("Qwen3 engine selected but no config provided");
+            }
         }
 
         Self {
             config,
             voxcpm_model,
+            qwen3_model,
         }
     }
 
     pub async fn speak(&self, text: &str) -> Result<Vec<u8>> {
-        let engine = self.config.engine.as_deref().unwrap_or("voxcpm");
-        
+        let engine = self.config.engine.as_deref().unwrap_or("voxcpm").trim();
+
         if engine == "voxcpm" {
             return self.speak_voxcpm(text, None).await;
+        } else if engine == "qwen3" {
+            return self.speak_qwen3(text, None).await;
         }
 
         // Fallback or other engines
         Err(anyhow::anyhow!("Unsupported TTS engine: {}", engine))
     }
 
-    /// Speak with a specific voice file (for multi-host support)
     pub async fn speak_with_voice(&self, text: &str, voice_path: &str) -> Result<Vec<u8>> {
-        let engine = self.config.engine.as_deref().unwrap_or("voxcpm");
-        
+        let engine = self.config.engine.as_deref().unwrap_or("voxcpm").trim();
+
         if engine == "voxcpm" {
             return self.speak_voxcpm(text, Some(voice_path.to_string())).await;
+        } else if engine == "qwen3" {
+            return self.speak_qwen3(text, Some(voice_path.to_string())).await;
         }
 
         Err(anyhow::anyhow!("Unsupported TTS engine: {}", engine))
     }
 
     async fn speak_voxcpm(&self, raw_text: &str, voice_override: Option<String>) -> Result<Vec<u8>> {
-        // Pre-TTS Normalization
+        // Check text length to prevent excessive memory usage
+        let raw_text = if raw_text.chars().count() > MAX_TOTAL_CHARS {
+            log::warn!(
+                "[TTS] Text too long ({} chars > {} limit), truncating",
+                raw_text.chars().count(),
+                MAX_TOTAL_CHARS
+            );
+            // Truncate and add ellipsis
+            let truncated: String = raw_text.chars().take(MAX_TOTAL_CHARS - 10).collect();
+            format!("{}……（内容过长，已截断）", truncated)
+        } else {
+            raw_text.to_string()
+        };
+
         // Pre-TTS Normalization
         let mut text = raw_text
             .replace("%", "百分之")
@@ -152,7 +194,10 @@ impl TtsClient {
             
             log::info!("Generating audio for chunk {}/{}: {}...", idx+1, chunks.len(), &chunk.chars().take(20).collect::<String>());
             
-            let mut model = model_mutex.lock().map_err(|e| anyhow::anyhow!("Model lock failed: {}", e))?;
+            let mut model = model_mutex.lock().unwrap_or_else(|poisoned| {
+                log::warn!("TTS Mutex was poisoned, recovering inner model...");
+                poisoned.into_inner()
+            });
             
             // Get sample rate dynamically from the model
             let sample_rate = model.sample_rate();
@@ -210,11 +255,168 @@ impl TtsClient {
         // Use the sample rate from the last model interaction (should be consistent)
         // We need to unlock or just get it again. Since we are in a loop above, we can just grab it briefly.
         let sample_rate = {
-             let model = model_mutex.lock().map_err(|e| anyhow::anyhow!("Model lock failed: {}", e))?;
+             let model = model_mutex.lock().unwrap_or_else(|poisoned| {
+                 log::warn!("TTS Mutex was poisoned (sample_rate), recovering...");
+                 poisoned.into_inner()
+             });
              model.sample_rate()
         };
         
         let wav_bytes = get_audio_wav_u8(&combined_tensor, sample_rate as u32)?;
+
+        log::info!(
+            "[TTS] Generated {} chunks, {} samples (≈{:.1}MB memory), {} bytes WAV",
+            chunks.len(),
+            all_samples.len(),
+            (all_samples.len() * std::mem::size_of::<f32>()) as f64 / 1024.0 / 1024.0,
+            wav_bytes.len()
+        );
+        
+        Ok(wav_bytes)
+    }
+
+    async fn speak_qwen3(&self, raw_text: &str, voice_override: Option<String>) -> Result<Vec<u8>> {
+        let raw_text = if raw_text.chars().count() > MAX_TOTAL_CHARS {
+            log::warn!(
+                "[TTS Qwen3] Text too long ({} chars > {} limit), truncating",
+                raw_text.chars().count(),
+                MAX_TOTAL_CHARS
+            );
+            let truncated: String = raw_text.chars().take(MAX_TOTAL_CHARS - 10).collect();
+            format!("{}……（内容过长，已截断）", truncated)
+        } else {
+            raw_text.to_string()
+        };
+
+        // Pre-TTS Normalization
+        let mut text = raw_text
+            .replace("%", "百分之")
+            .replace("℃", "度")
+            .replace("$", "美元")
+            .replace("**", "") // Remove MD bold
+            .replace("##", "") // Remove MD header
+            .replace("  ", " "); // Collapse spaces
+
+        if let Ok(re) = Regex::new(r"（.*?）|\(.*?\)|【.*?】") {
+            text = re.replace_all(&text, "").to_string();
+        }
+
+        text = text.replace("本条播放完毕", "")
+                   .replace("本条新闻播报结束", "")
+                   .replace("谢谢收听", "")
+                   .replace("报道结束", "");
+
+        let qwen_config = self.config.qwen3.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Qwen3 config missing"))?;
+            
+        let model_mutex = self.qwen3_model.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Qwen3 model not loaded"))?;
+
+        let mut chunks = Vec::new();
+        let mut current_chunk = String::new();
+        
+        let terminators = ['。', '！', '？', '\n'];
+        let secondary_terminators = ['，', '；', '：', '、']; 
+        
+        for char in text.chars() {
+            current_chunk.push(char);
+            let len = current_chunk.chars().count();
+            if char == '\n' {
+                if !current_chunk.trim().is_empty() {
+                    chunks.push(current_chunk.clone());
+                    current_chunk.clear();
+                }
+                continue;
+            }
+            if terminators.contains(&char) && len > 20 {
+                chunks.push(current_chunk.clone());
+                current_chunk.clear();
+                continue;
+            }
+            if len > 120 && secondary_terminators.contains(&char) {
+                 chunks.push(current_chunk.clone());
+                 current_chunk.clear();
+                 continue;
+            }
+            if len > 150 {
+                chunks.push(current_chunk.clone());
+                current_chunk.clear();
+            }
+        }
+        
+        if !current_chunk.trim().is_empty() {
+            chunks.push(current_chunk);
+        }
+
+        let mut all_samples: Vec<f32> = Vec::new();
+        let mut sample_rate = 24000;
+
+        for (idx, chunk) in chunks.iter().enumerate() {
+            if chunk.trim().is_empty() { continue; }
+            log::info!("Generating audio (Qwen3) for chunk {}/{}: {}...", idx+1, chunks.len(), &chunk.chars().take(20).collect::<String>());
+            
+            let model = model_mutex.lock().unwrap_or_else(|poisoned| {
+                log::warn!("Qwen3 Mutex was poisoned, recovering inner model...");
+                poisoned.into_inner()
+            });
+
+            let prompt_text = qwen_config.prompt_text.clone();
+            let prompt_wav_path = voice_override.clone().or(qwen_config.prompt_wav_path.clone());
+            let clean_wav_path = prompt_wav_path.map(|p| p.replace("file://", ""));
+            
+            let start = std::time::Instant::now();
+            let audio_buffer = if let Some(wav_path) = clean_wav_path {
+                let ref_audio = AudioBuffer::load(&(wav_path))?;
+                let prompt = model.create_voice_clone_prompt(&ref_audio, prompt_text.as_deref())?;
+                model.synthesize_voice_clone(
+                    chunk,
+                    &prompt,
+                    Language::Chinese,
+                    None
+                )?
+            } else {
+                model.synthesize(chunk, None)?
+            };
+
+            log::info!("Chunk {} generated in {:.2?}", idx+1, start.elapsed());
+            
+            sample_rate = audio_buffer.sample_rate;
+            let new_samples = audio_buffer.samples;
+            
+            if all_samples.is_empty() {
+                all_samples.extend(new_samples);
+            } else {
+                let crossfade_duration = 0.05; // 50ms overlap
+                let crossfade_samples = (sample_rate as f64 * crossfade_duration) as usize;
+                
+                let overlap_len = std::cmp::min(all_samples.len(), crossfade_samples);
+                let overlap_len = std::cmp::min(overlap_len, new_samples.len());
+
+                let start_idx = all_samples.len() - overlap_len;
+                for i in 0..overlap_len {
+                    let fade_out = 1.0 - (i as f32 / overlap_len as f32);
+                    let fade_in = i as f32 / overlap_len as f32;
+                    let old_val = all_samples[start_idx + i];
+                    let new_val = new_samples[i];
+                    all_samples[start_idx + i] = old_val * fade_out + new_val * fade_in;
+                }
+                
+                if new_samples.len() > overlap_len {
+                    all_samples.extend(&new_samples[overlap_len..]);
+                }
+            }
+        }
+
+        let combined_tensor = candle_core::Tensor::from_vec(all_samples.clone(), (1, all_samples.len()), &Device::Cpu)?;
+        let wav_bytes = get_audio_wav_u8(&combined_tensor, sample_rate as u32)?;
+
+        log::info!(
+            "[TTS Qwen3] Generated {} chunks, {} samples (≈{:.1}MB memory), {} bytes WAV",
+            chunks.len(),
+            all_samples.len(),
+            (all_samples.len() * std::mem::size_of::<f32>()) as f64 / 1024.0 / 1024.0,
+            wav_bytes.len()
+        );
         
         Ok(wav_bytes)
     }
@@ -236,6 +438,7 @@ impl TtsClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null()) // Suppress ffmpeg logs
+            .kill_on_drop(true)    // Ensure child process is killed if parent drops
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn ffmpeg: {}", e))?;
 
@@ -249,8 +452,14 @@ impl TtsClient {
             }
         });
 
-        // Read MP3 from stdout
-        let output = child.wait_with_output().await?;
+        // Read MP3 from stdout with timeout protection
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60), // 60 second timeout
+            child.wait_with_output()
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ffmpeg conversion timed out after 60 seconds"))?
+        .map_err(|e| anyhow::anyhow!("ffmpeg wait failed: {}", e))?;
 
         if !output.status.success() {
             return Err(anyhow::anyhow!("ffmpeg failed with status: {}", output.status));

@@ -114,4 +114,16 @@ impl TopicRegistry {
         }
         Ok(count)
     }
+
+    /// Get topic count and estimated memory usage
+    pub fn get_stats(&self) -> Result<(usize, u64)> {
+        let mut count = 0;
+        let mut total_size: u64 = 0;
+        for item in self.db.iter() {
+            let (key, val) = item?;
+            count += 1;
+            total_size += key.len() as u64 + val.len() as u64;
+        }
+        Ok((count, total_size))
+    }
 }

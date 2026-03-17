@@ -96,10 +96,11 @@ pub async fn push_sources(
     }
 
     let now = chrono::Utc::now().timestamp();
-    
+    let mut failed_count = 0;
+
     for source in payload.sources {
         let id = uuid::Uuid::new_v4().to_string();
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT OR IGNORE INTO item_sources (id, item_id, source_url, source_title, source_summary, created_at) VALUES (?, ?, ?, ?, ?, ?)"
         )
         .bind(&id)
@@ -109,7 +110,15 @@ pub async fn push_sources(
         .bind(&source.summary)
         .bind(now)
         .execute(&state.db)
-        .await;
+        .await
+        {
+            tracing::warn!("Failed to insert source for item {}: {}", item_id, e);
+            failed_count += 1;
+        }
+    }
+
+    if failed_count > 0 {
+        tracing::warn!("Completed push_sources for item {} with {} failures", item_id, failed_count);
     }
 
     StatusCode::OK.into_response()

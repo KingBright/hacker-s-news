@@ -6,6 +6,8 @@ use serde_json::json;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use tokio::sync::broadcast;
+use tokio::time::{sleep, Duration};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,6 +25,7 @@ pub struct LlmClient {
     config: LlmConfig,
     audit_log_path: Option<PathBuf>,
     cache: Option<sled::Db>,
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl LlmClient {
@@ -32,30 +35,40 @@ impl LlmClient {
         cache_path: Option<PathBuf>,
     ) -> Self {
         let cache = cache_path.and_then(|path| sled::open(path).ok());
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
 
-        // Spawn Background GC
+        // Spawn Background GC with shutdown signal support
         if let Some(db) = &cache {
             let db_clone = db.clone();
             tokio::spawn(async move {
                 log::info!("LLM Cache GC started.");
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await; // Check every hour
-                    let now = Local::now().timestamp();
-                    let mut count = 0;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
 
-                    for item in db_clone.iter() {
-                        if let Ok((key, value)) = item {
-                            if let Ok(entry) = serde_json::from_slice::<CacheEntry>(&value) {
-                                if now - entry.created_at > CACHE_TTL_SECS {
-                                    let _ = db_clone.remove(key);
-                                    count += 1;
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => {
+                            log::info!("LLM Cache GC received shutdown signal. Exiting.");
+                            break;
+                        }
+                        _ = interval.tick() => {
+                            let now = Local::now().timestamp();
+                            let mut count = 0;
+
+                            for item in db_clone.iter() {
+                                if let Ok((key, value)) = item {
+                                    if let Ok(entry) = serde_json::from_slice::<CacheEntry>(&value) {
+                                        if now - entry.created_at > CACHE_TTL_SECS {
+                                            let _ = db_clone.remove(key);
+                                            count += 1;
+                                        }
+                                    }
                                 }
                             }
+                            if count > 0 {
+                                log::info!("LLM Cache GC: Removed {} expired entries.", count);
+                                let _ = db_clone.flush();
+                            }
                         }
-                    }
-                    if count > 0 {
-                        log::info!("LLM Cache GC: Removed {} expired entries.", count);
-                        let _ = db_clone.flush();
                     }
                 }
             });
@@ -63,25 +76,75 @@ impl LlmClient {
 
         Self {
             client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(180))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             config,
             audit_log_path,
             cache,
+            shutdown_tx,
         }
     }
 
+    /// Signal the GC task to shut down gracefully
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
+    }
+
     fn log_audit(&self, stage: &str, content: &str) {
-        if let Some(path) = &self.audit_log_path {
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+        if let Some(base_path) = &self.audit_log_path {
+            let now = Local::now();
+            let timestamp = now.format("%Y-%m-%d %H:%M:%S");
+            let date_suffix = now.format("%Y-%m-%d");
             let log_entry = format!(
                 "--------------------------------------------------\n[{}] [{}]\n{}\n",
                 timestamp, stage, content
             );
 
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            // Write to date-stamped file (e.g. llm_audit_2026-03-15.log)
+            let rotated_path = if let Some(stem) = base_path.file_stem() {
+                let ext = base_path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "log".to_string());
+                base_path.with_file_name(format!("{}_{}.{}", stem.to_string_lossy(), date_suffix, ext))
+            } else {
+                base_path.clone()
+            };
+
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&rotated_path) {
                 let _ = writeln!(file, "{}", log_entry);
+            }
+
+            // Lazy cleanup: remove audit logs older than 7 days (check occasionally)
+            // Only run cleanup at the start of a new day (when seconds < 60, ~once per minute window)
+            if now.timestamp() % 3600 < 10 {
+                Self::cleanup_old_audit_logs(base_path, 7);
+            }
+        }
+    }
+
+    /// Remove audit log files older than `keep_days` days
+    fn cleanup_old_audit_logs(base_path: &PathBuf, keep_days: i64) {
+        if let Some(parent) = base_path.parent() {
+            if let Some(stem) = base_path.file_stem() {
+                let prefix = stem.to_string_lossy();
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    let cutoff = Local::now() - chrono::Duration::days(keep_days);
+                    let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        // Match files like "llm_audit_2026-03-08.log"
+                        if name.starts_with(&*prefix) && name.contains('_') {
+                            // Extract date part
+                            if let Some(date_part) = name.strip_prefix(&format!("{}_", prefix)) {
+                                let date_str = date_part.trim_end_matches(".log");
+                                if date_str.len() == 10 && date_str < cutoff_str.as_str() {
+                                    let _ = std::fs::remove_file(entry.path());
+                                    log::info!("Audit log rotation: removed old log {}", name);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -139,11 +202,77 @@ impl LlmClient {
         );
         self.log_audit("INPUT", prompt);
 
-        let res = match self.client.post(&url).json(&body).send().await {
-            Ok(response) => response,
-            Err(e) => {
-                log::warn!("Failed to connect to LLM at {}: {}", url, e);
-                return Err(anyhow::anyhow!("LLM Connection Failed: {}", e));
+        // 4-level retry mechanism with different strategies
+        let res = {
+            let mut last_err: Option<String> = None;
+            let mut response = None;
+            let mut use_fallback_endpoint = false;
+
+            for attempt in 0..7 {
+                // 4-level retry strategy:
+                // Level 0-1: Quick retries (3s) for light connection errors
+                // Level 2-3: Delayed retries (30s) for service busy
+                // Level 4-5: Fallback endpoint (120s) for persistent issues
+                // Level 6: Final fallback (300s) if everything fails
+
+                let delay = match attempt {
+                    0 => Duration::from_secs(3),   // Quick retry
+                    1 => Duration::from_secs(3),   // Quick retry
+                    2 => Duration::from_secs(30),  // Delayed retry
+                    3 => Duration::from_secs(30),  // Delayed retry
+                    4 => Duration::from_secs(120), // Fallback endpoint
+                    5 => Duration::from_secs(120), // Fallback endpoint
+                    _ => Duration::from_secs(300), // Final fallback
+                };
+
+                let current_url = if attempt >= 4 && !use_fallback_endpoint {
+                    if let Some(ref fb_url) = self.config.fallback_url {
+                        if !fb_url.is_empty() {
+                            use_fallback_endpoint = true;
+                            let fallback_url = format!(
+                                "{}/chat/completions",
+                                fb_url.trim_end_matches('/')
+                            );
+                            log::warn!("Switching to fallback endpoint: {}", fallback_url);
+                            fallback_url
+                        } else {
+                            url.clone()
+                        }
+                    } else {
+                        url.clone()
+                    }
+                } else {
+                    url.clone()
+                };
+
+                match self.client.post(&current_url).json(&body).send().await {
+                    Ok(r) => {
+                        response = Some(r);
+                        if attempt > 0 {
+                            log::info!("LLM connection succeeded on attempt {}/7", attempt + 1);
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        if attempt < 6 {
+                            log::warn!("LLM connection attempt {}/7 failed: {}. Retrying in {}s...",
+                                attempt + 1, e, delay.as_secs());
+                            sleep(delay).await;
+                        } else {
+                            log::error!("LLM connection failed after all 7 attempts: {}", e);
+                        }
+                    }
+                }
+            }
+
+            match response {
+                Some(r) => r,
+                None => {
+                    let e = last_err.unwrap_or_else(|| "Unknown connection error".to_string());
+                    log::error!("Failed to connect to LLM at {} after all attempts: {}", url, e);
+                    return Err(anyhow::anyhow!("LLM Connection Failed: {}", e));
+                }
             }
         };
 
@@ -197,5 +326,21 @@ impl LlmClient {
         }
 
         Ok(summary)
+    }
+
+    /// Get cache statistics (entry count and estimated size in bytes)
+    pub fn get_cache_stats(&self) -> Result<(usize, u64)> {
+        if let Some(db) = &self.cache {
+            let mut count = 0;
+            let mut total_size: u64 = 0;
+            for item in db.iter() {
+                let (key, val) = item?;
+                count += 1;
+                total_size += key.len() as u64 + val.len() as u64;
+            }
+            Ok((count, total_size))
+        } else {
+            Ok((0, 0))
+        }
     }
 }

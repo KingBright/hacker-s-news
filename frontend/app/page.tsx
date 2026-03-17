@@ -143,10 +143,17 @@ export default function Home() {
     }
 
     fetch('/api/history', { headers })
-      .then(res => res.json())
+      .then(res => {
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        }
+        return res.json();
+      })
       .then((data: { item_id: string }[]) => {
-        const ids = new Set(data.map(i => i.item_id));
-        setPlayedIds(ids);
+        if (Array.isArray(data)) {
+          const ids = new Set(data.map(i => i.item_id));
+          setPlayedIds(ids);
+        }
       })
       .catch(e => console.error("Failed to fetch history", e));
 
@@ -217,6 +224,8 @@ export default function Home() {
   // Auto-play control: false on init, true after user interaction/queue progress
   const shouldAutoPlay = useRef(false);
   const isFirstLoad = useRef(true);
+  // Request ID for race condition prevention in fetch operations
+  const fetchRequestId = useRef(0);
 
   // Weather State
   const [weather, setWeather] = useState<{ temp: number, code: number } | null>(null);
@@ -286,15 +295,37 @@ export default function Home() {
     .sort((a, b) => (b.publish_time || 0) - (a.publish_time || 0)); // New -> Old (History)
 
   // Fetch Items (Raw Data)
+  // Use request ID to prevent race conditions
+
   const fetchItems = useCallback(async (pageNum: number, isRefresh = false) => {
+    const currentRequestId = ++fetchRequestId.current;
     setIsLoading(true);
+
     try {
       const headers: HeadersInit = {};
       if (user) {
         headers['x-user-id'] = user.id;
       }
-      const res = await fetch(`/api/items?page=${pageNum}&limit=50`, { headers }); // Fetch more to ensure we have a good buffer
+      const res = await fetch(`/api/items?page=${pageNum}&limit=50`, { headers });
+
+      // Check if response is OK before parsing JSON
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+
       const data = await res.json();
+
+      // Race condition check: only update state if this is still the latest request
+      if (currentRequestId !== fetchRequestId.current) {
+        console.log('[FetchItems] Stale response detected, ignoring');
+        return;
+      }
+
+      // Validate data is an array
+      if (!Array.isArray(data)) {
+        console.error('[FetchItems] Invalid response format:', data);
+        return;
+      }
 
       setItems(prev => {
         if (isRefresh) {
@@ -311,9 +342,15 @@ export default function Home() {
 
       setHasMore(data.length === 50);
     } catch (err) {
-      console.error('Failed to fetch items:', err);
+      // Only log error if this is still the current request
+      if (currentRequestId === fetchRequestId.current) {
+        console.error('Failed to fetch items:', err);
+      }
     } finally {
-      setIsLoading(false);
+      // Only update loading state if this is still the current request
+      if (currentRequestId === fetchRequestId.current) {
+        setIsLoading(false);
+      }
     }
   }, [user]);
 
@@ -357,7 +394,19 @@ export default function Home() {
     try {
       // Try fetching page 1 again to see if new stuff arrived
       const res = await fetch(`/api/items?page=1&limit=20`);
+
+      if (!res.ok) {
+        console.error("[AutoPlay] Failed to check for more:", res.status);
+        return false;
+      }
+
       const data = await res.json();
+
+      // Validate response format
+      if (!Array.isArray(data)) {
+        console.error("[AutoPlay] Invalid response format");
+        return false;
+      }
 
       let hasNewParams = false;
       setItems(prev => {
@@ -369,6 +418,7 @@ export default function Home() {
 
       return hasNewParams;
     } catch (e) {
+      console.error("[AutoPlay] Error checking for more:", e);
       return false;
     } finally {
       setIsLoading(false);

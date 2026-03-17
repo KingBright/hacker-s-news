@@ -1,10 +1,18 @@
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cortex::core::config::load_config;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Get the application data directory (cross-platform)
+fn get_app_data_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".freshloop")
+}
+
+/// Run the main service logic (shared between standalone and service modes)
+async fn run_service() -> Result<()> {
     // Custom Logger to split stdout/stderr
     struct SplitLogger;
 
@@ -41,7 +49,6 @@ async fn main() -> Result<()> {
     log::set_max_level(log::LevelFilter::Info);
 
     // Load Config
-    // In a real app, path might be an argument
     let config_path = "config.toml";
 
     // Create a dummy config if not exists for first run ease
@@ -64,18 +71,16 @@ url = "https://news.ycombinator.com/rss"
 interval_min = 60
 tags = ["Tech", "Global"]
 "#;
-        std::fs::write(&config_path, dummy_config)?;
+        std::fs::write(config_path, dummy_config)?;
     }
 
-    let config = load_config(&config_path)?;
+    let config = load_config(config_path)?;
 
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let app_data_dir = get_app_data_dir();
 
     // LLM Audit Log & Cache Path
-    let llm_log_path =
-        std::path::PathBuf::from(format!("{}/.freshloop/logs/llm_audit.log", home_dir));
-    let llm_cache_path =
-        std::path::PathBuf::from(format!("{}/.freshloop/cache/llm_cache", home_dir));
+    let llm_log_path = app_data_dir.join("logs").join("llm_audit.log");
+    let llm_cache_path = app_data_dir.join("cache").join("llm_cache");
 
     // Ensure log dir exists
     if let Some(parent) = llm_log_path.parent() {
@@ -95,10 +100,10 @@ tags = ["Tech", "Global"]
     let nexus = Arc::new(cortex::core::nexus::NexusClient::new(config.nexus.clone()));
 
     // Initialize Retry Manager
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let cache_dir = format!("{}/.freshloop/cache", home_dir);
+    let cache_dir = app_data_dir.join("cache");
+    let cache_dir_str = cache_dir.to_string_lossy().to_string();
     let retry_manager = Arc::new(
-        cortex::core::retry::RetryManager::new(&cache_dir, nexus.clone())
+        cortex::core::retry::RetryManager::new(&cache_dir_str, nexus.clone())
             .expect("Failed to init RetryManager"),
     );
 
@@ -114,10 +119,42 @@ tags = ["Tech", "Global"]
         }
     });
 
+    // Spawn Retry Prune Background Loop (weekly)
+    let retry_mgr_prune = retry_manager.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(7 * 24 * 3600)); // Weekly
+        interval.tick().await; // Skip first tick
+        loop {
+            interval.tick().await;
+            match retry_mgr_prune.prune_old_entries(7 * 24 * 3600) {
+                // 7 days TTL
+                Ok(n) => {
+                    if n > 0 {
+                        log::info!("Retry Prune: Removed {} old entries", n);
+                    }
+                }
+                Err(e) => log::warn!("Retry Prune failed: {}", e),
+            }
+        }
+    });
+
     log::info!("Starting Cortex service...");
 
     // Run the main news loop
-    cortex::core::news::run_news_loop(config, llm, tts, nexus, retry_manager, cache_dir).await;
+    cortex::core::news::run_news_loop(
+        config,
+        llm,
+        tts,
+        nexus,
+        retry_manager,
+        cache_dir_str,
+    )
+    .await;
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    run_service().await
 }

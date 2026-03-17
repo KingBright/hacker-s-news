@@ -3,10 +3,23 @@ use reqwest::Client;
 use serde::{Serialize, Deserialize};
 use crate::core::config::NexusConfig;
 use reqwest::multipart;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Connection health status
+#[derive(Debug, Clone)]
+pub struct ConnectionHealth {
+    pub is_healthy: bool,
+    pub latency_ms: u64,
+    pub last_check: std::time::SystemTime,
+    pub error_count: u32,
+    pub last_error: Option<String>,
+}
 
 pub struct NexusClient {
-    client: Client,
+    client: Arc<RwLock<Client>>, // Use RwLock to allow client recreation for DNS refresh
     config: NexusConfig,
+    health: Arc<RwLock<ConnectionHealth>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -25,31 +38,162 @@ pub struct ItemPayload {
 
 impl NexusClient {
     pub fn new(config: NexusConfig) -> Self {
+        let client = Self::build_client();
+        let health = ConnectionHealth {
+            is_healthy: true,
+            latency_ms: 0,
+            last_check: std::time::SystemTime::now(),
+            error_count: 0,
+            last_error: None,
+        };
+
         Self {
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(300)) // 5 minutes for large uploads
-                .connect_timeout(std::time::Duration::from_secs(10)) // Fast fail on connection to allow retry
-                .pool_idle_timeout(Some(std::time::Duration::from_secs(30))) // Close idle connections quickly
-                .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: Arc::new(RwLock::new(client)),
             config,
+            health: Arc::new(RwLock::new(health)),
         }
     }
 
-    pub async fn upload_file(&self, data: Vec<u8>, filename: &str, mime: &str) -> Result<String> {
-        let part = multipart::Part::bytes(data)
-            .file_name(filename.to_string())
-            .mime_str(mime)?;
+    fn build_client() -> Client {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(300)) // 5 minutes for large uploads
+            .connect_timeout(std::time::Duration::from_secs(10)) // Fast fail on connection to allow retry
+            .pool_idle_timeout(Some(std::time::Duration::from_secs(30))) // Close idle connections quickly
+            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    }
 
-        let form = multipart::Form::new().part("file", part);
+    /// Refresh the HTTP client to bypass DNS cache
+    pub async fn refresh_client(&self) {
+        log::info!("[NexusClient] Refreshing HTTP client to bypass DNS cache");
+        let new_client = Self::build_client();
+        *self.client.write().await = new_client;
+    }
 
-        let url = format!("{}/api/internal/upload", self.config.api_url);
-        let res = self.client.post(&url)
-            .header("X-NEXUS-KEY", &self.config.auth_key)
-            .multipart(form)
+    /// Health check with latency measurement
+    pub async fn health_check(&self) -> Result<ConnectionHealth> {
+        let start = std::time::Instant::now();
+        let url = format!("{}/api/health", self.config.api_url);
+
+        // Try to get a fresh client for health check (bypass DNS cache)
+        let client = self.client.read().await.clone();
+
+        match client.get(&url)
+            .timeout(std::time::Duration::from_secs(5))
             .send()
-            .await?;
+            .await
+        {
+            Ok(res) => {
+                let latency_ms = start.elapsed().as_millis() as u64;
+                let is_healthy = res.status().is_success();
+
+                let health = ConnectionHealth {
+                    is_healthy,
+                    latency_ms,
+                    last_check: std::time::SystemTime::now(),
+                    error_count: if is_healthy { 0 } else { 1 },
+                    last_error: if is_healthy { None } else { Some(format!("HTTP {}", res.status())) },
+                };
+
+                *self.health.write().await = health.clone();
+                Ok(health)
+            }
+            Err(e) => {
+                let health = ConnectionHealth {
+                    is_healthy: false,
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    last_check: std::time::SystemTime::now(),
+                    error_count: 1,
+                    last_error: Some(e.to_string()),
+                };
+
+                *self.health.write().await = health.clone();
+                Err(anyhow!("Health check failed: {}", e))
+            }
+        }
+    }
+
+    /// Get current health status
+    pub async fn get_health(&self) -> ConnectionHealth {
+        self.health.read().await.clone()
+    }
+
+    /// Execute request with retry and exponential backoff
+    async fn request_with_retry<F, Fut>(&self, operation: F) -> Result<reqwest::Response>
+    where
+        F: Fn(Client) -> Fut,
+        Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    {
+        let max_retries = 3;
+        let mut last_error = None;
+
+        for attempt in 0..max_retries {
+            // Get fresh client (this may use DNS cache, but we retry with fresh client each time)
+            let client = self.client.read().await.clone();
+
+            match operation(client).await {
+                Ok(res) => {
+                    if res.status().is_server_error() && attempt < max_retries - 1 {
+                        log::warn!("[NexusClient] Server error on attempt {}, retrying...", attempt + 1);
+                        last_error = Some(format!("HTTP {}", res.status()));
+                    } else {
+                        return Ok(res);
+                    }
+                }
+                Err(e) => {
+                    let is_connect = e.is_connect();
+                    last_error = Some(e.to_string());
+                    log::warn!("[NexusClient] Request failed on attempt {}: {}", attempt + 1, e);
+
+                    if attempt < max_retries - 1 {
+                        // Exponential backoff: 1s, 2s, 4s
+                        let delay = std::time::Duration::from_secs(2_u64.pow(attempt as u32));
+                        log::info!("[NexusClient] Retrying in {:?}...", delay);
+                        tokio::time::sleep(delay).await;
+
+                        // On connection error, refresh client to bypass DNS cache
+                        if is_connect {
+                            self.refresh_client().await;
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(anyhow!("Request failed after {} attempts: {:?}", max_retries, last_error))
+    }
+
+    pub async fn upload_file(&self, data: Vec<u8>, filename: &str, mime: &str) -> Result<String> {
+        let url = format!("{}/api/internal/upload", self.config.api_url);
+        let auth_key = self.config.auth_key.clone();
+        let filename = filename.to_string();
+        let mime = mime.to_string();
+
+        // Validate mime string before entering retry loop to fail fast
+        let _ = multipart::Part::bytes(vec![0u8])
+            .mime_str(&mime)
+            .map_err(|e| anyhow!("Invalid MIME type '{}': {}", mime, e))?;
+
+        let res = self.request_with_retry(move |client| {
+            let url = url.clone();
+            let auth_key = auth_key.clone();
+            let filename = filename.clone();
+            let mime = mime.clone();
+            let data = data.clone();
+            async move {
+                let part = multipart::Part::bytes(data)
+                    .file_name(filename)
+                    .mime_str(&mime)
+                    .expect("MIME already validated");
+                let form = multipart::Form::new().part("file", part);
+                client.post(&url)
+                    .header("X-NEXUS-KEY", &auth_key)
+                    .multipart(form)
+                    .send()
+                    .await
+            }
+        }).await?;
 
         if !res.status().is_success() {
              let status = res.status();
@@ -68,17 +212,26 @@ impl NexusClient {
 
     pub async fn push_item(&self, item: ItemPayload) -> Result<String> {
         let url = format!("{}/api/internal/items", self.config.api_url);
-        let res = self.client.post(&url)
-            .header("X-NEXUS-KEY", &self.config.auth_key)
-            .json(&item)
-            .send()
-            .await?;
+        let auth_key = self.config.auth_key.clone();
+        let item_json = serde_json::to_value(&item)?;
+
+        let res = self.request_with_retry(|client| {
+            let url = url.clone();
+            let auth_key = auth_key.clone();
+            let item_json = item_json.clone();
+            async move {
+                client.post(&url)
+                    .header("X-NEXUS-KEY", &auth_key)
+                    .json(&item_json)
+                    .send()
+                    .await
+            }
+        }).await?;
 
         if !res.status().is_success() {
              return Err(anyhow!("Failed to push item: {}", res.status()));
         }
 
-        // Parse response to get item ID
         let json: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
         let item_id = json["id"].as_str().unwrap_or("unknown").to_string();
         Ok(item_id)
@@ -86,30 +239,40 @@ impl NexusClient {
 
     pub async fn push_item_multipart(&self, item: ItemPayload, audio_data: Option<Vec<u8>>) -> Result<String> {
         let url = format!("{}/api/internal/items/multipart", self.config.api_url);
-        
-        let mut form = multipart::Form::new()
-            .text("payload", serde_json::to_string(&item)?);
+        let auth_key = self.config.auth_key.clone();
+        let item_json = serde_json::to_string(&item)?;
 
-        if let Some(audio) = audio_data {
-            let part = multipart::Part::bytes(audio)
-                .file_name("audio.mp3")
-                .mime_str("audio/mpeg")?;
-            form = form.part("file", part);
-        }
+        let res = self.request_with_retry(move |client| {
+            let url = url.clone();
+            let auth_key = auth_key.clone();
+            let item_json = item_json.clone();
+            let audio_data = audio_data.clone();
+            async move {
+                let mut form = multipart::Form::new()
+                    .text("payload", item_json);
 
-        let res = self.client.post(&url)
-            .header("X-NEXUS-KEY", &self.config.auth_key)
-            .multipart(form)
-            .send()
-            .await?;
+                if let Some(audio) = audio_data {
+                    let part = multipart::Part::bytes(audio)
+                        .file_name("audio.mp3")
+                        .mime_str("audio/mpeg")
+                        .expect("audio/mpeg is a valid MIME type");
+                    form = form.part("file", part);
+                }
+
+                client.post(&url)
+                    .header("X-NEXUS-KEY", &auth_key)
+                    .multipart(form)
+                    .send()
+                    .await
+            }
+        }).await?;
 
         if !res.status().is_success() {
              let status = res.status();
              let text = res.text().await.unwrap_or_default();
              return Err(anyhow!("Failed to push multipart item: {} - {}", status, text));
         }
-        
-        // Parse response to get item ID
+
         let json: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
         let item_id = json["id"].as_str().unwrap_or("unknown").to_string();
         Ok(item_id)
@@ -117,29 +280,49 @@ impl NexusClient {
 
     pub async fn check_urls(&self, urls: Vec<String>) -> Result<Vec<String>> {
         let url = format!("{}/api/internal/dedup/check", self.config.api_url);
-        let res = self.client.post(&url)
-            .header("X-NEXUS-KEY", &self.config.auth_key)
-            .json(&serde_json::json!({ "urls": urls }))
-            .send()
-            .await?;
-        
+        let payload = serde_json::json!({ "urls": urls });
+        let auth_key = self.config.auth_key.clone();
+
+        let res = self.request_with_retry(|client| {
+            let url = url.clone();
+            let auth_key = auth_key.clone();
+            let payload = payload.clone();
+            async move {
+                client.post(&url)
+                    .header("X-NEXUS-KEY", &auth_key)
+                    .json(&payload)
+                    .send()
+                    .await
+            }
+        }).await?;
+
         if !res.status().is_success() {
             return Err(anyhow!("Failed to check urls: {}", res.status()));
         }
-        
+
         let json: serde_json::Value = res.json().await?;
         let existing = serde_json::from_value(json["existing_urls"].clone())?;
         Ok(existing)
     }
 
-    pub async fn mark_url(&self, url: &str, category: &str) -> Result<()> {
-        let endpoint = format!("{}/api/internal/dedup/mark", self.config.api_url);
-        let res = self.client.post(&endpoint)
-            .header("X-NEXUS-KEY", &self.config.auth_key)
-            .json(&serde_json::json!({ "url": url, "category": category }))
-            .send()
-            .await?;
-            
+    pub async fn mark_url(&self, url_str: &str, category: &str) -> Result<()> {
+        let url = format!("{}/api/internal/dedup/mark", self.config.api_url);
+        let payload = serde_json::json!({ "url": url_str, "category": category });
+        let auth_key = self.config.auth_key.clone();
+
+        let res = self.request_with_retry(|client| {
+            let url = url.clone();
+            let auth_key = auth_key.clone();
+            let payload = payload.clone();
+            async move {
+                client.post(&url)
+                    .header("X-NEXUS-KEY", &auth_key)
+                    .json(&payload)
+                    .send()
+                    .await
+            }
+        }).await?;
+
         if !res.status().is_success() {
             return Err(anyhow!("Failed to mark url: {}", res.status()));
         }
@@ -148,11 +331,19 @@ impl NexusClient {
 
     pub async fn fetch_pending_jobs(&self) -> Result<Vec<ItemPayload>> {
         let url = format!("{}/api/internal/items/pending", self.config.api_url);
-        let res = self.client.get(&url)
-            .header("X-NEXUS-KEY", &self.config.auth_key)
-            .send()
-            .await?;
-            
+        let auth_key = self.config.auth_key.clone();
+
+        let res = self.request_with_retry(|client| {
+            let url = url.clone();
+            let auth_key = auth_key.clone();
+            async move {
+                client.get(&url)
+                    .header("X-NEXUS-KEY", &auth_key)
+                    .send()
+                    .await
+            }
+        }).await?;
+
         if !res.status().is_success() {
              return Err(anyhow!("Failed to fetch pending jobs: {}", res.status()));
         }
@@ -178,13 +369,16 @@ impl NexusClient {
 
     pub async fn fetch_recent_items(&self, limit: u32) -> Result<Vec<ItemPayload>> {
         let url = format!("{}/api/items?limit={}", self.config.api_url, limit);
-        let res = self.client.get(&url)
-            // No auth needed for public items, but sending key doesn't hurt if we want internal view?
-            // Actually list_items is usually public. 
-            // Check routes setup? Assuming public.
-            .send()
-            .await?;
-            
+
+        let res = self.request_with_retry(|client| {
+            let url = url.clone();
+            async move {
+                client.get(&url)
+                    .send()
+                    .await
+            }
+        }).await?;
+
         if !res.status().is_success() {
              return Err(anyhow!("Failed to fetch recent items: {}", res.status()));
         }
@@ -207,21 +401,29 @@ impl NexusClient {
         Ok(payloads)
     }
 
-    pub async fn complete_job(&self, id: &str, audio_url: &str, summary: &str, duration_sec: Option<i64>) -> Result<()> {
+    pub async fn complete_job(&self, id: &str, audio_url_str: &str, summary: &str, duration_sec: Option<i64>) -> Result<()> {
         let url = format!("{}/api/internal/items/{}/complete", self.config.api_url, id);
         let payload = serde_json::json!({
-            "audio_url": audio_url,
+            "audio_url": audio_url_str,
             "summary": summary,
             "duration_sec": duration_sec,
             "publish_time": chrono::Utc::now().timestamp()
         });
+        let auth_key = self.config.auth_key.clone();
 
-        let res = self.client.post(&url)
-            .header("X-NEXUS-KEY", &self.config.auth_key)
-            .json(&payload)
-            .send()
-            .await?;
-            
+        let res = self.request_with_retry(|client| {
+            let url = url.clone();
+            let auth_key = auth_key.clone();
+            let payload = payload.clone();
+            async move {
+                client.post(&url)
+                    .header("X-NEXUS-KEY", &auth_key)
+                    .json(&payload)
+                    .send()
+                    .await
+            }
+        }).await?;
+
         if !res.status().is_success() {
             return Err(anyhow!("Failed to complete job: {}", res.status()));
         }
@@ -234,13 +436,21 @@ impl NexusClient {
         let payload = serde_json::json!({
             "sources": sources
         });
+        let auth_key = self.config.auth_key.clone();
 
-        let res = self.client.post(&url)
-            .header("X-NEXUS-KEY", &self.config.auth_key)
-            .json(&payload)
-            .send()
-            .await?;
-            
+        let res = self.request_with_retry(|client| {
+            let url = url.clone();
+            let auth_key = auth_key.clone();
+            let payload = payload.clone();
+            async move {
+                client.post(&url)
+                    .header("X-NEXUS-KEY", &auth_key)
+                    .json(&payload)
+                    .send()
+                    .await
+            }
+        }).await?;
+
         if !res.status().is_success() {
             log::warn!("Failed to push sources: {}", res.status());
         }

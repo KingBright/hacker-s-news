@@ -38,7 +38,7 @@ async fn main() {
     let audio_dir = std::env::var("AUDIO_DIR").unwrap_or_else(|_| "audio".to_string());
     fs::create_dir_all(&audio_dir).await.expect("Failed to create audio dir");
 
-    let api_key = std::env::var("NEXUS_KEY").unwrap_or_else(|_| "my-secret-key-123".to_string());
+    let api_key = std::env::var("NEXUS_KEY").expect("NEXUS_KEY environment variable must be set for security. Please configure it before starting the server.");
 
     let state = AppState {
         db: db_pool,
