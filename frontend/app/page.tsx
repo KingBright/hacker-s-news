@@ -616,7 +616,23 @@ export default function Home() {
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onEnded={() => {
-          console.log("[Audio] onEnded fired");
+          if (audioRef.current) {
+            const timeLeft = Math.abs(audioRef.current.duration - audioRef.current.currentTime);
+            console.log(`[Audio] onEnded fired. Duration: ${audioRef.current.duration}, Current: ${audioRef.current.currentTime}, Delta: ${timeLeft}`);
+
+            // Safety check: Only trigger completion if we are actually effectively at the end (e.g. within 2s)
+            // Sometimes browsers fire 'ended' on network errors or seeking edge cases.
+            if (timeLeft > 2.0 && !isNaN(timeLeft)) {
+              console.warn("[Audio] Premature onEnded detected (Delta > 2s). Ignoring completion mark.");
+              return;
+            }
+            // Strict double-check: if duration is NaN or 0, ignore
+            if (!audioRef.current.duration || isNaN(audioRef.current.duration)) {
+              console.warn("[Audio] onEnded with invalid duration. Ignoring.");
+              return;
+            }
+          }
+          console.log("[Audio] Dispatching playNext (Valid Completion)");
           playNext();
         }}
         onPlay={() => setIsPlaying(true)}
