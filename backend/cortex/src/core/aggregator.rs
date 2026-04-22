@@ -150,6 +150,8 @@ impl NewsAggregator {
             }
         }
         
+        let mut last_error: Option<anyhow::Error> = None;
+
         for cat in categories_to_flush {
             let clusters = {
                 let buf = self.buffer.lock().await;
@@ -184,12 +186,17 @@ impl NewsAggregator {
                     log::info!("Processing [{}]: Postponed or Skipped. Data retained.", cat);
                 },
                 Err(e) => {
-                    // Failed: Critical Error (e.g. LLM Crash)
-                    // Configurable Strict Mode: Abort entire cycle to prevent cascading failures
-                    log::error!("CRITICAL: Failed to process category [{}]: {}. Aborting flush cycle to trigger retry later.", cat, e);
-                    return Err(e);
+                    // Failed: Log and continue to next category instead of aborting.
+                    // This ensures one category's TTS failure doesn't block others.
+                    log::error!("Failed to process category [{}]: {}. Data retained, will retry later.", cat, e);
+                    last_error = Some(e);
                 }
             }
+        }
+
+        // If any category failed, return the last error for visibility
+        if let Some(e) = last_error {
+            return Err(e);
         }
         Ok(())
     }
@@ -215,23 +222,57 @@ impl NewsAggregator {
              
              
              // UNIFIED LOGIC: Use produce_episode
-             let (final_script, _generated_title, audio_bytes, duration, _) = self.produce_episode(
+             let (final_script, _generated_title, audio_bytes, duration, skipped) = self.produce_episode(
                  category,
                  context,
                  None, // No items for regeneration
                  true // is_regeneration
              ).await?;
-             
-             // Upload Audio if present (Manual upload for Regen flow)
-             let mut audio_url = String::new();
-             if let Some(bytes) = audio_bytes {
-                 let file_name = format!("regen_{}.mp3", uuid::Uuid::new_v4());
-                 audio_url = self.nexus.upload_audio(bytes, &file_name).await.unwrap_or_default();
+
+             if skipped {
+                 log::warn!(
+                     "Regeneration skipped for [Item {}], keeping pending for next cycle.",
+                     job.id.as_deref().unwrap_or("?")
+                 );
+                 continue;
              }
+             
+             // Upload Audio if present (Manual upload for Regen flow).
+             // If upload fails, do NOT complete the job to avoid publishing broken items.
+             let audio_url = if let Some(bytes) = audio_bytes {
+                 let file_name = format!("regen_{}.mp3", uuid::Uuid::new_v4());
+                 match self.nexus.upload_audio(bytes, &file_name).await {
+                     Ok(url) => url,
+                     Err(e) => {
+                         log::error!(
+                             "Regeneration upload failed for [Item {}]: {}. Keeping job pending.",
+                             job.id.as_deref().unwrap_or("?"),
+                             e
+                         );
+                         continue;
+                     }
+                 }
+             } else {
+                 log::error!(
+                     "Regeneration produced no audio for [Item {}]. Keeping job pending.",
+                     job.id.as_deref().unwrap_or("?")
+                 );
+                 continue;
+             };
 
              // Complete Job
              if let Some(id) = &job.id {
-                 self.nexus.complete_job(id, &audio_url, &final_script, Some(duration)).await?;
+                 if let Err(e) = self
+                     .nexus
+                     .complete_job(id, &audio_url, &final_script, Some(duration))
+                     .await
+                 {
+                     log::error!(
+                         "Failed to complete regeneration job [Item {}]: {}. Keeping job pending.",
+                         id,
+                         e
+                     );
+                 }
              }
         }
         Ok(())
@@ -377,51 +418,48 @@ impl NewsAggregator {
         let existing_summary = cluster.merged_summary.as_ref().unwrap_or(&cluster.main_item.description);
         
         let mut prompt = format!(
-            "Role: Senior Intelligence Analyst (资深情报分析师)。\n\n任务：将以下多来源信息综合成一份权威的简报模块。\n\n【策略 - 请根据内容类型自适应】：\n- **硬新闻/财经**：准确性第一。保留所有具体数字、日期、人名、公司名。遵循 5W1H 原则。\n- **软新闻/观点**：捕捉核心论点、情感弧线或独特氛围。提炼“金句”。\n- **低质量/碎片化**：如果来源行文混乱，请将其重构为逻辑通顺、符合新闻标准的文稿。修复所有语法错误。\n\n已有内容:\n标题: {}\n摘要: {}\n\n新内容:\n标题: {}\n摘要: {}\n\n要求：\n1. 极高信息密度：拒绝废话。\n2. 输出JSON格式: {{\"title\": \"综合标题\", \"summary\": \"综合摘要\"}}",
+            "Role: Senior Intelligence Analyst (资深情报分析师)。\n\n任务：将以下多来源信息综合成一份权威的简报模块。\n\n【策略 - 请根据内容类型自适应】：\n- **硬新闻/财经**：准确性第一。保留所有具体数字、日期、人名、公司名。遵循 5W1H 原则。\n- **软新闻/观点**：捕捉核心论点、情感弧线或独特氛围。提炼\"金句\"。\n- **低质量/碎片化**：如果来源行文混乱，请将其重构为逻辑通顺、符合新闻标准的文稿。修复所有语法错误。\n\n已有内容:\n标题: {}\n摘要: {}\n\n新内容:\n标题: {}\n摘要: {}\n\n要求：\n1. 极高信息密度：拒绝废话。\n2. 输出综合标题和摘要。",
             cluster.main_item.title, existing_summary,
             new_item.title, new_item.description
         );
+        
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct MergeResult {
+            title: String,
+            summary: String,
+        }
         
         let mut attempts = 0;
         const MAX_RETRIES: usize = 3;
 
         loop {
             attempts += 1;
-            let response = self.llm.chat(&prompt, false).await?;
-            
-            // Parse JSON
-            let json_clean = response.trim().trim_matches('`').trim();
-            if let Some(start) = json_clean.find('{') {
-                if let Some(end) = json_clean.rfind('}') {
-                    if start <= end {
-                        let json_str = &json_clean[start..=end];
-                        if let Ok(result) = serde_json::from_str::<serde_json::Value>(json_str) {
-                            let title = result["title"].as_str().unwrap_or(&cluster.main_item.title).to_string();
-                        let summary = result["summary"].as_str().unwrap_or(existing_summary).to_string();
-                        
-                        // Editor Review Loop for Summary
-                        // Skip review if it's the first attempt and looks plausible? 
-                        // No, user wants strict checking.
-                        let (passed, critique) = self.review_summary(&title, &summary).await?;
-                        if passed {
-                            return Ok(Some((title, summary)));
-                        }
-                        
-                        if attempts >= MAX_RETRIES {
-                            log::warn!("Editor rejected summary 3 times. Accepted last draft. Critique: {}", critique);
-                            return Ok(Some((title, summary)));
-                        }
+            match self.llm.chat_json::<MergeResult>(&prompt, "merge_result", false).await {
+                Ok(result) => {
+                    let title = if result.title.is_empty() { cluster.main_item.title.clone() } else { result.title };
+                    let summary = if result.summary.is_empty() { existing_summary.to_string() } else { result.summary };
+                    
+                    // Editor Review Loop for Summary
+                    let (passed, critique) = self.review_summary(&title, &summary).await?;
+                    if passed {
+                        return Ok(Some((title, summary)));
+                    }
+                    
+                    if attempts >= MAX_RETRIES {
+                        log::warn!("Editor rejected summary 3 times. Accepted last draft. Critique: {}", critique);
+                        return Ok(Some((title, summary)));
+                    }
 
-                        log::info!("Editor rejected summary (Attempt {}): {}. Regenerating...", attempts, critique);
-                        prompt.push_str(&format!("\n\n【主编反馈】\n你的上一版摘要被打回了，原因：{}\n请保留更多细节，重新合并。", critique));
-                        continue;
+                    log::info!("Editor rejected summary (Attempt {}): {}. Regenerating...", attempts, critique);
+                    prompt.push_str(&format!("\n\n【主编反馈】\n你的上一版摘要被打回了，原因：{}\n请保留更多细节，重新合并。", critique));
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("LLM merge failed (attempt {}): {}", attempts, e);
+                    if attempts >= MAX_RETRIES {
+                        break;
                     }
                 }
-            }
-        }
-            
-            if attempts >= MAX_RETRIES {
-                break;
             }
         }
         
@@ -431,31 +469,18 @@ impl NewsAggregator {
     /// Helper: Review merged summary quality
     async fn review_summary(&self, title: &str, summary: &str) -> Result<(bool, String)> {
         let prompt = format!(
-            "Role: Executive Editor (执行主编)。\n\n任务：严格质检这条新闻摘要。\n\n【标题】{}\n【摘要】{}\n\n审核标准：\n1. **Hook (吸引力)**：第一句话是否足够吸引人？\n2. **Clarity (清晰度)**：没有任何语病、错别字或歧义。\n3. **Detail (细节)**：保留了关键数据和实体名称，没有被过度概括。\n4. **Correction (校对)**：必须充当校对员，如果发现任何错别字或语句不通，视为不合格！\n\n输出格式（JSON）：\n{{ \"pass\": true, \"critique\": \"完美\" }}\n或\n{{ \"pass\": false, \"critique\": \"第一句逻辑不通，错别字'其'应为'起'，且缺少具体金额...\" }}",
+            "Role: Executive Editor (执行主编)。\n\n任务：严格质检这条新闻摘要。\n\n【标题】{}\n【摘要】{}\n\n审核标准：\n1. **Hook (吸引力)**：第一句话是否足够吸引人？\n2. **Clarity (清晰度)**：没有任何语病、错别字或歧义。\n3. **Detail (细节)**：保留了关键数据和实体名称，没有被过度概括。\n4. **Correction (校对)**：必须充当校对员，如果发现任何错别字或语句不通，视为不合格！\n\n输出审核结果。",
             title, summary
         );
 
-        let response = self.llm.chat(&prompt, false).await?;
-         // Simple JSON parse
-        let json_str = response.trim().trim_matches('`').trim();
-        let start = json_str.find('{').unwrap_or(0);
-        let end = json_str.rfind('}').unwrap_or(json_str.len().saturating_sub(1));
-        
-        // Ensure range is valid
-        let json_valid = if start <= end && end < json_str.len() {
-             &json_str[start..=end]
-        } else {
-             "{}"
-        };
-        
-        #[derive(serde::Deserialize)]
-        struct Review {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct ReviewResult {
             pass: bool,
             critique: String,
         }
 
-        let review: Review = serde_json::from_str(json_valid)
-            .unwrap_or(Review { pass: true, critique: "JSON Parse Error".to_string() });
+        let review = self.llm.chat_json::<ReviewResult>(&prompt, "review_result", false).await
+            .unwrap_or(ReviewResult { pass: true, critique: "JSON Parse Error".to_string() });
             
         Ok((review.pass, review.critique))
     }
@@ -475,27 +500,26 @@ impl NewsAggregator {
             prev_content, cluster.main_item.title, current_summary
         );
         
-        let response = self.llm.chat(&prompt, false).await?;
-        
-        // Parse JSON
-        let json_clean = response.trim().trim_matches('`').trim();
-        if let Some(start) = json_clean.find('{') {
-            if let Some(end) = json_clean.rfind('}') {
-                if start <= end {
-                    let json_str = &json_clean[start..=end];
-                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        let has_update = result["has_update"].as_bool().unwrap_or(false);
-                        if has_update {
-                            if let Some(update_summary) = result["update_summary"].as_str() {
-                                return Ok(Some(update_summary.to_string()));
-                            }
-                        }
-                    }
-                }
-            }
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct UpdateCheck {
+            has_update: bool,
+            #[serde(default)]
+            update_summary: Option<String>,
         }
         
-        Ok(None)
+        match self.llm.chat_json::<UpdateCheck>(&prompt, "update_check", false).await {
+            Ok(check) => {
+                if check.has_update {
+                    Ok(check.update_summary)
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                log::warn!("Update check LLM failed: {}", e);
+                Ok(None)
+            }
+        }
     }
     /// Process pre-clustered data for broadcast generation
     async fn process_clusters(&self, category: &str, clusters: &[ClusterData]) -> Result<bool> {
@@ -508,6 +532,7 @@ impl NewsAggregator {
         let mut all_sources = Vec::new();
         let mut broadcast_items = Vec::new();
         let mut unique_topic_count = 0;
+        let mut topics_to_record = Vec::new();
 
         for (idx, cluster) in clusters.iter().enumerate() {
             let summary = cluster.merged_summary.as_ref().unwrap_or(&cluster.main_item.description);
@@ -586,9 +611,8 @@ impl NewsAggregator {
                         log::info!("Follow-up story: {}", cluster.main_item.title);
                         unique_topic_count += 1;
                         
-                        // Update the registry with new content
-                        let _ = self.registry.record_topic_with_details(
-                            &combined_text, &cluster.main_item.title, summary);
+                        // Queue for registry update (only commit if episode is published)
+                        topics_to_record.push((combined_text.clone(), cluster.main_item.title.clone(), summary.to_string()));
                         
                         let source_str = cluster.main_item.source_name.as_deref().unwrap_or("Unknown");
                         source_text.push_str(&format!(
@@ -623,9 +647,8 @@ impl NewsAggregator {
                     }
                 }
             } else {
-                // New topic - record with full details
-                self.registry.record_topic_with_details(
-                    &combined_text, &cluster.main_item.title, summary)?;
+                // New topic - queue for record with full details
+                topics_to_record.push((combined_text.clone(), cluster.main_item.title.clone(), summary.to_string()));
                 unique_topic_count += 1;
                 
                 let source_str = cluster.main_item.source_name.as_deref().unwrap_or("Unknown");
@@ -713,6 +736,13 @@ impl NewsAggregator {
         self.nexus.push_item_multipart(payload, audio_bytes).await?;
         log::info!("Published Digest for [{}]", category);
         
+        // Finalize: Commit all recorded topics to registry now that publication succeeded
+        for (text, title, sum) in topics_to_record {
+            if let Err(e) = self.registry.record_topic_with_details(&text, &title, &sum) {
+                log::error!("Failed to record topic in registry: {}", e);
+            }
+        }
+        
         Ok(true)
     }
 
@@ -732,6 +762,101 @@ impl NewsAggregator {
         // Initialize Tracer
         let logger = Arc::new(Mutex::new(TraceLogger::new(category)));
         logger.lock().await.log("Start", &format!("Producing Episode for [{}]. Regen: {}", category, is_regen));
+
+        let host_val = if let Some(hosts) = &self.hosts {
+            hosts.iter().find(|h| h.categories.contains(&category.to_string()))
+        } else {
+            None
+        };
+        let host_prompt = host_val.and_then(|h| h.prompt_text.clone());
+
+        // Create Channel for Concurrent TTS Pipeline
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(10);
+        let tts_client = self.tts.clone();
+        let host_voice_clone = host_voice.clone();
+        let host_prompt_clone = host_prompt.clone();
+
+        let tts_task: tokio::task::JoinHandle<Result<Vec<u8>, String>> = tokio::spawn(async move {
+            let mut all_samples: Vec<i16> = Vec::new();
+            let mut sample_rate = 24000;
+            let mut failed_chunks: Vec<usize> = Vec::new();
+            
+            let mut chunk_idx = 0;
+            while let Some(chunk_text) = rx.recv().await {
+                chunk_idx += 1;
+                // Avoid synthesizing completely empty text or SKIP strings
+                let tts_text = clean_for_tts(&chunk_text);
+                if tts_text.trim().is_empty() || tts_text.trim().contains("SKIP") { continue; }
+                log::info!("[TTS Pipeline] Generating audio for chunk {} ({} chars)", chunk_idx, tts_text.chars().count());
+                
+                let result = if let Some(voice) = &host_voice_clone {
+                    tts_client.speak_with_voice(&tts_text, voice, host_prompt_clone.as_deref()).await
+                } else {
+                    tts_client.speak(&tts_text).await
+                };
+                
+                match result {
+                    Ok(wav_bytes) => {
+                        let cursor = std::io::Cursor::new(wav_bytes);
+                        if let Ok(mut reader) = hound::WavReader::new(cursor) {
+                            sample_rate = reader.spec().sample_rate;
+                            let new_samples: Vec<i16> = reader.samples::<i16>().filter_map(Result::ok).collect();
+                            
+                            // Crossfade: 50ms overlap between chunks for seamless audio
+                            if all_samples.is_empty() {
+                                all_samples.extend(new_samples);
+                            } else {
+                                let crossfade_duration = 0.05; // 50ms
+                                let crossfade_len = (sample_rate as f64 * crossfade_duration) as usize;
+                                let overlap = crossfade_len.min(all_samples.len()).min(new_samples.len());
+                                
+                                let start_idx = all_samples.len() - overlap;
+                                for i in 0..overlap {
+                                    let fade_out = 1.0 - (i as f32 / overlap as f32);
+                                    let fade_in = i as f32 / overlap as f32;
+                                    let old_val = all_samples[start_idx + i] as f32;
+                                    let new_val = new_samples[i] as f32;
+                                    all_samples[start_idx + i] = (old_val * fade_out + new_val * fade_in) as i16;
+                                }
+                                // Append the non-overlapping remainder
+                                if overlap < new_samples.len() {
+                                    all_samples.extend_from_slice(&new_samples[overlap..]);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("[TTS Pipeline] FAILED for chunk {}: {}", chunk_idx, e);
+                        failed_chunks.push(chunk_idx);
+                    }
+                }
+            }
+            
+            // If any chunk failed, report error so the episode is retried
+            if !failed_chunks.is_empty() {
+                return Err(format!("TTS generation failed for chunks: {:?}", failed_chunks));
+            }
+            
+            if all_samples.is_empty() {
+                return Err("TTS pipeline produced no audio samples".to_string());
+            }
+            
+            let mut out_cursor = std::io::Cursor::new(Vec::new());
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            if let Ok(mut writer) = hound::WavWriter::new(&mut out_cursor, spec) {
+                for sample in all_samples {
+                    let _ = writer.write_sample(sample);
+                }
+                let _ = writer.finalize();
+            }
+            
+            Ok(out_cursor.into_inner())
+        });
 
         // -- TTS DRAFT CACHE PRE-CHECK --
         use std::hash::Hasher;
@@ -781,13 +906,14 @@ impl NewsAggregator {
         // SMART FLOW (Unified)
         // Check if we recovered from cache
         let (raw_script, generated_title) = if let Some(script) = cached_script {
+             let _ = tx.send(script.clone()).await;
              (script, cached_title)
         } else if let Some(item_list) = items {
             log::info!("Starting Smart Episode Generation for {} items...", item_list.len());
             
             // Step A: Intelligent Structure Planning (Sort + Group)
             let tracer_clone = logger.clone();
-            let plans = match self.plan_episode_structure(item_list, tracer_clone).await {
+            let mut plans = match self.plan_episode_structure(item_list, tracer_clone).await {
                 Ok(p) => {
                     log::info!("Smart Flow: Planned {} segments", p.len());
                     p
@@ -807,6 +933,13 @@ impl NewsAggregator {
                 }
             };
 
+            // Topic cap: limit to 15 groups to avoid shallow coverage
+            const MAX_GROUPS: usize = 15;
+            if plans.len() > MAX_GROUPS {
+                log::info!("Capping episode from {} groups to {} groups", plans.len(), MAX_GROUPS);
+                plans.truncate(MAX_GROUPS);
+            }
+
             // Step A.5: Compress long summaries
             let mut all_items: Vec<BroadcastItem> = item_list.to_vec();
             if let Err(e) = self.compress_summaries(&mut all_items, 4000).await {
@@ -817,10 +950,11 @@ impl NewsAggregator {
             let script = self.generate_full_episode_script(
                 category,
                 &host_name,
-                &item_list,
+                &all_items,
                 &plans,
                 &holiday_context,
-                logger.clone()
+                logger.clone(),
+                Some(tx.clone())
             ).await?;
             
             // Step C: Extract title from content
@@ -856,8 +990,11 @@ impl NewsAggregator {
              let prompt = self.build_prompt(category, &host_name, context, &holiday_context, is_regen);
              let response = self.llm.chat(&prompt, is_regen).await?;
              logger.lock().await.log_llm("Simple Generation", "Used legacy/regen one-shot prompt", &prompt, &response);
+             let _ = tx.send(response.clone()).await;
              (response, None) // No title extraction for legacy mode
         };
+        
+        drop(tx); // Close the channel
         
         // 3. (Processed above)
         
@@ -884,12 +1021,22 @@ impl NewsAggregator {
             }
         }
 
-        // 6. TTS Generation
-        let tts_text = clean_for_tts(&script_body);
-        let wav_audio_bytes = if let Some(voice) = host_voice {
-            self.tts.speak_with_voice(&tts_text, &voice).await?
-        } else {
-            self.tts.speak(&tts_text).await?
+        // 6. TTS Generation — Await the parallel pipeline result
+        let wav_audio_bytes = match tts_task.await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(tts_err)) => {
+                // TTS pipeline reported failure — propagate to trigger Peek-Ack retry
+                let msg = format!("Parallel TTS pipeline error: {}", tts_err);
+                log::error!("{}", msg);
+                logger.lock().await.log("Audio Error", &msg);
+                return Err(anyhow::anyhow!(msg));
+            }
+            Err(join_err) => {
+                let msg = format!("TTS task panicked: {}", join_err);
+                log::error!("{}", msg);
+                logger.lock().await.log("Audio Error", &msg);
+                return Err(anyhow::anyhow!(msg));
+            }
         };
 
         // 7. Calculate Duration (Use WAV for accuracy) & Convert to MP3
@@ -1026,113 +1173,177 @@ impl NewsAggregator {
         items: &[BroadcastItem],
         plans: &[SegmentPlan],
         holiday_context: &str,
-        logger: Arc<Mutex<TraceLogger>>
+        logger: Arc<Mutex<TraceLogger>>,
+        tx: Option<tokio::sync::mpsc::Sender<String>>
     ) -> Result<String> {
         let total_items = items.len();
         log::info!("Unified Generation: {} groups, {} items", plans.len(), total_items);
 
-        // 1. Build Full Run of Show (Plan)
-        let mut ros = String::new();
-        ros.push_str(&format!("【节目单 - {}频道】\n", category));
-        ros.push_str(&format!("时间: {}\n", chrono::Local::now().format("%Y-%m-%d")));
-        ros.push_str(&format!("主播: {}\n", host_name));
-        if !holiday_context.is_empty() {
-             ros.push_str(&format!("节日: {}\n", holiday_context));
-        }
-        ros.push_str("\n--- 播报流程 ---\n");
+        // Chunking logic to avoid huge prompts (e.g. 130k chars)
+        let mut chunks: Vec<Vec<SegmentPlan>> = Vec::new();
+        let mut current_chunk: Vec<SegmentPlan> = Vec::new();
+        let mut current_items = 0;
 
-        for (idx, plan) in plans.iter().enumerate() {
-            let theme = plan.group_theme.as_deref().unwrap_or("新闻组");
-            let action = &plan.action;
-            let rationale = plan.transition_rationale.as_deref().unwrap_or("自然过渡");
-            ros.push_str(&format!("{}. [{}] 主题：{} (过渡策略：{})\n", idx + 1, action.to_uppercase(), theme, rationale));
+        for plan in plans {
+            if current_items + plan.ids.len() > 10 && !current_chunk.is_empty() {
+                chunks.push(current_chunk);
+                current_chunk = Vec::new();
+                current_items = 0;
+            }
+            current_chunk.push(plan.clone());
+            current_items += plan.ids.len();
         }
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+        
+        let mut full_script = String::new();
+        let total_chunks = chunks.len();
+        let mut previous_chunk_ending: Option<String> = None;
 
-        // 2. Build Content Block (Grouped)
-        let mut content = String::new();
-        for (idx, plan) in plans.iter().enumerate() {
-            content.push_str(&format!("\n=== 第 {} 组 (主题：{}) ===\n", idx + 1, plan.group_theme.as_deref().unwrap_or("Untitled")));
-            
-            for id in &plan.ids {
-                if let Some(item) = items.iter().find(|i| i.id == *id) {
-                     content.push_str(&format!("--- Item ---\n标题: {}\n来源: {}\n摘要: {}\n", 
-                        item.title, item.source_name, item.summary));
+        for (chunk_idx, plan_chunk) in chunks.iter().enumerate() {
+            let is_first = chunk_idx == 0;
+            let is_last = chunk_idx == total_chunks - 1;
+
+            // 1. Build Full Run of Show (Plan) for this chunk
+            let mut ros = String::new();
+            if is_first {
+                ros.push_str(&format!("【节目单 - {}频道】\n", category));
+                ros.push_str(&format!("时间: {}\n", chrono::Local::now().format("%Y-%m-%d")));
+                ros.push_str(&format!("主播: {}\n", host_name));
+                if !holiday_context.is_empty() {
+                     ros.push_str(&format!("节日: {}\n", holiday_context));
                 }
+            }
+            ros.push_str(&format!("\n--- 第 {}/{} 部分播报流程 ---\n", chunk_idx + 1, total_chunks));
+
+            for (idx, plan) in plan_chunk.iter().enumerate() {
+                let theme = plan.group_theme.as_deref().unwrap_or("新闻组");
+                let action = &plan.action;
+                let rationale = plan.transition_rationale.as_deref().unwrap_or("自然过渡");
+                ros.push_str(&format!("{}. [{}] 主题：{} (过渡策略：{})\n", idx + 1, action.to_uppercase(), theme, rationale));
+            }
+
+            // 2. Build Content Block (Grouped)
+            let mut content = String::new();
+            for (idx, plan) in plan_chunk.iter().enumerate() {
+                content.push_str(&format!("\n=== 第 {}/{} 部分 - 第 {} 组 (主题：{}) ===\n", chunk_idx + 1, total_chunks, idx + 1, plan.group_theme.as_deref().unwrap_or("Untitled")));
+                
+                for id in &plan.ids {
+                    if let Some(item) = items.iter().find(|i| i.id == *id) {
+                         content.push_str(&format!("--- Item ---\n标题: {}\n来源: {}\n摘要: {}\n", 
+                            item.title, item.source_name, item.summary));
+                    }
+                }
+            }
+
+            // 3. Prompt Construction
+            let now = chrono::Local::now();
+            let date_str = now.format("%Y年%-m月%-d日").to_string();
+            let run_of_show = ros;
+            let full_content_block = content;
+
+            let requirement_intro_outro = if total_chunks == 1 {
+                format!("必须包含 [开场白] -> [正文(按顺序串联)] -> [结束语]。\n\
+                - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (包含日期)\n\
+                - 结束语: \"以上就是本期内容...\"", category)
+            } else if is_first {
+                format!("必须包含 [开场白] -> [正文(按顺序串联)]，不要写结束语，因为后面还有内容。\n\
+                - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (包含日期)", category)
+            } else if is_last {
+                "必须包含 [正文(按顺序串联)] -> [结束语]，不要写开场白，直接承接上半部分。\n\
+                - 结束语: \"以上就是本期内容...\"".to_string()
+            } else {
+                "必须只包含 [正文(按顺序串联)]，不要写开场白，不要写结束语，直接承接上半部分并为下半部分留口子。".to_string()
+            };
+
+            let previous_context_str = if let Some(ref text) = previous_chunk_ending {
+                format!("\n【上一部分结尾供参考(Strict Context)】\n{}\n(请务必与上述结尾做无缝、强关联的逻辑性承接，**严禁**使用\"接下来\"、“然后”等生硬套话！)\n", text)
+            } else {
+                String::new()
+            };
+
+            // Create the mega-prompt (chunked)
+            let prompt = format!(
+                "Role: FreshLoop 顶流播客主持人 (Host: {})。\n\
+                频道: {}\n\
+                当前日期: {} (请务必基于此日期播报，今天是普通工作日，除非明确提到节日，否则不要编造“新年”、“春节”等背景)\n\
+                {}\n\
+                \n\
+                【任务目标】\n\
+                基于以下【第 {}/{} 部分的节目编排表】和【详细新闻素材】，撰写一份连贯的单人口播稿。\n\
+                {}\
+                \n\
+                【节目编排表 (Run of Show)】\n\
+                {}\n\
+                \n\
+                【详细新闻素材】\n\
+                {}\n\
+                \n\
+                【撰写要求 (Critical)】\n\
+                1. **结构安排**：{}\n\
+                2. **素材忠诚度 (Strict Content Fidelity)**：\n\
+                   - **以素材为准**：必须基于提供的【详细新闻素材】。禁止引入你训练记忆中可能冲突的事实。\n\
+                   - **禁止幻觉**：严禁编造任何时间、地点、天气、具体数字或素材中未提及的背景故事。\n\
+                3. **简洁衔接**：段落之间的过渡必须简洁直接。\n\
+                   - **优先使用事实性过渡**：提取人物、地点、事件等实体信息进行衔接。\n\
+                   - **避免模板化语句**：禁止使用\"我们先从...说起\"、\"说到...\"、“接下来我们来看”等固定模板。如果提供了【上一部分结尾供参考】，你的第一句必须极其自然地顺着该语境往下接。\n\
+                   - **死亡名单（出现即不合格）**：严禁使用：\"视线转向\"、\"视线转回\"、\"不妨把目光投向\"、\"同样需要\"、\"聊完…不妨…\"、\"话题延伸至\"、\"议题回归\"、\"视角转换至\"、\"从…延伸到…\"。\n\
+                4. **口语化改写（必须）**：\n\
+                   - 严禁逐字照搬素材摘要原文，必须用自己的话重新表述。\n\
+                   - 语气像朋友聊天分享见闻，不是照本宣科念新闻稿。\n\
+                   - 可以加入适当的口语化表达（如\"说白了\"、\"挺有意思的是\"）。\n\
+                5. **篇幅控制**：每条新闻控制在 100-150 字。\n\
+                \n\
+                【格式禁忌 (Strict Mocks)】\n\
+                1. **纯文本输出**：输出必须是【纯纯的口播稿】！\n\
+                2. **严禁包含任何标记**：严禁出现 【正文】、[Music]、(记者报道) 等元数据或结构标记！\n\
+                3. **严禁小标题**：不要给每条新闻加标题，直接用话术过渡。\n\
+                \n\
+                现在，请开始你的表演：",
+                host_name, category, date_str, 
+                if !holiday_context.is_empty() { format!("节日背景: {}", holiday_context) } else { String::new() },
+                chunk_idx + 1, total_chunks,
+                previous_context_str,
+                run_of_show,
+                full_content_block,
+                requirement_intro_outro
+            );
+
+            // 4. LLM Call
+            logger.lock().await.log("Unified Gen Chunk", &format!("Starting generation for chunk {}/{}... (Length: {})", chunk_idx + 1, total_chunks, prompt.len()));
+            let response = self.llm.chat(&prompt, false).await?;
+            
+            logger.lock().await.log_llm("Unified Result Chunk", &format!("Script Chunk {}/{}", chunk_idx + 1, total_chunks), &prompt, &response);
+
+            let cleaned = clean_content(response);
+            
+            // Capture the tail for the next chunk's context
+            let tail_chars = 150; // Extract last 150 chars
+            let char_count = cleaned.chars().count();
+            if char_count > tail_chars {
+                previous_chunk_ending = Some(cleaned.chars().skip(char_count - tail_chars).collect());
+            } else {
+                previous_chunk_ending = Some(cleaned.clone());
+            }
+
+            full_script.push_str(&cleaned);
+            full_script.push_str("\n\n");
+            
+            if let Some(sender) = &tx {
+                 if let Err(e) = sender.send(cleaned.clone()).await {
+                     log::warn!("Failed to send chunk to TTS pipeline: {}", e);
+                 }
             }
         }
 
-        // 3. Prompt Construction
-        let now = chrono::Local::now();
-        let date_str = now.format("%Y年%-m月%-d日").to_string();
-        let run_of_show = ros; // Renamed for clarity in prompt
-        let full_content_block = content; // Renamed for clarity in prompt
-
-        // Create the mega-prompt
-        let prompt = format!(
-            "Role: FreshLoop 顶流播客主持人 (Host: {})。\n\
-            频道: {}\n\
-            当前日期: {} (请务必基于此日期播报，今天是普通工作日，除非明确提到节日，否则不要编造“新年”、“春节”等背景)\n\
-            {}\n\
-            \n\
-            【任务目标】\n\
-            基于以下【节目编排表 (Run of Show)】和【详细新闻素材】，撰写一份完整的、连贯的单人口播稿。\n\
-            \n\
-            【节目编排表 (Run of Show)】\n\
-            导演已经为你规划好了叙事逻辑，请严格遵循这个顺序进行播报：\n\
-            {}\n\
-            \n\
-            【详细新闻素材】\n\
-            {}\n\
-            \n\
-            【撰写要求 (Critical)】\n\
-            1. **结构完整**：必须包含 [开场白] -> [正文(按顺序串联)] -> [结束语]。\n\
-               - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (包含日期，**禁止**胡编乱造当前天气、环境等未提供的信息)\n\
-               - 结束语: \"以上就是本期内容...\" \n\
-            2. **素材忠诚度 (Strict Content Fidelity)**：\n\
-               - **以素材为准**：你的播报内容必须基于提供的【详细新闻素材】。禁止引入你训练记忆中可能冲突的事实。\n\
-               - **政治/身份状态**：今天是 2026 年，请根据素材描述对待人物身份。例如，如果素材暗示某人是现任领导人，即使你的记忆中他是“前任”，你也必须按素材描述为准。\n\
-               - **禁止幻觉**：严禁编造任何时间、地点、天气、具体数字或素材中未提及的背景故事。\n\
-            3. **简洁衔接**：段落之间的过渡必须简洁直接。\n\
-               - **优先使用事实性过渡**：直接从新闻中提取人物、地点、事件等实体信息进行衔接。\n\
-               - **避免模板化语句**：禁止使用\"我们先从...说起\"、\"说到...\"、\"从...延伸到...\"、\"接下来我们关注...\"、\"转向...\"、\"也值得关注\"等固定模板。\n\
-               - **避免抽象引导语**：禁止使用\"我们看到\"、\"值得注意的是\"、\"值得关注的是\"等抽象描述。\n\
-               - **推荐方式**：直接用主体信息衔接，例如：\"特朗普在达沃斯论坛警告欧洲。与此同时，美国海军舰队正向波斯湾进发。\"\n\
-            4. **事实性表达**：\n\
-               - **直接陈述事实**：优先使用包含新闻主体和关系的具体表述，避免\"此举旨在...\"、\"显示...\"等总结性、概括性的抽象语言。\n\
-               - **保留主体信息**：新闻中的人名、机构名、地点等主体信息本身就是最好的衔接材料。\n\
-            5. **信息准确**：保留新闻核心要素(Who/What/When)，但去除冗余细节。\n\
-            6. **篇幅控制**：总时长约 5-8 分钟。每条新闻控制在 100-150 字。\n\
-            \n\
-            【格式禁忌 (Strict Mocks)】\n\
-            1. **纯文本输出**：输出必须是【纯纯的口播稿】！\n\
-            2. **严禁包含任何标记**：\n\
-               - ❌ 严禁出现 【正文】、【Segment】、【Group】、【Chapter】 等结构标记！\n\
-               - ❌ 严禁出现 [Music]、[Sound Effect] 等音效标记！\n\
-               - ❌ 严禁出现 (记者报道)、(来源:XXX) 等元数据！\n\
-               - ❌ 严禁出现 \"播报结束\"、\"End of Script\" 等提示语！\n\
-            3. **严禁小标题**：不要给每条新闻加标题，直接用话术过渡。\n\
-            \n\
-            现在，请开始你的表演，从开场白开始，一气呵成播报完全部内容（Intro -> Body -> Outro）：",
-            host_name, category, date_str, 
-            if !holiday_context.is_empty() { format!("节日背景: {}", holiday_context) } else { String::new() },
-            run_of_show,
-            full_content_block,
-            category
-        );
-
-        // 4. LLM Call
-        logger.lock().await.log("Unified Gen", "Starting full episode generation...");
-        let response = self.llm.chat(&prompt, false).await?;
-        
-        logger.lock().await.log_llm("Unified Result", "Full Script", &prompt, &response);
-
         // 5. Post-Processing / Safety
-        let cleaned = clean_content(response);
-        if cleaned.len() < 300 {
+        let final_script = full_script.trim().to_string();
+        if final_script.len() < 300 && total_chunks == 1 {
              return Err(anyhow::anyhow!("Generated script too short (<300 chars). Likely just an intro."));
         }
 
-        Ok(cleaned)
+        Ok(final_script)
     }
 
     /// Extract episode title from news content
@@ -1149,48 +1360,73 @@ impl NewsAggregator {
             1. 不超过25字，多事件用「/」分隔\n\
             2. 禁止「今日要闻」「新闻汇总」等通用词\n\
             3. 禁止「震惊」「重磅」等夸张词\n\n\
-            请输出 JSON 格式：{{ \"title\": \"你的标题\" }}",
+            直接输出标题文本，不要 JSON，不要引号，不要任何格式包裹。\n\
+            示例：苹果发布M5芯片/SpaceX星舰第七次试飞",
             category, top_titles
         );
         
-        // Use standard chat which handles <think> stripping internally,
-        // but we also need to parse JSON to contain the result cleanly.
         let response = self.llm.chat(&prompt, false).await?;
         
-        // Try to parse JSON
-        let json_clean = response.trim().trim_matches('`').trim();
-        // Handle code blocks like ```json ... ```
-        let json_str = if let Some(start) = json_clean.find('{') {
-             if let Some(end) = json_clean.rfind('}') {
-                if start <= end {
-                    &json_clean[start..=end]
-                } else {
-                    json_clean
+        // Post-processing: clean up the title
+        let mut title = response.trim().to_string();
+        
+        // Try to extract from JSON if LLM still returned JSON despite instructions
+        if title.contains('{') {
+            let json_clean = title.trim_matches('`').trim().to_string();
+            if let Some(start) = json_clean.find('{') {
+                if let Some(end) = json_clean.rfind('}') {
+                    if start <= end {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_clean[start..=end]) {
+                            if let Some(t) = val["title"].as_str() {
+                                title = t.trim().to_string();
+                            }
+                        }
+                    }
                 }
-             } else {
-                 json_clean
-             }
-        } else {
-            json_clean
-        };
-
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-            if let Some(t) = val["title"].as_str() {
-                return Ok(t.trim().to_string());
             }
         }
-
-        // Fallback: If not JSON, use the raw response but truncate widely if it looks like a thought dump
-        let raw = response.trim();
-        // Heuristic: If it contains newlines or is too long, it might be a thought dump.
-        if raw.len() > 100 || raw.contains('\n') {
-            // Last resort: Try to find a line that looks like a title or just take the fast 25 chars?
-            // Safer to just log error and return a safe fallback title.
-            log::warn!("LLM returned unstructured thought dump for title: {}", raw.chars().take(50).collect::<String>());
-            return Ok(format!("{} News Briefing", category));
+        
+        // Strip wrapping quotes
+        title = title.trim_matches('"').trim_matches('\'').to_string();
+        for ch in ['\u{201c}', '\u{201d}', '\u{2018}', '\u{2019}'] {
+            title = title.replace(ch, "");
         }
-
-        Ok(raw.to_string())
+        // Strip "title:" prefix variants
+        let title_lower = title.to_lowercase();
+        for prefix in ["title:", "标题:", "标题："] {
+            if title_lower.starts_with(prefix) {
+                title = title[prefix.len()..].trim().to_string();
+                break;
+            }
+        }
+        
+        // Validate: reject obviously bad titles
+        let now = chrono::Local::now();
+        let date_suffix = now.format("%m.%d").to_string();
+        let is_invalid = title.is_empty()
+            || title.contains("你的标题")
+            || title.starts_with('{')
+            || title.contains("\"title\"")
+            || title.len() > 200
+            || title.contains('\n')
+            || title.to_lowercase().contains("news digest")
+            || title.to_lowercase().contains("news briefing");
+        
+        if is_invalid {
+            log::warn!("Invalid title detected: \'{}\', using fallback", title.chars().take(50).collect::<String>());
+            // Build fallback from top 2-3 item titles
+            let short_titles: Vec<String> = items.iter().take(3)
+                .map(|i| i.title.chars().take(12).collect::<String>())
+                .collect();
+            title = format!("{} {}", short_titles.join("/"), date_suffix);
+        }
+        
+        // Final length guard
+        if title.chars().count() > 40 {
+            title = title.chars().take(40).collect();
+        }
+        
+        Ok(title)
     }
 
 
@@ -1231,19 +1467,19 @@ impl NewsAggregator {
         
         // Parse JSON
         let json_clean = response.trim().trim_matches('`').trim();
-        let start = json_clean.find('[').unwrap_or(0);
-        let end = json_clean.rfind(']').unwrap_or(json_clean.len().saturating_sub(1));
         
-        if start <= end && end < json_clean.len() {
-             let json_str = &json_clean[start..=end];
-             if let Ok(groups) = serde_json::from_str::<Vec<ClusterGroup>>(json_str) {
+        // Safe JSON array extraction
+        let json_str = match (json_clean.find('['), json_clean.rfind(']')) {
+            (Some(s), Some(e)) if e >= s => &json_clean[s..=e],
+            _ => "[]",
+        };
+        if let Ok(groups) = serde_json::from_str::<Vec<ClusterGroup>>(json_str) {
                  // Validate all IDs exist
                  let valid_ids: std::collections::HashSet<usize> = items.iter().map(|i| i.id).collect();
                  let all_valid = groups.iter().all(|g| g.ids.iter().all(|id| valid_ids.contains(id)));
                  if all_valid && !groups.is_empty() {
                      return Ok(groups);
                  }
-             }
         }
         
         // Fallback: Each item is its own group with generic theme
@@ -1270,6 +1506,32 @@ impl NewsAggregator {
             }
         };
         logger.lock().await.log("Clustering Result", &format!("{:?}", cluster_groups));
+
+        // Filter out low-value classified ads (rentals, job search, ads) if they have only 1 item
+        let mut filtered_groups = Vec::new();
+        for group in cluster_groups {
+            let mut is_low_value = false;
+            // Only filter if it's a singleton (a single forum post)
+            if group.ids.len() == 1 {
+                let theme_lower = group.theme.to_lowercase();
+                if theme_lower.contains("求职") 
+                    || theme_lower.contains("招聘") 
+                    || theme_lower.contains("合租") 
+                    || theme_lower.contains("转让") 
+                    || theme_lower.contains("出售") 
+                    || theme_lower.contains("出二手") 
+                    || theme_lower.contains("接单") 
+                {
+                    is_low_value = true;
+                }
+            }
+            if is_low_value {
+                log::info!("Filtered out low-value classified ad group: {}", group.theme);
+            } else {
+                filtered_groups.push(group);
+            }
+        }
+        let cluster_groups = filtered_groups;
 
         // Phase 2: Sequencing the Groups
         // Build descriptions with theme info
@@ -1305,11 +1567,7 @@ impl NewsAggregator {
              group_descriptions.join("\n")
         );
 
-        let response = self.llm.chat(&prompt_v2, false).await?;
-        logger.lock().await.log_llm("Planning Phase 2", "Sequencing", &prompt_v2, &response);
-
-        // Parse Plan
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
         struct Step {
             action: String,
             group_index: usize,
@@ -1317,14 +1575,17 @@ impl NewsAggregator {
             transition_rationale: Option<String>,
         }
         
+        let response = self.llm.chat(&prompt_v2, false).await?;
+        logger.lock().await.log_llm("Planning Phase 2", "Sequencing", &prompt_v2, &response);
+
         let json_clean = response.trim().trim_matches('`').trim();
-        let start = json_clean.find('[').unwrap_or(0);
-        let end = json_clean.rfind(']').unwrap_or(json_clean.len().saturating_sub(1));
         
-        let steps: Vec<Step> = if start <= end {
-            serde_json::from_str(&json_clean[start..=end]).unwrap_or_default()
-        } else {
-            Vec::new()
+        // Safe JSON array extraction
+        let steps: Vec<Step> = match (json_clean.find('['), json_clean.rfind(']')) {
+            (Some(s), Some(e)) if e >= s => {
+                serde_json::from_str(&json_clean[s..=e]).unwrap_or_default()
+            }
+            _ => Vec::new(),
         };
 
         // Convert back to SegmentPlan with rich context from ClusterGroup

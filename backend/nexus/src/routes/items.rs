@@ -231,6 +231,28 @@ pub async fn create_item(
                 return Json(json!({ "id": "skipped", "status": "skipped_dupe" })).into_response();
             }
 
+            // Backfill source_items to keep legacy dedup table in sync with items.original_url.
+            if let Some(original_url) = payload.original_url.as_deref().filter(|u| !u.is_empty()) {
+                let source_id = uuid::Uuid::new_v4().to_string();
+                let category = payload
+                    .category
+                    .as_deref()
+                    .unwrap_or("Uncategorized")
+                    .to_string();
+                if let Err(e) = sqlx::query(
+                    "INSERT OR IGNORE INTO source_items (id, url, category, created_at) VALUES (?, ?, ?, ?)"
+                )
+                .bind(&source_id)
+                .bind(original_url)
+                .bind(category)
+                .bind(created_at)
+                .execute(&state.db)
+                .await
+                {
+                    tracing::warn!("Failed to sync source_items for item {}: {}", id, e);
+                }
+            }
+
             // Handle Sources - log errors but don't fail the request
             if let Some(sources) = &payload.sources {
                 for source in sources {
@@ -358,6 +380,28 @@ pub async fn create_item_multipart(
                     let _ = tokio::fs::remove_file(path).await;
                 }
                 return Json(json!({ "id": "skipped", "status": "skipped_dupe" })).into_response();
+            }
+
+            // Backfill source_items to keep legacy dedup table in sync with items.original_url.
+            if let Some(original_url) = item_req.original_url.as_deref().filter(|u| !u.is_empty()) {
+                let source_id = uuid::Uuid::new_v4().to_string();
+                let category = item_req
+                    .category
+                    .as_deref()
+                    .unwrap_or("Uncategorized")
+                    .to_string();
+                if let Err(e) = sqlx::query(
+                    "INSERT OR IGNORE INTO source_items (id, url, category, created_at) VALUES (?, ?, ?, ?)"
+                )
+                .bind(&source_id)
+                .bind(original_url)
+                .bind(category)
+                .bind(created_at)
+                .execute(&state.db)
+                .await
+                {
+                    tracing::warn!("Failed to sync source_items for item {}: {}", id, e);
+                }
             }
 
             // Handle sources

@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use crate::AppState;
 
-const DEFAULT_USER: &str = "default";
-
 #[derive(Serialize, FromRow)]
 pub struct HistoryItem {
     pub item_id: String,

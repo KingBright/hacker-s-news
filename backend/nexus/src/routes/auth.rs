@@ -5,8 +5,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use crate::AppState;
 use bcrypt::{hash, verify, DEFAULT_COST};
-use rand::Rng;
-use rand::distributions::Alphanumeric;
+use rand::RngExt;
+use rand::distr::Alphanumeric;
 use sqlx::Row; // Import Row trait for get()
 
 #[derive(Deserialize)]
@@ -58,7 +58,7 @@ pub async fn create_user(
 
     // 2. Generate Password if not provided
     let password_plain = payload.password.unwrap_or_else(|| {
-        rand::thread_rng()
+        rand::rng()
             .sample_iter(&Alphanumeric)
             .take(8)
             .map(char::from)

@@ -77,7 +77,8 @@ impl LlmClient {
         Self {
             client: Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
-                .timeout(std::time::Duration::from_secs(180))
+                .timeout(std::time::Duration::from_secs(300))
+                .no_proxy() // Disable environment variable proxies too, just in case
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             config,
@@ -326,6 +327,243 @@ impl LlmClient {
         }
 
         Ok(summary)
+    }
+
+    /// Structured JSON output: sends a prompt with `response_format: json_schema`
+    /// so LM Studio constrains the model to output valid JSON matching the schema.
+    /// Returns the deserialized Rust type directly.
+    pub async fn chat_json<T: serde::de::DeserializeOwned + schemars::JsonSchema>(
+        &self,
+        prompt: &str,
+        schema_name: &str,
+        skip_cache: bool,
+    ) -> Result<T> {
+        // 1. Check cache (same key scheme as chat())
+        let cache_key = if !skip_cache {
+            let mut hasher = Sha256::new();
+            hasher.update(prompt);
+            hasher.update(b"__json__");
+            hasher.update(schema_name.as_bytes());
+            Some(hex::encode(hasher.finalize()))
+        } else {
+            None
+        };
+
+        if let Some(key) = &cache_key {
+            if let Some(db) = &self.cache {
+                if let Ok(Some(cached_bytes)) = db.get(key) {
+                    if let Ok(entry) = serde_json::from_slice::<CacheEntry>(&cached_bytes) {
+                        let now = Local::now().timestamp();
+                        if now - entry.created_at < CACHE_TTL_SECS {
+                            log::info!("LLM Cache Hit (JSON)! Key: {}", key);
+                            self.log_audit("CACHE HIT (JSON)", &entry.content);
+                            return serde_json::from_str::<T>(&entry.content)
+                                .map_err(|e| anyhow::anyhow!("Cached JSON parse error: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Generate JSON Schema from Rust type (used for json_schema mode and prompt enrichment)
+        let schema = schemars::schema_for!(T);
+        let schema_value = serde_json::to_value(&schema)?;
+
+        // 3. Build request body based on json_mode config
+        //    - "json_schema": OpenAI Structured Outputs (strictest, guaranteed schema compliance)
+        //    - "json_object": OpenAI JSON mode (valid JSON, no schema enforcement)
+        //    - "none" / other: plain text, schema hint in prompt
+        let json_mode = self.config.json_mode.as_str();
+        
+        // For json_object and none modes, embed schema description in prompt
+        // (json_schema mode enforces at API level, so no prompt hint needed)
+        let content_with_hint = if json_mode != "json_schema" {
+            // Build a compact schema description from the JSON Schema
+            let schema_str = serde_json::to_string(&schema_value).unwrap_or_default();
+            format!("{}\n\nRespond ONLY with a valid JSON object. Schema: {}", prompt, schema_str)
+        } else {
+            prompt.to_string()
+        };
+
+        let mut body = json!({
+            "model": self.config.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content_with_hint
+                }
+            ],
+            "stream": false,
+            "max_tokens": 8192
+        });
+
+        // Add response_format based on mode
+        match json_mode {
+            "json_schema" => {
+                body["response_format"] = json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": true,
+                        "schema": schema_value
+                    }
+                });
+            }
+            "json_object" => {
+                body["response_format"] = json!({
+                    "type": "json_object"
+                });
+            }
+            _ => {
+                // "none" mode: no response_format, rely on prompt hint
+            }
+        }
+
+        let url = format!(
+            "{}/chat/completions",
+            self.config.api_url.trim_end_matches('/')
+        );
+
+        log::info!(
+            "Sending structured JSON request to {} (schema: {}, prompt: {} chars)",
+            url, schema_name, prompt.len()
+        );
+        self.log_audit("INPUT (JSON)", &format!("[Schema: {}]\n{}", schema_name, prompt));
+
+        // 4. Retry mechanism (same as chat())
+        let res = {
+            let mut last_err: Option<String> = None;
+            let mut response = None;
+            let mut use_fallback_endpoint = false;
+
+            for attempt in 0..7 {
+                let delay = match attempt {
+                    0 => Duration::from_secs(3),
+                    1 => Duration::from_secs(3),
+                    2 => Duration::from_secs(30),
+                    3 => Duration::from_secs(30),
+                    4 => Duration::from_secs(120),
+                    5 => Duration::from_secs(120),
+                    _ => Duration::from_secs(300),
+                };
+
+                let current_url = if attempt >= 4 && !use_fallback_endpoint {
+                    if let Some(ref fb_url) = self.config.fallback_url {
+                        if !fb_url.is_empty() {
+                            use_fallback_endpoint = true;
+                            let fallback_url = format!(
+                                "{}/chat/completions",
+                                fb_url.trim_end_matches('/')
+                            );
+                            log::warn!("Switching to fallback endpoint: {}", fallback_url);
+                            fallback_url
+                        } else {
+                            url.clone()
+                        }
+                    } else {
+                        url.clone()
+                    }
+                } else {
+                    url.clone()
+                };
+
+                match self.client.post(&current_url).json(&body).send().await {
+                    Ok(r) => {
+                        response = Some(r);
+                        if attempt > 0 {
+                            log::info!("LLM connection succeeded on attempt {}/7", attempt + 1);
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        if attempt < 6 {
+                            log::warn!("LLM connection attempt {}/7 failed: {}. Retrying in {}s...",
+                                attempt + 1, e, delay.as_secs());
+                            sleep(delay).await;
+                        } else {
+                            log::error!("LLM connection failed after all 7 attempts: {}", e);
+                        }
+                    }
+                }
+            }
+
+            match response {
+                Some(r) => r,
+                None => {
+                    let e = last_err.unwrap_or_else(|| "Unknown connection error".to_string());
+                    log::error!("Failed to connect to LLM at {} after all attempts: {}", url, e);
+                    return Err(anyhow::anyhow!("LLM Connection Failed: {}", e));
+                }
+            }
+        };
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let error_text = res.text().await.unwrap_or_default();
+            log::error!("LLM Error {}: {}", status, error_text);
+            self.log_audit("ERROR (JSON)", &format!("Status: {}, Body: {}", status, error_text));
+            return Err(anyhow::anyhow!("LLM API Error {}: {}", status, error_text));
+        }
+
+        // 5. Parse response
+        let response_json: serde_json::Value = res.json().await?;
+        log::info!("Received structured JSON response.");
+
+        let content = response_json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+
+        // Strip <think> tags if present
+        let json_content = if let Some(idx) = content.find("</think>") {
+            let thought = &content[..idx + "</think>".len()];
+            self.log_audit("THOUGHT (JSON)", thought);
+            content[idx + "</think>".len()..].trim()
+        } else {
+            content.trim()
+        };
+
+        self.log_audit("OUTPUT (JSON)", json_content);
+
+        // 6. Deserialize — try direct parse first, fall back to JSON extraction for "none" mode
+        let result: T = match serde_json::from_str(json_content) {
+            Ok(v) => v,
+            Err(e) => {
+                // Fallback: try to extract JSON from response (for "none" mode or imperfect output)
+                let extracted = if let (Some(s), Some(e_pos)) = (json_content.find('{'), json_content.rfind('}')) {
+                    if e_pos >= s { &json_content[s..=e_pos] } else { json_content }
+                } else if let (Some(s), Some(e_pos)) = (json_content.find('['), json_content.rfind(']')) {
+                    if e_pos >= s { &json_content[s..=e_pos] } else { json_content }
+                } else {
+                    json_content
+                };
+                
+                serde_json::from_str(extracted).map_err(|_| {
+                    log::error!("Structured JSON parse failed (schema: {}): {}. Content: {}", 
+                        schema_name, e, json_content);
+                    anyhow::anyhow!("Structured JSON parse error: {}", e)
+                })?
+            }
+        };
+
+        // 7. Write to cache
+        if let Some(key) = &cache_key {
+            if let Some(db) = &self.cache {
+                let entry = CacheEntry {
+                    created_at: Local::now().timestamp(),
+                    content: json_content.to_string(),
+                };
+                if let Ok(bytes) = serde_json::to_vec(&entry) {
+                    if let Err(e) = db.insert(key, bytes) {
+                        log::warn!("Failed to write to LLM cache: {}", e);
+                    } else {
+                        let _ = db.flush();
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Get cache statistics (entry count and estimated size in bytes)

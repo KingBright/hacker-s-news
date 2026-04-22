@@ -3,8 +3,13 @@ target/
 *.log
 dist/
 aha
+qwen3-tts-rs
 freshloop.db
 freshloop.db-shm
 freshloop.db-wal
 config.toml
 scripts/deploy.sh
+.code_analysis/
+.runtime/
+DIAG_*.md
+backend/target-local/

@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 // Retry configuration constants
 const MAX_RETRY_COUNT: u8 = 5;        // Maximum retry attempts before giving up
-const MAX_AGE_SECS: u64 = 7 * 24 * 3600; // 7 days - entries older than this are pruned
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RetryAction {

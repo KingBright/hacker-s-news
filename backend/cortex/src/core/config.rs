@@ -20,6 +20,7 @@ pub struct Config {
 pub struct Host {
     pub name: String,
     pub voice: String,
+    pub prompt_text: Option<String>,
     pub categories: Vec<String>,
 }
 
@@ -34,6 +35,13 @@ pub struct LlmConfig {
     pub model: String,
     pub api_url: String,
     pub fallback_url: Option<String>, // Fallback endpoint URL
+    /// JSON output mode: "json_schema" (strictest, default), "json_object" (wider compat), "none" (prompt-only)
+    #[serde(default = "default_json_mode")]
+    pub json_mode: String,
+}
+
+fn default_json_mode() -> String {
+    "json_schema".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]

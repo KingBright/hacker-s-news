@@ -283,7 +283,12 @@ class TraceParser:
                     # strip possible ```json wrapper
                     text = re.sub(r"^```\w*\s*", "", text)
                     text = re.sub(r"\s*```$", "", text)
-                    trace.final_script = text.strip()
+                    text = text.strip()
+                    trace.final_script = (
+                        (trace.final_script + "\n\n" + text)
+                        if trace.final_script
+                        else text
+                    )
 
             elif "Segment Writer Result" in name or "Segment Result" in name:
                 trace.step_times.setdefault("generation", step.time)

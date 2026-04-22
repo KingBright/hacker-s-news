@@ -4,7 +4,6 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
-use serde_json::json;
 use crate::AppState;
 use crate::routes::items::Item;
 

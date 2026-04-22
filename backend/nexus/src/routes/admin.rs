@@ -1,10 +1,9 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
-use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use serde::Deserialize;
 use crate::AppState;
 use crate::routes::items::Item;
 

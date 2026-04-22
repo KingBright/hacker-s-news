@@ -9,9 +9,16 @@ echo "  Deployment Verification"
 echo "=========================================="
 
 # Configuration
-SERVER="root@hackerlife.fun"
-SSH_PORT="222"
+if nc -z -w 1 192.168.2.200 22 2>/dev/null; then
+    SERVER="root@192.168.2.200"
+    SSH_PORT="22"
+else
+    SERVER="root@hackerlife.fun"
+    SSH_PORT="222"
+fi
 NEXUS_URL="https://news.hackerlife.fun:8443"
+APP_NAME="com.freshloop.cortex"
+LAUNCH_DOMAIN="gui/$(id -u)"
 
 # Colors
 RED='\033[0;31m'
@@ -46,24 +53,39 @@ fi
 # 3. Check Cortex Local Service
 echo ""
 echo ">>> Checking Cortex locally..."
-if launchctl list | grep -q "com.freshloop.cortex"; then
+JOB_INFO=$(launchctl print "$LAUNCH_DOMAIN/$APP_NAME" 2>/dev/null || true)
+TRIGGER_RESPONSE=$(curl -s "http://localhost:3721/api/status" 2>/dev/null || echo "FAILED")
+if [ -n "$JOB_INFO" ]; then
     pass "Cortex service is loaded"
+    JOB_PROGRAM=$(echo "$JOB_INFO" | awk -F' = ' '/^[[:space:]]*program = / { print $2; exit }')
+    JOB_STATE=$(echo "$JOB_INFO" | awk -F' = ' '/^[[:space:]]*state = / { print $2; exit }')
+    JOB_PID=$(echo "$JOB_INFO" | awk -F' = ' '/^[[:space:]]*pid = / { print $2; exit }')
+    JOB_HOME=$(echo "$JOB_INFO" | awk -F'=> ' '/^[[:space:]]*HOME => / { print $2; exit }')
+    [ -n "$JOB_PROGRAM" ] && echo "  Program: $JOB_PROGRAM"
+    [ -n "$JOB_STATE" ] && echo "  State: $JOB_STATE"
 else
-    fail "Cortex service is NOT loaded"
-    echo "  Try: ./scripts/install_local_service.sh"
+    if [[ "$TRIGGER_RESPONSE" != "FAILED" ]] && [[ "$TRIGGER_RESPONSE" != "" ]]; then
+        warn "Cortex API is responding, but launchctl job is not visible in this session"
+    else
+        fail "Cortex service is NOT loaded"
+        echo "  Try: ./scripts/install_local_service.sh"
+    fi
 fi
 
 # 4. Check Cortex Process
-if pgrep -f "cortex" > /dev/null; then
-    pass "Cortex process is running (PID: $(pgrep -f cortex))"
+if [ -n "$JOB_PID" ] && [ "$JOB_PID" != "-" ]; then
+    pass "Cortex process is running (PID: $JOB_PID)"
 else
-    fail "Cortex process is NOT running"
+    if [[ "$TRIGGER_RESPONSE" != "FAILED" ]] && [[ "$TRIGGER_RESPONSE" != "" ]]; then
+        warn "Cortex API is responding, but PID is not visible yet"
+    else
+        fail "Cortex process is NOT running"
+    fi
 fi
 
 # 5. Check Cortex Trigger API
 echo ""
 echo ">>> Checking Cortex Trigger API..."
-TRIGGER_RESPONSE=$(curl -s "http://localhost:3721/api/status" 2>/dev/null || echo "FAILED")
 if [[ "$TRIGGER_RESPONSE" != "FAILED" ]] && [[ "$TRIGGER_RESPONSE" != "" ]]; then
     pass "Cortex Trigger API is responding"
     echo "  Status: $(echo $TRIGGER_RESPONSE | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status', 'unknown'))" 2>/dev/null || echo 'parse error')"
@@ -100,4 +122,8 @@ echo "  - Cortex Status: http://localhost:3721/api/status"
 echo ""
 echo "Troubleshooting:"
 echo "  - Nexus logs: ssh -p $SSH_PORT $SERVER 'journalctl -u nexus -f'"
-echo "  - Cortex logs: tail -f ~/.freshloop/logs/cortex.err.log"
+if [ -n "$JOB_HOME" ]; then
+    echo "  - Cortex logs: tail -f $JOB_HOME/.freshloop/logs/cortex-$(date +%Y-%m-%d).log"
+else
+    echo "  - Cortex logs: tail -f ~/.freshloop/logs/cortex-$(date +%Y-%m-%d).log"
+fi

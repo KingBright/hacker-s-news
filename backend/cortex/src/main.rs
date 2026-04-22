@@ -11,41 +11,127 @@ fn get_app_data_dir() -> PathBuf {
         .join(".freshloop")
 }
 
-/// Run the main service logic (shared between standalone and service modes)
-async fn run_service() -> Result<()> {
-    // Custom Logger to split stdout/stderr
-    struct SplitLogger;
+// --- Daily Rotating Logger ---
+// Writes logs to date-stamped files: cortex-YYYY-MM-DD.log
+// Auto-cleans logs older than 30 days on startup.
+mod rotating_log {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
 
-    impl log::Log for SplitLogger {
+    pub struct RotatingLogger {
+        log_dir: PathBuf,
+        current_date: Mutex<String>,
+        file: Mutex<Option<std::fs::File>>,
+    }
+
+    impl RotatingLogger {
+        pub fn new(log_dir: &std::path::Path) -> Self {
+            std::fs::create_dir_all(log_dir).ok();
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let file = Self::open_log_file(log_dir, &today);
+            Self {
+                log_dir: log_dir.to_path_buf(),
+                current_date: Mutex::new(today),
+                file: Mutex::new(file),
+            }
+        }
+
+        fn open_log_file(log_dir: &std::path::Path, date: &str) -> Option<std::fs::File> {
+            let path = log_dir.join(format!("cortex-{}.log", date));
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()
+        }
+
+        /// Delete log files older than `max_age_days`
+        pub fn cleanup_old_logs(log_dir: &std::path::Path, max_age_days: i64) {
+            let cutoff = chrono::Local::now() - chrono::Duration::days(max_age_days);
+            let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
+
+            if let Ok(entries) = std::fs::read_dir(log_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    // Match cortex-YYYY-MM-DD.log pattern (len = 21)
+                    if name.starts_with("cortex-") && name.ends_with(".log") && name.len() == 21 {
+                        let date_part = &name[7..17]; // extract YYYY-MM-DD
+                        if date_part < cutoff_str.as_str() {
+                            if std::fs::remove_file(entry.path()).is_ok() {
+                                eprintln!("[LOG CLEANUP] Removed old log: {}", name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    impl log::Log for RotatingLogger {
         fn enabled(&self, metadata: &log::Metadata) -> bool {
             metadata.level() <= log::Level::Info
         }
 
         fn log(&self, record: &log::Record) {
-            if self.enabled(record.metadata()) {
-                let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%SZ");
-                let msg = format!(
-                    "[{}] [{}] [{}] {}",
-                    timestamp,
-                    record.level(),
-                    record.target(),
-                    record.args()
-                );
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let now = chrono::Local::now();
+            let today = now.format("%Y-%m-%d").to_string();
+            let timestamp = now.format("%Y-%m-%dT%H:%M:%S%:z");
+            let msg = format!(
+                "[{}] [{}] [{}] {}\n",
+                timestamp,
+                record.level(),
+                record.target(),
+                record.args()
+            );
 
-                // Error and Warn go to stderr (cortex.err.log)
-                // Info and below go to stdout (cortex.out.log)
-                if record.level() <= log::Level::Warn {
-                    eprintln!("{}", msg);
-                } else {
-                    println!("{}", msg);
+            // Check if we need to rotate (new day)
+            {
+                let mut current = self.current_date.lock().unwrap();
+                if *current != today {
+                    *current = today.clone();
+                    let mut file_guard = self.file.lock().unwrap();
+                    *file_guard = Self::open_log_file(&self.log_dir, &today);
                 }
+            }
+
+            // Write to file
+            if let Ok(mut file_guard) = self.file.lock() {
+                if let Some(ref mut f) = *file_guard {
+                    let _ = f.write_all(msg.as_bytes());
+                }
+            }
+
+            // Also echo to stdout/stderr for interactive debugging
+            if record.level() <= log::Level::Warn {
+                eprint!("{}", msg);
+            } else {
+                print!("{}", msg);
             }
         }
 
-        fn flush(&self) {}
+        fn flush(&self) {
+            if let Ok(mut file_guard) = self.file.lock() {
+                if let Some(ref mut f) = *file_guard {
+                    let _ = f.flush();
+                }
+            }
+        }
     }
+}
 
-    log::set_boxed_logger(Box::new(SplitLogger)).unwrap();
+/// Run the main service logic (shared between standalone and service modes)
+async fn run_service() -> Result<()> {
+    let app_data_dir = get_app_data_dir();
+
+    // Initialize rotating logger
+    let log_dir = app_data_dir.join("logs");
+    let logger = rotating_log::RotatingLogger::new(&log_dir);
+    rotating_log::RotatingLogger::cleanup_old_logs(&log_dir, 30);
+    log::set_boxed_logger(Box::new(logger)).unwrap();
     log::set_max_level(log::LevelFilter::Info);
 
     // Load Config
@@ -75,8 +161,6 @@ tags = ["Tech", "Global"]
     }
 
     let config = load_config(config_path)?;
-
-    let app_data_dir = get_app_data_dir();
 
     // LLM Audit Log & Cache Path
     let llm_log_path = app_data_dir.join("logs").join("llm_audit.log");

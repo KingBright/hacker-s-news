@@ -18,25 +18,6 @@ schedule_times = [
     "22:00",
 ]
 
-# Classification Categories for LLM
-categories = [
-    "热点科技",
-    "工程技术",
-    "生命科学",
-    "科学",
-    "极客",
-    "数码",
-    "游戏影音",
-    "读书",
-    "文娱",
-    "财经",
-    "政治",
-    "探索",
-    "生活",
-    "广告",
-    "其他",
-]
-
 # RSS Feeds to monitor
 rss_feeds = [
     # Tech
@@ -48,6 +29,67 @@ rss_feeds = [
     "https://36kr.com/feed",
     # Add your feeds here...
 ]
+
+# Classification Categories for LLM (Array of Tables)
+[[categories]]
+name = "热点科技"
+description = "人工智能、大模型、机器学习、Agent、前沿科技动态"
+
+[[categories]]
+name = "工程技术"
+description = "编程语言、软件工程、开源项目、架构实践、开发工具"
+
+[[categories]]
+name = "生命科学"
+description = "医学、生物技术、健康科技、科研进展"
+
+[[categories]]
+name = "科学"
+description = "自然科学、物理、化学、天文、环境研究"
+
+[[categories]]
+name = "极客"
+description = "黑客文化、效率工具、技术观点、社区热点"
+
+[[categories]]
+name = "数码"
+description = "消费电子、硬件新品、芯片、终端设备"
+
+[[categories]]
+name = "游戏影音"
+description = "游戏、影视、动漫、流媒体与相关产业新闻"
+
+[[categories]]
+name = "读书"
+description = "读书方法、书籍推荐、知识管理与学习"
+
+[[categories]]
+name = "文娱"
+description = "文化与娱乐动态、泛内容消费"
+
+[[categories]]
+name = "财经"
+description = "商业公司、市场趋势、投融资与宏观经济"
+
+[[categories]]
+name = "政治"
+description = "国际关系、政策法规、公共事务"
+
+[[categories]]
+name = "探索"
+description = "太空探索、科学发现、技术边界拓展"
+
+[[categories]]
+name = "生活"
+description = "生活方式、实用技巧、社会观察"
+
+[[categories]]
+name = "广告"
+description = "推广内容、软文、营销信息（用于过滤）"
+
+[[categories]]
+name = "其他"
+description = "无法归入以上分类的内容"
 
 # ===========================================
 # SECTIONS

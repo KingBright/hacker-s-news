@@ -37,7 +37,7 @@ export function LoginModal({ isOpen, onClose, onLogin }: LoginModalProps) {
             const user = await res.json();
             onLogin(user);
             onClose();
-        } catch (e) {
+        } catch {
             setError("Login failed. Check credentials.");
         } finally {
             setLoading(false);

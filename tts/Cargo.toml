@@ -5,9 +5,16 @@ edition = "2021"
 
 [dependencies]
 aha = { path = "../aha" }
+qwen3-tts = { path = "../qwen3-tts-rs", features = ["hub"] }
 anyhow = "1.0"
-candle-core = "0.9.2"
+candle-core = "0.10.2"
+hound = "3.5"
+async-trait = "0.1"
+regex = "1.10"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+log = "0.4"
 
 [features]
-metal = ["aha/metal"]
-cuda = ["aha/cuda"]
+metal = ["aha/metal", "qwen3-tts/metal"]
+cuda = ["aha/cuda", "qwen3-tts/cuda"]

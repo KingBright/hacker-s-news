@@ -1,26 +1,28 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback } from 'react';
+import Image from 'next/image';
 import { Item } from '../src/types';
+
+const SPEED_OPTIONS: number[] = [1.0, 1.25, 1.5, 1.75, 2.0];
+
+interface SourceApiItem {
+  source_url: string;
+  source_title?: string | null;
+  source_summary?: string | null;
+}
+
+type NavigatorWithAudioSession = Navigator & {
+  audioSession?: {
+    type: 'auto' | 'playback' | 'transient' | 'transient-solo' | 'ambient';
+  };
+};
 
 function formatTime(seconds: number): string {
   if (!seconds || isNaN(seconds)) return "00:00";
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-}
-
-function getRelativeTime(timestamp: number): string {
-  if (!timestamp) return '';
-  const now = Date.now();
-  const diff = now - timestamp * 1000;
-
-  if (diff < 60000) return 'Just now';
-  const mins = Math.floor(diff / 60000);
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return new Date(timestamp * 1000).toLocaleDateString();
 }
 
 // Animated Equalizer Component for Playing State
@@ -53,7 +55,6 @@ export default function Home() {
   const [isBuffering, setIsBuffering] = useState(false);
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [isDragging, setIsDragging] = useState(false);
 
   // Pagination State
   const [page, setPage] = useState(1);
@@ -62,6 +63,7 @@ export default function Home() {
 
   // Persistence State
   const [playedIds, setPlayedIds] = useState<Set<string>>(new Set());
+  const [authRestored, setAuthRestored] = useState(false); // Gate initial fetch until auth is restored
   const [initialized, setInitialized] = useState(false);
   const [resumeTime, setResumeTime] = useState<number | null>(null);
   const [isPlayerExpanded, setIsPlayerExpanded] = useState(false);
@@ -71,13 +73,11 @@ export default function Home() {
   const [showSources, setShowSources] = useState(false);
   const [sources, setSources] = useState<Array<{ url: string, title: string, summary: string }>>([]);
   const [sourcesLoading, setSourcesLoading] = useState(false);
-  const [sourcesItemId, setSourcesItemId] = useState<string | null>(null);
 
   // Playlist and Transcript UI State
   const [playedExpanded, setPlayedExpanded] = useState(false); // Played list collapsed by default
   const [panelView, setPanelView] = useState<'transcript' | 'playlist'>('transcript'); // Default to transcript
   const [transcriptItemId, setTranscriptItemId] = useState<string | null>(null);
-  const [queueIds, setQueueIds] = useState<string[]>([]);
   // Debug State
   const [showDebug, setShowDebug] = useState(false);
   const [debugMinimized, setDebugMinimized] = useState(false);
@@ -86,7 +86,6 @@ export default function Home() {
   // Playback Speed State
   const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
   const [showSpeedPicker, setShowSpeedPicker] = useState(false);
-  const SPEED_OPTIONS = [1.0, 1.25, 1.5, 1.75, 2.0];
 
   // Capture Logs
   useEffect(() => {
@@ -94,7 +93,7 @@ export default function Home() {
     const originalWarn = console.warn;
     const originalError = console.error;
 
-    const addLog = (type: string, args: any[]) => {
+    const addLog = (type: string, args: unknown[]) => {
       const msg = args.map(arg =>
         typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
       ).join(' ');
@@ -134,38 +133,55 @@ export default function Home() {
     };
   }, [isPlayerExpanded, showTranscript, showSources]);
 
-  // Load persistence (History from API + Resume from Local)
+  // Load persistence (History from API + Local fallback + Resume from Local)
   useEffect(() => {
-    // 1. Fetch History from Backend
-    const headers: HeadersInit = {};
+    // 1. Fetch History from Backend (logged-in) or localStorage (guest)
     if (user) {
-      headers['x-user-id'] = user.id;
+      const headers: HeadersInit = { 'x-user-id': user.id };
+      fetch('/api/history', { headers })
+        .then(res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+          return res.json();
+        })
+        .then((data: { item_id: string }[]) => {
+          if (Array.isArray(data)) {
+            const ids = new Set(data.map(i => i.item_id));
+            setPlayedIds(ids);
+          }
+        })
+        .catch(e => console.error("Failed to fetch history", e));
+    } else {
+      // Guest: load played IDs from localStorage
+      try {
+        const stored = localStorage.getItem('freshloop_played_ids');
+        if (stored) {
+          const arr = JSON.parse(stored) as string[];
+          if (Array.isArray(arr)) {
+            setPlayedIds(new Set(arr));
+          }
+        }
+      } catch (e) {
+        console.error("Failed to load local played IDs", e);
+      }
     }
-
-    fetch('/api/history', { headers })
-      .then(res => {
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-        }
-        return res.json();
-      })
-      .then((data: { item_id: string }[]) => {
-        if (Array.isArray(data)) {
-          const ids = new Set(data.map(i => i.item_id));
-          setPlayedIds(ids);
-        }
-      })
-      .catch(e => console.error("Failed to fetch history", e));
 
     // 2. Load Resume State (Keep Local)
     try {
       const storedResumeId = localStorage.getItem('freshloop_resume_id');
       const storedResumeTime = localStorage.getItem('freshloop_resume_time');
-      if (storedResumeId) setCurrentId(storedResumeId);
-      if (storedResumeTime) {
+      if (storedResumeId && storedResumeTime) {
         const t = parseFloat(storedResumeTime);
-        setResumeTime(t);
-        shouldAutoPlay.current = false; // Ensure restored state is PAUSED
+        // Only restore if the progress is meaningful (> 1s) — avoids restoring stale 0-progress entries
+        if (t > 1) {
+          setCurrentId(storedResumeId);
+          setResumeTime(t);
+          shouldAutoPlay.current = false; // Ensure restored state is PAUSED
+        } else {
+          // Stale entry, just restore the current track but no seek
+          setCurrentId(storedResumeId);
+        }
+      } else if (storedResumeId) {
+        setCurrentId(storedResumeId);
       }
     } catch (e) {
       console.error("Failed to load local persistence", e);
@@ -176,13 +192,27 @@ export default function Home() {
 
 
   // Save persistence (Resume State ONLY)
+  // Guard: only save when progress is meaningful and belongs to the current track.
+  // During track transitions, progress may briefly be stale (old track's value).
+  // We verify by checking the audio element's src matches the current item.
   useEffect(() => {
     if (!initialized || !currentId) return;
     if (resumeTime !== null) return;
 
+    // Don't save progress=0 during track transitions (it would overwrite valid resume data)
+    if (progress <= 0.5) return;
+
+    // Verify the audio element is actually playing this track (prevents cross-track contamination)
+    if (audioRef.current) {
+      const currentItem = items.find(i => i.id === currentId);
+      if (currentItem && currentItem.audio_url && audioRef.current.src && !audioRef.current.src.endsWith(currentItem.audio_url)) {
+        return; // Audio src doesn't match currentId — stale state, skip save
+      }
+    }
+
     localStorage.setItem('freshloop_resume_id', currentId);
     localStorage.setItem('freshloop_resume_time', progress.toString());
-  }, [currentId, progress, initialized, resumeTime]);
+  }, [currentId, progress, initialized, resumeTime, items]);
 
   // Restore Auth
   useEffect(() => {
@@ -203,6 +233,9 @@ export default function Home() {
         setPlaybackSpeed(speed);
       }
     }
+
+    // Signal that auth state has been restored (even if no user was found)
+    setAuthRestored(true);
   }, []);
 
   const handleLogin = (u: { id: string; username: string }) => {
@@ -223,6 +256,7 @@ export default function Home() {
   const observerTarget = useRef<HTMLDivElement>(null);
   // Auto-play control: false on init, true after user interaction/queue progress
   const shouldAutoPlay = useRef(false);
+  const pendingPlayback = useRef(false);
   const isFirstLoad = useRef(true);
   // Request ID for race condition prevention in fetch operations
   const fetchRequestId = useRef(0);
@@ -354,50 +388,156 @@ export default function Home() {
     }
   }, [user]);
 
-  // Initial Load (Auto-fetch)
+  // Initial Load (Auto-fetch) — gated on authRestored to prevent fetching without user header
   useEffect(() => {
-    fetchItems(1);
-  }, [fetchItems]);
+    if (!authRestored) return; // Wait for auth restore before fetching
+    setPage(1);
+    setHasMore(true);
+    fetchItems(1, true);
+  }, [fetchItems, authRestored]);
+
+  // Infinite scroll for older pages
+  useEffect(() => {
+    if (!authRestored || page <= 1) return;
+    fetchItems(page);
+  }, [page, fetchItems, authRestored]);
+
+  useEffect(() => {
+    const target = observerTarget.current;
+    if (!target || items.length === 0 || isLoading || !hasMore) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (entry?.isIntersecting && !isLoading && hasMore) {
+          setPage((prev) => prev + 1);
+        }
+      },
+      { rootMargin: '240px 0px' }
+    );
+
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [items.length, isLoading, hasMore]);
 
   const markAsPlayed = useCallback((id: string) => {
     // 1. Optimistic Update
     setPlayedIds(prev => {
       const next = new Set(prev);
       next.add(id);
+
+      // 2a. Guest: persist to localStorage
+      if (!user) {
+        try {
+          // Keep last 200 entries to prevent localStorage bloat
+          const arr = Array.from(next).slice(-200);
+          localStorage.setItem('freshloop_played_ids', JSON.stringify(arr));
+        } catch (e) {
+          console.error("Failed to save local played IDs", e);
+        }
+      }
+
       return next;
     });
 
-    // 2. Backend Sync
-    const headers: HeadersInit = { 'Content-Type': 'application/json' };
-    if (user) headers['x-user-id'] = user.id;
+    // 2b. Logged-in: Backend Sync
+    if (user) {
+      fetch('/api/history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-user-id': user.id },
+        body: JSON.stringify({ item_id: id })
+      }).catch(e => console.error("Failed to sync history", e));
+    }
 
-    fetch('/api/history', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ item_id: id })
-    }).catch(e => console.error("Failed to sync history", e));
+    // 3. Clear resume state for the played item (it's done, no need to resume)
+    try {
+      const storedId = localStorage.getItem('freshloop_resume_id');
+      if (storedId === id) {
+        localStorage.removeItem('freshloop_resume_id');
+        localStorage.removeItem('freshloop_resume_time');
+      }
+    } catch { /* ignore */ }
   }, [user]);
 
-  const playItem = useCallback((id: string, url: string) => {
-    shouldAutoPlay.current = true; // User clicked -> auto-play
-    if (currentId === id) {
-      setIsPlaying(!isPlaying);
-    } else {
-      setCurrentId(id);
-      setIsPlaying(true);
-    }
-  }, [currentId, isPlaying]);
+  const pausePlayback = useCallback(() => {
+    shouldAutoPlay.current = false;
+    pendingPlayback.current = false;
+    setIsPlaying(false);
+  }, []);
 
-  const checkForMore = useCallback(async () => {
+  const attemptPlayback = useCallback(async (reason: string) => {
+    const audio = audioRef.current;
+    if (!audio || !currentId || !audio.src) return;
+
+    try {
+      const playPromise = audio.play();
+      if (playPromise) {
+        await playPromise;
+      }
+
+      pendingPlayback.current = false;
+      setIsBuffering(false);
+      setIsPlaying(true);
+      console.log(`[Audio] Playback active (${reason})`);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        console.warn(`[Audio] play() aborted during source switch (${reason})`);
+        return;
+      }
+
+      if (audio.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        pendingPlayback.current = true;
+        setIsBuffering(true);
+        console.log(`[Audio] Waiting for media readiness before retrying (${reason})`);
+        return;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[Audio] play() rejected (${reason}): ${message}`);
+      pendingPlayback.current = false;
+      setIsPlaying(false);
+    }
+  }, [currentId]);
+
+  const selectTrack = useCallback((id: string, autoplay: boolean) => {
+    shouldAutoPlay.current = autoplay;
+    pendingPlayback.current = autoplay;
+    setProgress(0);
+    setDuration(0);
+    setCurrentId(id);
+    setIsPlaying(autoplay);
+  }, []);
+
+  const playItem = useCallback((id: string) => {
+    if (currentId === id) {
+      if (isPlaying) {
+        pausePlayback();
+      } else {
+        shouldAutoPlay.current = true;
+        pendingPlayback.current = true;
+        setIsPlaying(true);
+        void attemptPlayback('resume-current-track');
+      }
+      return;
+    }
+
+    selectTrack(id, true);
+  }, [attemptPlayback, currentId, isPlaying, pausePlayback, selectTrack]);
+
+  const checkForMore = useCallback(async (): Promise<Item[]> => {
     console.log("[AutoPlay] Checking server for more content...");
     setIsLoading(true);
     try {
       // Try fetching page 1 again to see if new stuff arrived
-      const res = await fetch(`/api/items?page=1&limit=20`);
+      const headers: HeadersInit = {};
+      if (user) {
+        headers['x-user-id'] = user.id;
+      }
+      const res = await fetch(`/api/items?page=1&limit=20`, { headers });
 
       if (!res.ok) {
         console.error("[AutoPlay] Failed to check for more:", res.status);
-        return false;
+        return [];
       }
 
       const data = await res.json();
@@ -405,111 +545,104 @@ export default function Home() {
       // Validate response format
       if (!Array.isArray(data)) {
         console.error("[AutoPlay] Invalid response format");
-        return false;
+        return [];
       }
 
-      let hasNewParams = false;
-      setItems(prev => {
-        const seen = new Set(prev.map(i => i.id));
-        const newItems = data.filter((d: Item) => !seen.has(d.id));
-        if (newItems.length > 0) hasNewParams = true;
-        return [...prev, ...newItems];
-      });
+      const seen = new Set(items.map(i => i.id));
+      const newItems = data
+        .filter((d: Item) => !seen.has(d.id))
+        .sort((a: Item, b: Item) => (a.publish_time || 0) - (b.publish_time || 0));
 
-      return hasNewParams;
+      if (newItems.length > 0) {
+        setItems(prev => {
+          const prevSeen = new Set(prev.map(i => i.id));
+          return [...prev, ...newItems.filter(item => !prevSeen.has(item.id))];
+        });
+      }
+
+      return newItems;
     } catch (e) {
       console.error("[AutoPlay] Error checking for more:", e);
-      return false;
+      return [];
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [items, user]);
 
   const playNext = useCallback(async () => {
     console.log("[AutoPlay] playNext triggered for", currentId);
 
-    // 1. Mark current as played (moves it to History list)
+    const sortedPending = items
+      .filter(i => !playedIds.has(i.id))
+      .sort((a, b) => (a.publish_time || 0) - (b.publish_time || 0));
+    const currentIndex = currentId ? sortedPending.findIndex(item => item.id === currentId) : -1;
+
     if (currentId) {
       markAsPlayed(currentId);
     }
 
-    // 2. Determine Next Item
-    // Since 'pendingItems' updates immediately upon 'markAsPlayed' (React state), 
-    // inside this callback we might still see the OLD derived state if we rely on closure 'pendingItems'.
-    // However, we need to decide NEXT based on the logical list.
-    // The 'pendingItems' variable in scope is from the *last render*. 
-    // If currentId was in pendingItems, it's about to be removed.
-    // So the next item is logically the one *after* currentId in the sorted pending list.
-    // OR, if pendingItems is Old->New, and we just finished currentId (which should be at top),
-    // then the next one is indeed pendingItems[1] (if current is 0) or simply pendingItems[0] of the NEXT render.
+    const nextItem = currentIndex >= 0
+      ? sortedPending[currentIndex + 1] ?? null
+      : sortedPending[0] ?? null;
 
-    // BETTER APPROACH: Find the candidate from the generic 'items' pool using the same sort logic,
-    // excluding the one we just finished.
-
-    // We can't rely on 'pendingItems' in this closure updating instantly.
-    // Manually filter:
-    const nextCandidates = items
-      .filter(i => !playedIds.has(i.id) && i.id !== currentId) // Remove played + just finished
-      .sort((a, b) => (a.publish_time || 0) - (b.publish_time || 0)); // Old->New
-
-    if (nextCandidates.length > 0) {
-      const nextId = nextCandidates[0].id;
-      console.log("[AutoPlay] Next item found:", nextId);
-      shouldAutoPlay.current = true; // Playlist flow -> auto-play
-      setCurrentId(nextId);
-      setIsPlaying(true);
-    } else {
-      console.log("[AutoPlay] Local queue empty. Checking server...");
-      // Attempt to fetch more
-      const foundNew = await checkForMore();
-      if (!foundNew) {
-        console.log("[AutoPlay] No new content from server. Stop.");
-        setIsPlaying(false);
-        // Don't clear currentId so player stays visible (as 'finished' state)
-      } else {
-        // If found new, we need to trigger playNext again? 
-        // Or let the user wait? 
-        // Ideally we auto-play the new stuff.
-        // We can't recurse easily here without fresh state.
-        // Just set isPlaying(false) for now, or try to find it blindly?
-        // Let's rely on the user or a simpler re-check.
-        setIsPlaying(false);
-      }
+    if (nextItem) {
+      console.log("[AutoPlay] Next item found:", nextItem.id);
+      selectTrack(nextItem.id, true);
+      return;
     }
-  }, [currentId, items, playedIds, markAsPlayed, checkForMore]);
+
+    console.log("[AutoPlay] Local queue empty. Checking server...");
+    const newItems = await checkForMore();
+
+    if (newItems.length > 0) {
+      console.log("[AutoPlay] New remote item found:", newItems[0].id);
+      selectTrack(newItems[0].id, true);
+      return;
+    }
+
+    console.log("[AutoPlay] No new content from server. Stop.");
+    pausePlayback();
+  }, [checkForMore, currentId, items, markAsPlayed, pausePlayback, playedIds, selectTrack]);
 
   const playPrev = useCallback(() => {
-    // History logic: New -> Old. 
-    // Prev implies "Go back to the one I just heard" -> Top of Played List?
-    // Or "Previous" in the Pending List? 
-    // Standard player: Prev = Start of track OR Previous Track.
-    // In this flow, "Previous" likely means "The most recently played item".
+    const chronologicalItems = [...items].sort((a, b) => (a.publish_time || 0) - (b.publish_time || 0));
+    const currentIndex = currentId ? chronologicalItems.findIndex(item => item.id === currentId) : -1;
+
+    if (currentIndex > 0) {
+      selectTrack(chronologicalItems[currentIndex - 1].id, true);
+      return;
+    }
+
     const historyCandidates = items
       .filter(i => playedIds.has(i.id))
-      .sort((a, b) => (b.publish_time || 0) - (a.publish_time || 0)); // New -> Old
+      .sort((a, b) => (b.publish_time || 0) - (a.publish_time || 0));
 
-    // Only fallback if nothing is selected (e.g. fresh load without persistence)
-    // AND never auto-play, just select it
     if (!currentId && historyCandidates.length > 0) {
-      setCurrentId(historyCandidates[0].id);
-      setIsPlaying(false);
+      selectTrack(historyCandidates[0].id, true);
     }
-  }, [items, playedIds, currentId]);
+  }, [currentId, items, playedIds, selectTrack]);
 
-  const togglePlay = () => {
-    setIsPlaying(!isPlaying);
-  };
+  const togglePlay = useCallback(() => {
+    if (isPlaying) {
+      pausePlayback();
+      return;
+    }
+
+    shouldAutoPlay.current = true;
+    pendingPlayback.current = true;
+    setIsPlaying(true);
+    void attemptPlayback('toggle-play');
+  }, [attemptPlayback, isPlaying, pausePlayback]);
 
   // Fetch sources for an item
   const fetchSources = async (itemId: string) => {
     setSourcesLoading(true);
-    setSourcesItemId(itemId);
     setShowSources(true);
     try {
       const res = await fetch(`/api/items/${itemId}/sources`);
       if (res.ok) {
-        const data = await res.json();
-        setSources(data.map((s: any) => ({
+        const data: SourceApiItem[] = await res.json();
+        setSources(data.map((s) => ({
           url: s.source_url,
           title: s.source_title || 'Untitled',
           summary: s.source_summary || ''
@@ -528,20 +661,24 @@ export default function Home() {
     // Block updates if we are waiting to resume seeking, to prevent overwriting saved progress with 0
     if (resumeTime !== null) return;
 
-    if (audioRef.current && !isDragging) {
+    if (audioRef.current) {
       setProgress(audioRef.current.currentTime);
     }
   };
 
-  const handleLoadedMetadata = () => {
+  const handleLoadedMetadata = useCallback(() => {
     if (audioRef.current) {
       setDuration(audioRef.current.duration);
       if (resumeTime !== null) {
         audioRef.current.currentTime = resumeTime;
         setResumeTime(null);
       }
+
+      if (pendingPlayback.current) {
+        void attemptPlayback('loaded-metadata');
+      }
     }
-  };
+  }, [attemptPlayback, resumeTime]);
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const time = parseFloat(e.target.value);
@@ -551,71 +688,84 @@ export default function Home() {
     }
   };
 
-  const skipTime = (seconds: number) => {
+  const skipTime = useCallback((seconds: number) => {
     if (audioRef.current) {
       const newTime = audioRef.current.currentTime + seconds;
       audioRef.current.currentTime = Math.max(0, Math.min(newTime, duration));
       setProgress(audioRef.current.currentTime);
     }
-  };
+  }, [duration]);
 
-  // Audio Control Logic
+  // Keep the audio session in "playback" mode when the browser supports it.
   useEffect(() => {
-    if (!audioRef.current) return;
+    const nav = navigator as NavigatorWithAudioSession;
+    if (!nav.audioSession) return;
 
-    if (currentId) {
-      const item = items.find(i => i.id === currentId);
-      if (item && item.audio_url) {
-        // Only update source if it has changed to prevent unwanted reloading
-        const currentSrc = audioRef.current.getAttribute('src');
-        if (currentSrc !== item.audio_url) {
-          audioRef.current.src = item.audio_url;
-          // Reset progress only when changing tracks
-          setProgress(0);
-          // Apply playback speed to new track
-          audioRef.current.playbackRate = playbackSpeed;
-          // Resume time handling is done in onLoadedMetadata
+    try {
+      nav.audioSession.type = 'playback';
+      console.log('[Audio] navigator.audioSession.type set to playback');
+    } catch (error) {
+      console.warn('[Audio] Failed to set navigator.audioSession.type', error);
+    }
+  }, []);
 
-          // Only auto-play if explicitly triggered by user action or playlist continuation
-          // On page load/refresh (restoration), we want to load the state but stay paused
+  // Audio source management
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
 
-          if (isFirstLoad.current) {
-            console.log("[Audio] First load/restore detected. Suppressing auto-play.");
-            setIsPlaying(false);
-            // Nuclear option: Force pause again after a tick to fight browser auto-resume
-            setTimeout(() => {
-              if (audioRef.current) audioRef.current.pause();
-            }, 0);
-            isFirstLoad.current = false;
-          } else if (shouldAutoPlay.current) {
-            audioRef.current.play()
-              .then(() => setIsPlaying(true))
-              .catch(e => console.error("Play failed", e));
-          } else {
-            setIsPlaying(false);
-          }
-        }
-      } else {
-        // currentId is set but item invalid -> Stop zombie audio
-        if (isPlaying) {
-          audioRef.current.pause();
-          setIsPlaying(false);
-        }
-      }
-    } else {
-      audioRef.current.pause();
+    if (!currentId) {
+      audio.pause();
+      pendingPlayback.current = false;
+      setIsBuffering(false);
+      return;
+    }
+
+    const item = items.find(i => i.id === currentId);
+    if (!item?.audio_url) {
+      console.warn('[Audio] Missing audio for current item', currentId);
+      pausePlayback();
+      return;
+    }
+
+    audio.playbackRate = playbackSpeed;
+
+    const currentSrc = audio.getAttribute('src');
+    if (currentSrc === item.audio_url) {
+      return;
+    }
+
+    setProgress(0);
+    setDuration(0);
+    setIsBuffering(true);
+    audio.pause();
+    audio.src = item.audio_url;
+    audio.load();
+
+    if (isFirstLoad.current && !shouldAutoPlay.current) {
+      console.log('[Audio] Restored track loaded in paused state.');
+      pendingPlayback.current = false;
       setIsPlaying(false);
     }
-  }, [currentId, items]);
 
+    isFirstLoad.current = false;
+  }, [currentId, items, pausePlayback, playbackSpeed]);
+
+  // React state remains the single source of truth for playback intent.
   useEffect(() => {
-    if (!audioRef.current) return;
+    const audio = audioRef.current;
+    if (!audio || !currentId) return;
+
     if (isPlaying) {
-      audioRef.current.play().catch(e => console.error("Resume failed", e));
-    } else {
-      audioRef.current.pause();
+      shouldAutoPlay.current = true;
+      pendingPlayback.current = true;
+      void attemptPlayback('playback-state-sync');
+      return;
     }
-  }, [isPlaying]);
+
+    pendingPlayback.current = false;
+    audio.pause();
+  }, [attemptPlayback, currentId, isPlaying]);
 
   // Apply Playback Speed
   useEffect(() => {
@@ -624,6 +774,86 @@ export default function Home() {
     }
     localStorage.setItem('freshloop_playback_speed', playbackSpeed.toString());
   }, [playbackSpeed]);
+
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+
+    const mediaSession = navigator.mediaSession;
+    const item = items.find(i => i.id === currentId);
+
+    if (!item) {
+      mediaSession.metadata = null;
+      return;
+    }
+
+    mediaSession.metadata = new MediaMetadata({
+      title: item.title.replace(/^【.*?】/, '').trim() || 'FreshLoop Briefing',
+      artist: item.category || 'FreshLoop',
+      album: 'FreshLoop Daily Briefing',
+      artwork: [
+        { src: '/logo.png', sizes: '192x192', type: 'image/png' },
+        { src: '/logo.png', sizes: '512x512', type: 'image/png' },
+      ],
+    });
+  }, [currentId, items]);
+
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+
+    navigator.mediaSession.playbackState = currentId
+      ? (isPlaying ? 'playing' : 'paused')
+      : 'none';
+  }, [currentId, isPlaying]);
+
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+
+    const mediaSession = navigator.mediaSession;
+    const setHandler = (action: MediaSessionAction, handler: MediaSessionActionHandler | null) => {
+      try {
+        mediaSession.setActionHandler(action, handler);
+      } catch (error) {
+        console.warn(`[MediaSession] Failed to register ${action}`, error);
+      }
+    };
+
+    setHandler('play', () => {
+      shouldAutoPlay.current = true;
+      pendingPlayback.current = true;
+      setIsPlaying(true);
+      void attemptPlayback('media-session-play');
+    });
+    setHandler('pause', () => {
+      pausePlayback();
+    });
+    setHandler('nexttrack', () => {
+      void playNext();
+    });
+    setHandler('previoustrack', () => {
+      playPrev();
+    });
+    setHandler('seekbackward', (details) => {
+      skipTime(-(details.seekOffset ?? 10));
+    });
+    setHandler('seekforward', (details) => {
+      skipTime(details.seekOffset ?? 30);
+    });
+    setHandler('seekto', (details) => {
+      if (!audioRef.current || details.seekTime === undefined) return;
+      audioRef.current.currentTime = details.seekTime;
+      setProgress(audioRef.current.currentTime);
+    });
+
+    return () => {
+      setHandler('play', null);
+      setHandler('pause', null);
+      setHandler('nexttrack', null);
+      setHandler('previoustrack', null);
+      setHandler('seekbackward', null);
+      setHandler('seekforward', null);
+      setHandler('seekto', null);
+    };
+  }, [attemptPlayback, pausePlayback, playNext, playPrev, skipTime]);
 
   // Debug Trigger Logic
   const debugClicks = useRef(0);
@@ -646,23 +876,15 @@ export default function Home() {
     }
   };
 
-  // Circular Progress Calculation
-  const circleRadius = 22;
-  const circumference = 2 * Math.PI * circleRadius; // ~138
-  const progressPercent = duration > 0 ? (progress / duration) : 0;
-  const strokeDashoffset = circumference - (progressPercent * circumference);
-
   const currentItem = items.find(i => i.id === currentId);
   const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
   const unreadCount = items.filter(i => !playedIds.has(i.id)).length;
-  const lastUpdated = items.length > 0 && items[0].publish_time
-    ? `Updated ${getRelativeTime(items[0].publish_time)}`
-    : (items.length > 0 ? 'Updated recently' : 'No content');
 
   return (
     <div className="relative flex min-h-screen w-full flex-col overflow-x-hidden max-w-md mx-auto shadow-2xl pb-32 bg-background-dark text-white font-display">
       <audio
         ref={audioRef}
+        preload="auto"
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onEnded={() => {
@@ -683,15 +905,20 @@ export default function Home() {
             }
           }
           console.log("[Audio] Dispatching playNext (Valid Completion)");
-          playNext();
+          void playNext();
         }}
-        onPlay={() => setIsPlaying(true)}
-        onPause={() => setIsPlaying(false)}
         onWaiting={() => setIsBuffering(true)}
-        onCanPlay={() => setIsBuffering(false)}
-        onPlaying={() => setIsBuffering(false)}
+        onCanPlay={() => {
+          setIsBuffering(false);
+          if (pendingPlayback.current) {
+            void attemptPlayback('can-play');
+          }
+        }}
+        onPlaying={() => {
+          pendingPlayback.current = false;
+          setIsBuffering(false);
+        }}
         className="hidden"
-        autoPlay
         playsInline
       />
 
@@ -701,7 +928,7 @@ export default function Home() {
           <div>
             <div className="flex items-center gap-3" onClick={handleDebugTrigger}>
               <div className="size-10 rounded-xl overflow-hidden shadow-lg ring-1 ring-white/10">
-                <img src="/logo.png" alt="FreshLoop Logo" className="w-full h-full object-cover" />
+                <Image src="/logo.png" alt="FreshLoop Logo" width={40} height={40} className="w-full h-full object-cover" />
               </div>
               <h1 className="text-[28px] font-bold leading-none tracking-tight text-white">FreshLoop</h1>
               {showDebug && <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />}
@@ -752,7 +979,11 @@ export default function Home() {
                   <span className="text-sm font-medium text-white/70">Tailored for you</span>
                 </div>
                 <button
-                  onClick={() => fetchItems(1, true)}
+                  onClick={() => {
+                    setPage(1);
+                    setHasMore(true);
+                    fetchItems(1, true);
+                  }}
                   disabled={isLoading}
                   className="h-10 w-10 ml-2 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white transition-colors active:scale-95 disabled:opacity-50"
                   title="Refresh Feed"
@@ -772,7 +1003,7 @@ export default function Home() {
 
           <div className="flex flex-col gap-3">
             {/* Main Feed: Pending Items (Old -> New) */}
-            {pendingItems.map((item, index) => {
+            {pendingItems.map((item) => {
               const isActive = currentId === item.id;
               // ... (Use same display logic)
               let category = item.category || 'News';
@@ -791,7 +1022,7 @@ export default function Home() {
               return (
                 <div
                   key={item.id}
-                  onClick={() => item.audio_url && playItem(item.id, item.audio_url)}
+                  onClick={() => item.audio_url && playItem(item.id)}
                   className={`
                       group flex items-center gap-4 bg-surface-dark p-4 rounded-2xl ring-1 shadow-sm hover:shadow-md transition-all cursor-pointer active:scale-[0.99]
                       ${isActive ? 'ring-primary' : 'ring-white/5 hover:ring-primary/50'}
@@ -997,7 +1228,7 @@ export default function Home() {
                                 const dateStr = dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                                 const timeStr = dateObj.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
                                 return (
-                                  <div key={item.id} onClick={() => playItem(item.id, item.audio_url || '')}
+                                  <div key={item.id} onClick={() => playItem(item.id)}
                                     className={`flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-colors ${isActive ? 'bg-primary/10' : 'hover:bg-white/5'}`}>
                                     <div className={`flex items-center justify-center size-10 rounded-lg shrink-0 ${isActive ? 'bg-primary text-black' : 'bg-white/5 text-white/40'}`}>
                                       {isActive && isPlaying ? <AnimatedEqualizer size="sm" /> : <span className="material-symbols-outlined text-xl">graphic_eq</span>}
@@ -1025,7 +1256,7 @@ export default function Home() {
                               {playedExpanded && (
                                 <div className="space-y-1 mt-2 opacity-60">
                                   {playedItems.slice(0, 20).map(item => (
-                                    <div key={item.id} onClick={() => playItem(item.id, item.audio_url || '')} className="flex items-center gap-3 p-3 rounded-xl cursor-pointer hover:bg-white/5">
+                                    <div key={item.id} onClick={() => playItem(item.id)} className="flex items-center gap-3 p-3 rounded-xl cursor-pointer hover:bg-white/5">
                                       <span className="material-symbols-outlined text-white/20 text-lg">replay</span>
                                       <h4 className="text-sm font-medium truncate text-white/40">{item.title}</h4>
                                     </div>
@@ -1255,4 +1486,3 @@ export default function Home() {
     </div >
   );
 }
-

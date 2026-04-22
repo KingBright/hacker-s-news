@@ -8,6 +8,9 @@ PROJECT_ROOT="$SCRIPT_DIR/.."
 # Change to the project root
 cd "$PROJECT_ROOT"
 
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/backend/target-local}"
+export CARGO_TARGET_DIR
+
 # 1. Clean and create the distribution directory
 echo "Cleaning up and creating the distribution directory..."
 rm -rf dist
@@ -21,8 +24,8 @@ cd ..
 
 # 3. Copy the backend binaries
 echo "Copying backend binaries..."
-cp backend/target/release/nexus dist/
-cp backend/target/release/cortex dist/
+cp "$CARGO_TARGET_DIR/release/nexus" dist/
+cp "$CARGO_TARGET_DIR/release/cortex" dist/
 
 # 4. Build the frontend
 echo "Building the frontend..."

@@ -6,6 +6,18 @@ import { Item } from '../../src/types';
 // Session timeout in milliseconds (1 hour)
 const SESSION_TIMEOUT_MS = 60 * 60 * 1000;
 
+interface AdminUser {
+    id: string;
+    username: string;
+    created_at: number;
+}
+
+type ItemUpdate = Partial<Pick<Item, 'rating' | 'tags' | 'is_deleted'>>;
+
+function getErrorMessage(error: unknown, fallback: string) {
+    return error instanceof Error ? error.message : fallback;
+}
+
 interface SessionData {
     key: string;
     user: string;
@@ -21,14 +33,14 @@ export default function AdminPage() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
-    const [users, setUsers] = useState<any[]>([]);
+    const [users, setUsers] = useState<AdminUser[]>([]);
     const [newUserStart, setNewUserStart] = useState('');
     const [createdCreds, setCreatedCreds] = useState<{ username: string, password: string } | null>(null);
 
     const [copiedId, setCopiedId] = useState<string | null>(null);
 
     // Check and restore session from sessionStorage
-    const checkSession = useCallback(() => {
+    const checkSession = useCallback((): SessionData | null => {
         try {
             const sessionData = sessionStorage.getItem('nexus_session');
             if (sessionData) {
@@ -37,8 +49,7 @@ export default function AdminPage() {
                 if (Date.now() < session.expiresAt) {
                     setPassword(session.key);
                     setUsername(session.user);
-                    setIsAuthenticated(true);
-                    return session.key;
+                    return session;
                 } else {
                     // Session expired, clear it
                     sessionStorage.removeItem('nexus_session');
@@ -51,13 +62,12 @@ export default function AdminPage() {
         return null;
     }, []);
 
-    useEffect(() => {
-        const storedKey = checkSession();
-        if (storedKey) {
-            fetchItems(storedKey);
-            fetchUsers(storedKey);
-        }
-    }, [checkSession]);
+    const validateAdminKey = useCallback(async (key: string) => {
+        const res = await fetch('/api/admin/users', {
+            headers: { 'X-API-KEY': key }
+        });
+        return res.ok;
+    }, []);
 
     // Set up session expiration check
     useEffect(() => {
@@ -76,22 +86,34 @@ export default function AdminPage() {
         }
     }, [isAuthenticated]);
 
-    const handleLogin = () => {
+    const handleLogin = async () => {
         setError(null);
-        if (username === 'admin' && password) {
+        if (!username.trim() || !password.trim()) {
+            setError("Username and API key are required.");
+            return;
+        }
+
+        try {
+            const valid = await validateAdminKey(password);
+            if (!valid) {
+                setError("Invalid API key.");
+                return;
+            }
+
             // Use sessionStorage instead of localStorage for better security
             // Session expires after SESSION_TIMEOUT_MS
             const session: SessionData = {
                 key: password,
-                user: username,
+                user: username.trim(),
                 expiresAt: Date.now() + SESSION_TIMEOUT_MS
             };
             sessionStorage.setItem('nexus_session', JSON.stringify(session));
             setIsAuthenticated(true);
-            fetchItems(password);
+            fetchItems();
             fetchUsers(password);
-        } else {
-            setError("Invalid Username or Password. (Try user: admin)");
+        } catch (e) {
+            console.error("Failed to validate admin login", e);
+            setError("Failed to validate API key.");
         }
     };
 
@@ -119,10 +141,14 @@ export default function AdminPage() {
             headers: { 'X-API-KEY': key }
         })
             .then(res => {
+                if (res.status === 401) {
+                    handleLogout();
+                    throw new Error('HTTP 401');
+                }
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 return res.json();
             })
-            .then(data => setUsers(data || []))
+            .then((data: AdminUser[]) => setUsers(data || []))
             .catch(e => {
                 console.error("Failed to fetch users", e);
                 setError("Failed to fetch users. Session may have expired.");
@@ -152,12 +178,12 @@ export default function AdminPage() {
             setCreatedCreds({ username: data.username, password: data.password_generated });
             setNewUserStart('');
             fetchUsers(password);
-        } catch (e: any) {
-            setError(e.message || "Failed to create user");
+        } catch (e: unknown) {
+            setError(getErrorMessage(e, "Failed to create user"));
         }
     };
 
-    const fetchItems = useCallback((key: string) => {
+    const fetchItems = useCallback(() => {
         setLoading(true);
         setError(null);
         fetch('/api/items?limit=100')
@@ -176,7 +202,37 @@ export default function AdminPage() {
             });
     }, []);
 
-    const updateItem = async (id: string, updates: any) => {
+    useEffect(() => {
+        const restoreSession = async () => {
+            const session = checkSession();
+            if (!session) return;
+
+            try {
+                const valid = await validateAdminKey(session.key);
+                if (!valid) {
+                    sessionStorage.removeItem('nexus_session');
+                    setPassword('');
+                    setUsername('');
+                    setError('Admin session expired. Please login again.');
+                    return;
+                }
+
+                setIsAuthenticated(true);
+                fetchItems();
+                fetchUsers(session.key);
+            } catch (e) {
+                console.error("Failed to validate restored admin session", e);
+                sessionStorage.removeItem('nexus_session');
+                setPassword('');
+                setUsername('');
+                setError('Failed to restore admin session. Please login again.');
+            }
+        };
+
+        restoreSession();
+    }, [checkSession, fetchItems, fetchUsers, validateAdminKey]);
+
+    const updateItem = async (id: string, updates: ItemUpdate) => {
         setError(null);
         try {
             const res = await fetch(`/api/admin/items/${id}`, {
@@ -203,8 +259,8 @@ export default function AdminPage() {
                 setItems(prev => prev.filter(i => i.id !== id));
             }
 
-        } catch (err: any) {
-            setError('Failed to update item: ' + err.message);
+        } catch (err: unknown) {
+            setError('Failed to update item: ' + getErrorMessage(err, 'Unknown error'));
         }
     };
 
@@ -229,8 +285,8 @@ export default function AdminPage() {
             }
 
             alert('Regeneration started. Please allow a few minutes for processing.');
-        } catch (err: any) {
-            setError('Failed to start regeneration: ' + err.message);
+        } catch (err: unknown) {
+            setError('Failed to start regeneration: ' + getErrorMessage(err, 'Unknown error'));
         }
     };
 

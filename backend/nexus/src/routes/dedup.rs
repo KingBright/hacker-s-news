@@ -38,17 +38,26 @@ pub async fn check_files(
         return Json(CheckResponse { existing_urls: vec![] }).into_response();
     }
 
-    // Construct query with standard SQL (Note: sqlx doesn't support array binding easily for SQLite in simple query)
-    // We will loop or construct dynamic query. For simplicity and SQLite, let's just loop or use IN clause with dynamic parameters.
-    // Given the list might be small (news batch), dynamic IN clause is fine.
-    
+    // Query both source_items (legacy dedup table) and items.original_url (authoritative content table).
     let placeholders: Vec<String> = payload.urls.iter().map(|_| "?".to_string()).collect();
     let query = format!(
-        "SELECT url FROM source_items WHERE url IN ({})",
+        r#"
+        SELECT url FROM source_items WHERE url IN ({})
+        UNION
+        SELECT original_url AS url
+        FROM items
+        WHERE original_url IS NOT NULL
+          AND original_url != ''
+          AND original_url IN ({})
+        "#,
+        placeholders.join(","),
         placeholders.join(",")
     );
 
     let mut query_builder = sqlx::query_as::<_, (String,)>(&query);
+    for url in &payload.urls {
+        query_builder = query_builder.bind(url);
+    }
     for url in &payload.urls {
         query_builder = query_builder.bind(url);
     }

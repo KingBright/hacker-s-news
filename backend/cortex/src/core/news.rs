@@ -14,7 +14,7 @@ use tokio::time::{self, Duration};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use sysinfo::{System, get_current_pid};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 struct ItemAnalysis {
     title: String,    // Cleaned/Translated title
     summary: String,  // 2-sentence summary
@@ -180,14 +180,8 @@ async fn run_one_cycle(
             item.title, clean_desc, topics_str, category_names_str
         );
 
-        match llm.chat(&analysis_prompt, false).await {
-            Ok(json_str) => {
-                let json_clean = json_str.trim().trim_matches('`').trim();
-                let start = json_clean.find('{').unwrap_or(0);
-                let end = json_clean.rfind('}').unwrap_or(json_clean.len()) + 1;
-                let potential_json = &json_clean[start..end];
-
-                if let Ok(analysis) = serde_json::from_str::<ItemAnalysis>(potential_json) {
+        match llm.chat_json::<ItemAnalysis>(&analysis_prompt, "item_analysis", false).await {
+            Ok(analysis) => {
                     if analysis.category == "广告"
                         || analysis.category == "Advertisement"
                         || analysis.score < 6
@@ -258,9 +252,12 @@ async fn run_one_cycle(
                         }
                         Err(e) => log::error!("Failed to push with clustering: {}", e),
                     }
-                }
             }
-            Err(e) => log::warn!("LLM analysis failed: {}", e),
+            Err(e) => {
+                log::warn!("LLM analysis failed for '{}': {}", item.title, e);
+                let buf = buffer.lock().await;
+                buf.mark_link_processed(&item.link).ok();
+            }
         }
     }
 
@@ -543,8 +540,18 @@ struct TriggerResponse {
     message: String,
 }
 
+#[derive(serde::Deserialize, Default)]
+struct TriggerQuery {
+    /// When true, skip RSS fetching and LLM clustering — go straight to
+    /// aggregator.try_process() which generates scripts + TTS from
+    /// already-buffered clusters.
+    #[serde(default)]
+    flush_only: bool,
+}
+
 async fn handle_trigger(
     State(state): State<Arc<TriggerState>>,
+    axum::extract::Query(query): axum::extract::Query<TriggerQuery>,
 ) -> Json<TriggerResponse> {
     // Prevent concurrent triggers
     {
@@ -559,7 +566,13 @@ async fn handle_trigger(
     }
 
     let now = (state.get_now)();
-    log::info!("[Trigger API] Manual cycle triggered at {}", now);
+    let flush_only = query.flush_only;
+
+    if flush_only {
+        log::info!("[Trigger API] Flush-only triggered at {} (skipping RSS+LLM, running TTS directly)", now);
+    } else {
+        log::info!("[Trigger API] Manual cycle triggered at {}", now);
+    }
 
     let config = state.config.clone();
     let llm = state.llm.clone();
@@ -570,17 +583,24 @@ async fn handle_trigger(
 
     // Run in background so the HTTP response returns immediately
     tokio::spawn(async move {
-        let result = run_one_cycle(config, llm, nexus, aggregator, buffer, now).await;
+        let result = if flush_only {
+            // Skip RSS + LLM, directly process buffered clusters
+            log::info!("[Flush-Only] Running aggregator.try_process() on existing buffered data...");
+            aggregator.try_process().await
+        } else {
+            run_one_cycle(config, llm, nexus, aggregator, buffer, now).await
+        };
         match &result {
-            Ok(()) => log::info!("[Trigger API] Manual cycle completed successfully"),
-            Err(e) => log::error!("[Trigger API] Manual cycle failed: {}", e),
+            Ok(()) => log::info!("[Trigger API] {} completed successfully", if flush_only { "Flush-only" } else { "Manual cycle" }),
+            Err(e) => log::error!("[Trigger API] {} failed: {}", if flush_only { "Flush-only" } else { "Manual cycle" }, e),
         }
         *state_clone.running.lock().await = false;
     });
 
+    let mode = if flush_only { "Flush-only (TTS only)" } else { "Full cycle" };
     Json(TriggerResponse {
         success: true,
-        message: format!("Cycle triggered at {}. Running in background.", now),
+        message: format!("{} triggered at {}. Running in background.", mode, now),
     })
 }
 

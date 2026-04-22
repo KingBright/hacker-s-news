@@ -6,12 +6,20 @@
   --color-background-dark: #050a07;
   --color-surface-dark: #1a3224;
   --color-surface-highlight: #244732;
-  --font-display: "Work Sans", sans-serif;
+  --font-display: var(--font-work-sans), sans-serif;
 }
 
 :root {
   --background: var(--color-background-dark);
   --foreground: #ffffff;
+}
+
+@font-face {
+  font-family: "Material Symbols Outlined";
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: swap;
+  src: url("/fonts/material-symbols-outlined.woff2") format("woff2");
 }
 
 /* Force dark mode if class is present on html, but Tailwind handles .dark: selector automatically with darkMode: 'class' (default in v4 if using .dark class?)
@@ -89,6 +97,23 @@ body {
 
 /* Prevent browser dictionary/quick answers on icon fonts */
 .material-symbols-outlined {
+  font-family: "Material Symbols Outlined";
+  font-style: normal;
+  font-weight: 400;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  direction: ltr;
+  font-feature-settings: 'liga';
+  -webkit-font-smoothing: antialiased;
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
   user-select: none;
   -webkit-user-select: none;
+}
+
+.material-symbols-outlined.filled {
+  font-variation-settings: 'FILL' 1, 'wght' 400, 'GRAD' 0, 'opsz' 24;
 }

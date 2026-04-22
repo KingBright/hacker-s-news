@@ -51,6 +51,7 @@ async fn main() {
     let admin_index = format!("{}/admin.html", static_dir);
 
     let app = Router::new()
+        .route("/api/health", get(|| async { "ok" }))
         .route("/api/items", get(routes::items::list_items))
         .route("/api/internal/items", post(routes::items::create_item))
         .route("/api/internal/items/multipart", post(routes::items::create_item_multipart))

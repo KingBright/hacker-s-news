@@ -6,7 +6,6 @@ use axum::{
 use serde_json::json;
 use std::path::Path;
 use tokio::fs;
-use uuid::Uuid;
 
 use crate::AppState;
 
