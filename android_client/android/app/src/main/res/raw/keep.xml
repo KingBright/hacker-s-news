@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/ic_stat_freshloop,@drawable/ic_notification,@drawable/fln_play,@drawable/fln_pause,@drawable/fln_skip_next,@drawable/fln_skip_previous,@drawable/fln_fast_forward,@drawable/fln_rewind,@drawable/freshloop_button_bg,@layout/freshloop_notification_player" />

@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/fln_root"
+    android:layout_width="match_parent"
+    android:layout_height="48dp"
+    android:background="@android:color/transparent"
+    android:orientation="vertical"
+    android:paddingStart="8dp"
+    android:paddingTop="2dp"
+    android:paddingEnd="8dp"
+    android:paddingBottom="2dp">
+
+    <TextView
+        android:id="@+id/fln_title"
+        android:layout_width="match_parent"
+        android:layout_height="17dp"
+        android:ellipsize="end"
+        android:includeFontPadding="false"
+        android:maxLines="1"
+        android:text=""
+        android:textColor="#151A17"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="27dp"
+        android:layout_marginTop="2dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginEnd="5dp"
+            android:gravity="center_vertical"
+            android:orientation="vertical"
+            android:layout_weight="1">
+
+            <TextView
+                android:id="@+id/fln_subtitle"
+                android:layout_width="match_parent"
+                android:layout_height="12dp"
+                android:ellipsize="end"
+                android:includeFontPadding="false"
+                android:maxLines="1"
+                android:text=""
+                android:textColor="#68716C"
+                android:textSize="9sp" />
+
+            <ProgressBar
+                android:id="@+id/fln_progress"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="2dp"
+                android:layout_marginTop="4dp"
+                android:indeterminate="false"
+                android:max="1000"
+                android:progress="0"
+                android:progressBackgroundTint="#D7DED9"
+                android:progressTint="#19A958" />
+        </LinearLayout>
+
+        <ImageButton
+            android:id="@+id/fln_previous"
+            android:layout_width="24dp"
+            android:layout_height="27dp"
+            android:background="@android:color/transparent"
+            android:padding="6dp"
+            android:src="@drawable/fln_skip_previous" />
+
+        <ImageButton
+            android:id="@+id/fln_rewind"
+            android:layout_width="24dp"
+            android:layout_height="27dp"
+            android:background="@android:color/transparent"
+            android:padding="6dp"
+            android:src="@drawable/fln_rewind" />
+
+        <ImageButton
+            android:id="@+id/fln_play_pause"
+            android:layout_width="28dp"
+            android:layout_height="28dp"
+            android:background="@drawable/freshloop_button_bg"
+            android:padding="7dp"
+            android:src="@drawable/fln_pause" />
+
+        <ImageButton
+            android:id="@+id/fln_fast_forward"
+            android:layout_width="24dp"
+            android:layout_height="27dp"
+            android:background="@android:color/transparent"
+            android:padding="6dp"
+            android:src="@drawable/fln_fast_forward" />
+
+        <ImageButton
+            android:id="@+id/fln_next"
+            android:layout_width="24dp"
+            android:layout_height="27dp"
+            android:background="@android:color/transparent"
+            android:padding="6dp"
+            android:src="@drawable/fln_skip_next" />
+    </LinearLayout>
+</LinearLayout>
