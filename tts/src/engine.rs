@@ -1,19 +1,19 @@
-use anyhow::{Result, anyhow};
-use candle_core::Device;
+use crate::adapters::{Qwen3Adapter, VoxCpmAdapter};
 use crate::config::{TtsConfig, VoicePrompt};
-use crate::adapters::{VoxCpmAdapter, Qwen3Adapter};
+use anyhow::{anyhow, Result};
+use candle_core::Device;
 
 #[async_trait::async_trait]
 pub trait TtsEngine: Send + Sync {
     /// Provide a Voice Prompt ahead of time to build cache (e.g. for long paragraphs)
     fn cache_voice_prompt(&mut self, prompt: &VoicePrompt) -> Result<()>;
-    
+
     /// Obtain the configured sample rate
     fn sample_rate(&self) -> usize;
 
     /// Synthesize a specific chunk of text and return raw float audio samples
     fn synthesize_chunk(&mut self, text: &str) -> Result<Vec<f32>>;
-    
+
     /// Optional: Fully synthesize a long text by breaking it up internally and managing cross-fades
     /// Default implementation covers typical paragraph parsing, or the Adapter can override it.
     async fn synthesize_long_text(&mut self, raw_text: &str) -> Result<Vec<f32>> {
@@ -21,15 +21,27 @@ pub trait TtsEngine: Send + Sync {
         // ... (We will implement default behavior in audio.rs or directly here)
         let chunks = crate::audio::chunk_text(raw_text);
         let mut all_samples: Vec<f32> = Vec::new();
-        
+
         for (idx, chunk) in chunks.iter().enumerate() {
-            if chunk.trim().is_empty() { continue; }
-            log::info!("Generating audio chunk {}/{} ({} chars)...", idx+1, chunks.len(), chunk.chars().count());
-            
+            if chunk.trim().is_empty() {
+                continue;
+            }
+            log::info!(
+                "Generating audio chunk {}/{} ({} chars)...",
+                idx + 1,
+                chunks.len(),
+                chunk.chars().count()
+            );
+
             let new_samples = self.synthesize_chunk(chunk)?;
-            crate::audio::append_with_crossfade(&mut all_samples, &new_samples, self.sample_rate(), 0.05);
+            crate::audio::append_with_crossfade(
+                &mut all_samples,
+                &new_samples,
+                self.sample_rate(),
+                0.05,
+            );
         }
-        
+
         Ok(all_samples)
     }
 }
@@ -69,7 +81,7 @@ impl EngineFactory {
                 return Err(anyhow!("Qwen3 config missing"));
             }
         }
-        
+
         Err(anyhow!("Unknown TTS Engine: {}", engine))
     }
 }

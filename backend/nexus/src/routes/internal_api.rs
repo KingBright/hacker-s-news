@@ -1,11 +1,11 @@
+use crate::routes::items::Item;
+use crate::AppState;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
-use crate::AppState;
-use crate::routes::items::Item;
 
 pub async fn list_pending_items(
     State(state): State<AppState>,
@@ -19,7 +19,7 @@ pub async fn list_pending_items(
 
     let cutoff = chrono::Utc::now().timestamp() - 72 * 3600; // 72 hours
     let items = sqlx::query_as::<_, Item>(
-        "SELECT id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at, rating, tags, is_deleted, duration_sec, status FROM items WHERE status = 'pending_regen' AND publish_time > ?",
+        "SELECT id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at, rating, tags, is_deleted, duration_sec, status, category FROM items WHERE status = 'pending_regen' AND publish_time > ?",
     )
     .bind(cutoff)
     .fetch_all(&state.db)
@@ -117,7 +117,11 @@ pub async fn push_sources(
     }
 
     if failed_count > 0 {
-        tracing::warn!("Completed push_sources for item {} with {} failures", item_id, failed_count);
+        tracing::warn!(
+            "Completed push_sources for item {} with {} failures",
+            item_id,
+            failed_count
+        );
     }
 
     StatusCode::OK.into_response()

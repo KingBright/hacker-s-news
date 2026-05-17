@@ -1,16 +1,16 @@
 use crate::core::config::Host;
 
-use chinese_lunisolar_calendar::LunisolarDate;
-use anyhow::Result;
-use std::sync::Arc;
-use tokio::sync::Mutex; 
-use crate::core::news_buffer::{NewsBuffer, PendingNewsItem, ClusterData};
-use crate::core::topic_registry::TopicRegistry;
 use crate::core::llm::LlmClient;
+use crate::core::news_buffer::{ClusterData, NewsBuffer, PendingNewsItem};
+use crate::core::nexus::{ItemPayload, NexusClient};
+use crate::core::topic_registry::TopicRegistry;
 use crate::core::tts::TtsClient;
-use crate::core::nexus::{NexusClient, ItemPayload};
+use anyhow::Result;
+use chinese_lunisolar_calendar::LunisolarDate;
 use regex::Regex;
 use std::io::Write;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 // --- Trace Logger ---
 #[derive(Debug, serde::Serialize)]
@@ -48,7 +48,12 @@ impl TraceLogger {
             llm_response: None,
         });
         // Mirror to stdout
-        log::info!("[Trace: {}] {}: {}", self.step_name_slug(), step_name, details);
+        log::info!(
+            "[Trace: {}] {}: {}",
+            self.step_name_slug(),
+            step_name,
+            details
+        );
     }
 
     pub fn log_llm(&mut self, step_name: &str, details: &str, prompt: &str, response: &str) {
@@ -59,7 +64,11 @@ impl TraceLogger {
             llm_prompt: Some(prompt.to_string()),
             llm_response: Some(response.to_string()),
         });
-        log::info!("[Trace: {}] {} (LLM Invoked)", self.step_name_slug(), step_name);
+        log::info!(
+            "[Trace: {}] {} (LLM Invoked)",
+            self.step_name_slug(),
+            step_name
+        );
     }
 
     fn step_name_slug(&self) -> String {
@@ -70,34 +79,42 @@ impl TraceLogger {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         let log_dir = std::path::Path::new(&home).join(".freshloop/logs/traces");
         std::fs::create_dir_all(&log_dir)?;
-        
-        let filename = format!("trace_{}_{}_{}.md", 
-            self.start_time.format("%Y%m%d_%H%M"), 
-            self.category.replace(" ", "_"), 
-            self.id.chars().take(8).collect::<String>());
-            
+
+        let filename = format!(
+            "trace_{}_{}_{}.md",
+            self.start_time.format("%Y%m%d_%H%M"),
+            self.category.replace(" ", "_"),
+            self.id.chars().take(8).collect::<String>()
+        );
+
         let path = log_dir.join(&filename);
         let mut file = std::fs::File::create(&path)?;
-        
+
         writeln!(file, "# Execution Trace Report")?;
         writeln!(file, "- **Task ID**: {}", self.id)?;
         writeln!(file, "- **Category**: {}", self.category)?;
         writeln!(file, "- **Start Time**: {}", self.start_time)?;
         writeln!(file, "- **Total Steps**: {}\n", self.steps.len())?;
-        
+
         for (i, step) in self.steps.iter().enumerate() {
-            writeln!(file, "## {}. {} ({})", i+1, step.step_name, step.timestamp)?;
+            writeln!(
+                file,
+                "## {}. {} ({})",
+                i + 1,
+                step.step_name,
+                step.timestamp
+            )?;
             writeln!(file, "{}", step.details)?;
-            
+
             if let Some(prompt) = &step.llm_prompt {
                 writeln!(file, "\n**LLM Prompt**:\n```text\n{}\n```", prompt)?;
             }
             if let Some(resp) = &step.llm_response {
-                 writeln!(file, "\n**LLM Response**:\n```text\n{}\n```", resp)?;
+                writeln!(file, "\n**LLM Response**:\n```text\n{}\n```", resp)?;
             }
             writeln!(file, "\n---\n")?;
         }
-        
+
         Ok(path.to_string_lossy().to_string())
     }
 }
@@ -120,7 +137,14 @@ impl NewsAggregator {
         nexus: Arc<NexusClient>,
         hosts: Option<Vec<Host>>,
     ) -> Self {
-        Self { buffer, registry, llm, tts, nexus, hosts }
+        Self {
+            buffer,
+            registry,
+            llm,
+            tts,
+            nexus,
+            hosts,
+        }
     }
 
     /// Primary entry point: Check buffer stats, flush specific categories if ready
@@ -135,21 +159,29 @@ impl NewsAggregator {
             let buf = self.buffer.lock().await;
             buf.get_category_stats()?
         };
-        
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         let mut categories_to_flush = Vec::new();
 
         for (category, (count, oldest_ts)) in stats {
             let wait_time = if now > oldest_ts { now - oldest_ts } else { 0 };
-            
+
             // Flush Rule: Unique Clusters >= 10 OR Wait > 6h
             if count >= MIN_CLUSTERS || wait_time > MAX_WAIT_SEC {
-                log::info!("Triggering Flush for [{}]: Clusters={}, Wait={}s", category, count, wait_time);
+                log::info!(
+                    "Triggering Flush for [{}]: Clusters={}, Wait={}s",
+                    category,
+                    count,
+                    wait_time
+                );
                 categories_to_flush.push(category);
             }
         }
-        
+
         let mut last_error: Option<anyhow::Error> = None;
 
         for cat in categories_to_flush {
@@ -157,17 +189,22 @@ impl NewsAggregator {
                 let buf = self.buffer.lock().await;
                 buf.get_category_clusters(&cat)?
             };
-            
+
             if clusters.is_empty() {
                 continue;
             }
-            
+
             // Check minimum clusters for episode
             if clusters.len() < MIN_CLUSTERS_FOR_EPISODE {
-                log::info!("Postponing [{}]: Only {} clusters, need at least {}", cat, clusters.len(), MIN_CLUSTERS_FOR_EPISODE);
+                log::info!(
+                    "Postponing [{}]: Only {} clusters, need at least {}",
+                    cat,
+                    clusters.len(),
+                    MIN_CLUSTERS_FOR_EPISODE
+                );
                 continue;
             }
-            
+
             // Collect IDs for potential removal
             let cluster_ids: Vec<String> = clusters.iter().map(|c| c.id.clone()).collect();
 
@@ -175,20 +212,28 @@ impl NewsAggregator {
             match self.process_clusters(&cat, &clusters).await {
                 Ok(true) => {
                     // Success (Ack): Remove processed clusters
-                    log::info!("Successfully processed [{}], removing {} clusters.", cat, cluster_ids.len());
+                    log::info!(
+                        "Successfully processed [{}], removing {} clusters.",
+                        cat,
+                        cluster_ids.len()
+                    );
                     let buf = self.buffer.lock().await;
                     if let Err(e) = buf.remove_clusters(&cat, &cluster_ids) {
                         log::error!("Failed to remove clusters from DB after processing: {}", e);
                     }
-                },
+                }
                 Ok(false) => {
                     // Postponed/Skipped: Do nothing (Repo keeps data)
                     log::info!("Processing [{}]: Postponed or Skipped. Data retained.", cat);
-                },
+                }
                 Err(e) => {
                     // Failed: Log and continue to next category instead of aborting.
                     // This ensures one category's TTS failure doesn't block others.
-                    log::error!("Failed to process category [{}]: {}. Data retained, will retry later.", cat, e);
+                    log::error!(
+                        "Failed to process category [{}]: {}. Data retained, will retry later.",
+                        cat,
+                        e
+                    );
                     last_error = Some(e);
                 }
             }
@@ -204,76 +249,81 @@ impl NewsAggregator {
     /// Admin Regeneration Loop (Moved from news.rs)
     pub async fn process_regenerations(&self) -> Result<()> {
         let pending = self.nexus.fetch_pending_jobs().await?;
-        if pending.is_empty() { return Ok(()); }
+        if pending.is_empty() {
+            return Ok(());
+        }
 
         log::info!("Found {} pending regeneration jobs.", pending.len());
 
         for job in pending {
-             // Treat "Title - Smart Daily" as category for reverse lookup or fallback to "Other"
-             let category = if job.title.contains(" - ") {
-                 job.title.split(" - ").next().unwrap_or("Other")
-             } else {
-                 "Other"
-             };
-             
-             let context = job.summary.as_deref().unwrap_or("");
-             
-             log::info!("Regenerating [Item {}] (Category: {})", job.id.as_deref().unwrap_or("?"), category);
-             
-             
-             // UNIFIED LOGIC: Use produce_episode
-             let (final_script, _generated_title, audio_bytes, duration, skipped) = self.produce_episode(
-                 category,
-                 context,
-                 None, // No items for regeneration
-                 true // is_regeneration
-             ).await?;
+            // Treat "Title - Smart Daily" as category for reverse lookup or fallback to "Other"
+            let category = if job.title.contains(" - ") {
+                job.title.split(" - ").next().unwrap_or("Other")
+            } else {
+                "Other"
+            };
 
-             if skipped {
-                 log::warn!(
-                     "Regeneration skipped for [Item {}], keeping pending for next cycle.",
-                     job.id.as_deref().unwrap_or("?")
-                 );
-                 continue;
-             }
-             
-             // Upload Audio if present (Manual upload for Regen flow).
-             // If upload fails, do NOT complete the job to avoid publishing broken items.
-             let audio_url = if let Some(bytes) = audio_bytes {
-                 let file_name = format!("regen_{}.mp3", uuid::Uuid::new_v4());
-                 match self.nexus.upload_audio(bytes, &file_name).await {
-                     Ok(url) => url,
-                     Err(e) => {
-                         log::error!(
-                             "Regeneration upload failed for [Item {}]: {}. Keeping job pending.",
-                             job.id.as_deref().unwrap_or("?"),
-                             e
-                         );
-                         continue;
-                     }
-                 }
-             } else {
-                 log::error!(
-                     "Regeneration produced no audio for [Item {}]. Keeping job pending.",
-                     job.id.as_deref().unwrap_or("?")
-                 );
-                 continue;
-             };
+            let context = job.summary.as_deref().unwrap_or("");
 
-             // Complete Job
-             if let Some(id) = &job.id {
-                 if let Err(e) = self
-                     .nexus
-                     .complete_job(id, &audio_url, &final_script, Some(duration))
-                     .await
-                 {
-                     log::error!(
-                         "Failed to complete regeneration job [Item {}]: {}. Keeping job pending.",
-                         id,
-                         e
-                     );
-                 }
-             }
+            log::info!(
+                "Regenerating [Item {}] (Category: {})",
+                job.id.as_deref().unwrap_or("?"),
+                category
+            );
+
+            // UNIFIED LOGIC: Use produce_episode
+            let (final_script, _generated_title, audio_bytes, duration, skipped) = self
+                .produce_episode(
+                    category, context, None, // No items for regeneration
+                    true, // is_regeneration
+                )
+                .await?;
+
+            if skipped {
+                log::warn!(
+                    "Regeneration skipped for [Item {}], keeping pending for next cycle.",
+                    job.id.as_deref().unwrap_or("?")
+                );
+                continue;
+            }
+
+            // Upload Audio if present (Manual upload for Regen flow).
+            // If upload fails, do NOT complete the job to avoid publishing broken items.
+            let audio_url = if let Some(bytes) = audio_bytes {
+                let file_name = format!("regen_{}.mp3", uuid::Uuid::new_v4());
+                match self.nexus.upload_audio(bytes, &file_name).await {
+                    Ok(url) => url,
+                    Err(e) => {
+                        log::error!(
+                            "Regeneration upload failed for [Item {}]: {}. Keeping job pending.",
+                            job.id.as_deref().unwrap_or("?"),
+                            e
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                log::error!(
+                    "Regeneration produced no audio for [Item {}]. Keeping job pending.",
+                    job.id.as_deref().unwrap_or("?")
+                );
+                continue;
+            };
+
+            // Complete Job
+            if let Some(id) = &job.id {
+                if let Err(e) = self
+                    .nexus
+                    .complete_job(id, &audio_url, &final_script, Some(duration))
+                    .await
+                {
+                    log::error!(
+                        "Failed to complete regeneration job [Item {}]: {}. Keeping job pending.",
+                        id,
+                        e
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -283,15 +333,16 @@ impl NewsAggregator {
         log::info!("Starting History Backfill from Nexus...");
         let recent_items = self.nexus.fetch_recent_items(200).await?;
         let mut count = 0;
-        
+
         for item in recent_items {
             let summary = item.summary.clone().unwrap_or_default();
             let combined_text = format!("{} {}", item.title, summary);
             // Use new method to store full details for better follow-up detection
-            self.registry.record_topic_with_details(&combined_text, &item.title, &summary)?;
+            self.registry
+                .record_topic_with_details(&combined_text, &item.title, &summary)?;
             count += 1;
         }
-        
+
         log::info!("Backfilled {} topics into local registry.", count);
         Ok(())
     }
@@ -302,34 +353,42 @@ impl NewsAggregator {
     /// 3. Store as new or merged cluster
     pub async fn push_with_clustering(&self, item: PendingNewsItem) -> Result<bool> {
         const SIMHASH_THRESHOLD: u32 = 10; // Hamming distance threshold for coarse filtering
-        
+
         let item_hash = ClusterData::calculate_simhash(&item.title, &item.description);
-        
+
         // 1. Find similar clusters in buffer
         let similar_clusters = {
             let buf = self.buffer.lock().await;
             buf.find_similar_clusters(&item.category, item_hash, SIMHASH_THRESHOLD)?
         };
-        
+
         if similar_clusters.is_empty() {
             // No similar clusters, create new one
             log::info!("New cluster: {}", item.title);
             let cluster = ClusterData::new(item);
             let buf = self.buffer.lock().await;
             buf.store_cluster(&cluster)?;
-            return Ok(true);  // New cluster created
+            return Ok(true); // New cluster created
         }
-        
+
         // 2. LLM verification for the most similar cluster
         let mut best_match: Option<ClusterData> = None;
-        
+
         // Optimization: Fast path for exact title matches (Check Main + Related)
         let mut exact_match_found = false;
         if let Some(exact_match_cluster) = similar_clusters.iter().find(|c| {
             // Check main item
-            if c.main_item.title.trim().eq_ignore_ascii_case(item.title.trim()) { return true; }
+            if c.main_item
+                .title
+                .trim()
+                .eq_ignore_ascii_case(item.title.trim())
+            {
+                return true;
+            }
             // Check related items
-            c.related_items.iter().any(|r| r.title.trim().eq_ignore_ascii_case(item.title.trim()))
+            c.related_items
+                .iter()
+                .any(|r| r.title.trim().eq_ignore_ascii_case(item.title.trim()))
         }) {
             log::info!("Fast-track: Found exact title match for '{}'", item.title);
             best_match = Some(exact_match_cluster.clone());
@@ -338,8 +397,13 @@ impl NewsAggregator {
             // Normal path: LLM verification
             for cluster in similar_clusters {
                 let dist = ClusterData::hamming_distance(cluster.simhash, item_hash);
-                log::info!("SimHash Candidate: '{}' (Dist: {}) vs New: '{}'", cluster.main_item.title, dist, item.title);
-                
+                log::info!(
+                    "SimHash Candidate: '{}' (Dist: {}) vs New: '{}'",
+                    cluster.main_item.title,
+                    dist,
+                    item.title
+                );
+
                 let is_same = self.llm_verify_same_topic(&item, &cluster).await?;
                 if is_same {
                     best_match = Some(cluster);
@@ -347,46 +411,60 @@ impl NewsAggregator {
                 }
             }
         }
-        
+
         if let Some(mut matched_cluster) = best_match {
             // 3. Merge into existing cluster
-            log::info!("Merging '{}' into cluster '{}'", item.title, matched_cluster.main_item.title);
-            
+            log::info!(
+                "Merging '{}' into cluster '{}'",
+                item.title,
+                matched_cluster.main_item.title
+            );
+
             // Optimization: If title is identical, skip LLM merge cost
-            if exact_match_found || item.title.trim().eq_ignore_ascii_case(matched_cluster.main_item.title.trim()) {
+            if exact_match_found
+                || item
+                    .title
+                    .trim()
+                    .eq_ignore_ascii_case(matched_cluster.main_item.title.trim())
+            {
                 // Strict Duplicate Check: Check against ALL items in cluster
                 // If this new item is identical (Title+Content) to ANY existing item, discard it.
-                let is_strict_duplicate = 
-                    (item.title.trim().eq_ignore_ascii_case(matched_cluster.main_item.title.trim()) && 
-                     item.description.trim() == matched_cluster.main_item.description.trim()) ||
-                    matched_cluster.related_items.iter().any(|r| 
-                        r.title.trim().eq_ignore_ascii_case(item.title.trim()) && 
-                        r.description.trim() == item.description.trim()
-                    );
+                let is_strict_duplicate = (item
+                    .title
+                    .trim()
+                    .eq_ignore_ascii_case(matched_cluster.main_item.title.trim())
+                    && item.description.trim() == matched_cluster.main_item.description.trim())
+                    || matched_cluster.related_items.iter().any(|r| {
+                        r.title.trim().eq_ignore_ascii_case(item.title.trim())
+                            && r.description.trim() == item.description.trim()
+                    });
 
                 if is_strict_duplicate {
-                    log::info!("Discarding exact duplicate item (Title+Content match in cluster): {}", item.title);
-                    return Ok(false); 
+                    log::info!(
+                        "Discarding exact duplicate item (Title+Content match in cluster): {}",
+                        item.title
+                    );
+                    return Ok(false);
                 }
-                
+
                 log::info!("Skipping LLM merge for identical title: {}", item.title);
                 matched_cluster.add_related(item);
             } else {
                 // LLM merge to create combined summary
                 let merged_summary = self.llm_merge_items(&matched_cluster, &item).await?;
-                
+
                 matched_cluster.add_related(item);
                 if let Some((title, summary)) = merged_summary {
                     matched_cluster.set_merged_summary(title, summary);
                 }
             }
-            
+
             // Update cluster in buffer
             let buf = self.buffer.lock().await;
             buf.store_cluster(&matched_cluster)?;
-            return Ok(false);  // Merged into existing
+            return Ok(false); // Merged into existing
         }
-        
+
         // No match confirmed by LLM, create new cluster
         log::info!("New cluster (LLM verified): {}", item.title);
         let cluster = ClusterData::new(item);
@@ -396,61 +474,95 @@ impl NewsAggregator {
     }
 
     /// LLM verification: Are these two items about the same topic?
-    async fn llm_verify_same_topic(&self, item: &PendingNewsItem, cluster: &ClusterData) -> Result<bool> {
+    async fn llm_verify_same_topic(
+        &self,
+        item: &PendingNewsItem,
+        cluster: &ClusterData,
+    ) -> Result<bool> {
         let prompt = format!(
             "判断以下两条新闻是否报道同一个事件/话题？\n\n\
             新闻A:\n标题: {}\n摘要: {}\n\n\
             新闻B:\n标题: {}\n摘要: {}\n\n\
             判断标准：同一事件指同一个具体事件、产品、人物动态，而非仅仅领域相似。\n\
             仅回答 YES 或 NO。",
-            item.title, item.description,
-            cluster.main_item.title, 
-            cluster.merged_summary.as_ref().unwrap_or(&cluster.main_item.description)
+            item.title,
+            item.description,
+            cluster.main_item.title,
+            cluster
+                .merged_summary
+                .as_ref()
+                .unwrap_or(&cluster.main_item.description)
         );
-        
+
         let response = self.llm.chat(&prompt, false).await?;
         let answer = response.trim().to_uppercase();
         Ok(answer.contains("YES"))
     }
 
     /// LLM merge: Combine item into cluster with merged summary
-    async fn llm_merge_items(&self, cluster: &ClusterData, new_item: &PendingNewsItem) -> Result<Option<(String, String)>> {
-        let existing_summary = cluster.merged_summary.as_ref().unwrap_or(&cluster.main_item.description);
-        
+    async fn llm_merge_items(
+        &self,
+        cluster: &ClusterData,
+        new_item: &PendingNewsItem,
+    ) -> Result<Option<(String, String)>> {
+        let existing_summary = cluster
+            .merged_summary
+            .as_ref()
+            .unwrap_or(&cluster.main_item.description);
+
         let mut prompt = format!(
             "Role: Senior Intelligence Analyst (资深情报分析师)。\n\n任务：将以下多来源信息综合成一份权威的简报模块。\n\n【策略 - 请根据内容类型自适应】：\n- **硬新闻/财经**：准确性第一。保留所有具体数字、日期、人名、公司名。遵循 5W1H 原则。\n- **软新闻/观点**：捕捉核心论点、情感弧线或独特氛围。提炼\"金句\"。\n- **低质量/碎片化**：如果来源行文混乱，请将其重构为逻辑通顺、符合新闻标准的文稿。修复所有语法错误。\n\n已有内容:\n标题: {}\n摘要: {}\n\n新内容:\n标题: {}\n摘要: {}\n\n要求：\n1. 极高信息密度：拒绝废话。\n2. 输出综合标题和摘要。",
             cluster.main_item.title, existing_summary,
             new_item.title, new_item.description
         );
-        
+
         #[derive(serde::Deserialize, schemars::JsonSchema)]
         struct MergeResult {
             title: String,
             summary: String,
         }
-        
+
         let mut attempts = 0;
         const MAX_RETRIES: usize = 3;
 
         loop {
             attempts += 1;
-            match self.llm.chat_json::<MergeResult>(&prompt, "merge_result", false).await {
+            match self
+                .llm
+                .chat_json::<MergeResult>(&prompt, "merge_result", false)
+                .await
+            {
                 Ok(result) => {
-                    let title = if result.title.is_empty() { cluster.main_item.title.clone() } else { result.title };
-                    let summary = if result.summary.is_empty() { existing_summary.to_string() } else { result.summary };
-                    
+                    let title = if result.title.is_empty() {
+                        cluster.main_item.title.clone()
+                    } else {
+                        result.title
+                    };
+                    let summary = if result.summary.is_empty() {
+                        existing_summary.to_string()
+                    } else {
+                        result.summary
+                    };
+
                     // Editor Review Loop for Summary
                     let (passed, critique) = self.review_summary(&title, &summary).await?;
                     if passed {
                         return Ok(Some((title, summary)));
                     }
-                    
+
                     if attempts >= MAX_RETRIES {
-                        log::warn!("Editor rejected summary 3 times. Accepted last draft. Critique: {}", critique);
+                        log::warn!(
+                            "Editor rejected summary 3 times. Accepted last draft. Critique: {}",
+                            critique
+                        );
                         return Ok(Some((title, summary)));
                     }
 
-                    log::info!("Editor rejected summary (Attempt {}): {}. Regenerating...", attempts, critique);
+                    log::info!(
+                        "Editor rejected summary (Attempt {}): {}. Regenerating...",
+                        attempts,
+                        critique
+                    );
                     prompt.push_str(&format!("\n\n【主编反馈】\n你的上一版摘要被打回了，原因：{}\n请保留更多细节，重新合并。", critique));
                     continue;
                 }
@@ -462,7 +574,7 @@ impl NewsAggregator {
                 }
             }
         }
-        
+
         Ok(None)
     }
 
@@ -479,35 +591,50 @@ impl NewsAggregator {
             critique: String,
         }
 
-        let review = self.llm.chat_json::<ReviewResult>(&prompt, "review_result", false).await
-            .unwrap_or(ReviewResult { pass: true, critique: "JSON Parse Error".to_string() });
-            
+        let review = self
+            .llm
+            .chat_json::<ReviewResult>(&prompt, "review_result", false)
+            .await
+            .unwrap_or(ReviewResult {
+                pass: true,
+                critique: "JSON Parse Error".to_string(),
+            });
+
         Ok((review.pass, review.critique))
     }
 
     /// Check if a previously reported topic has substantial new information
     /// Returns Some(update_summary) if there's new info, None if it should be discarded
-    async fn check_for_updates(&self, cluster: &ClusterData, current_summary: &str, prev_record: &crate::core::topic_registry::TopicRecord) -> Result<Option<String>> {
+    async fn check_for_updates(
+        &self,
+        cluster: &ClusterData,
+        current_summary: &str,
+        prev_record: &crate::core::topic_registry::TopicRecord,
+    ) -> Result<Option<String>> {
         // Use previous summary if available, otherwise just use title
         let prev_content = if !prev_record.summary.is_empty() {
             format!("标题: {}\n摘要: {}", prev_record.title, prev_record.summary)
         } else {
             format!("标题: {}", cluster.main_item.title)
         };
-        
+
         let prompt = format!(
             "Role: Breaking News Desk (突发新闻中心)。\n判断新内容是否构成【实质性更新】。\n\n【之前报道】\n{}\n\n【新线索】\n标题: {}\n摘要: {}\n\n判定标准：\n- **NO**: 重复信息、单纯的观点重申、无关痛痒的细节修饰。\n- **YES**: 新的数据、官方回应、事件进入下一阶段、结果反转。\n\n输出格式（仅输出JSON）：\n{{\n  \"has_update\": true或false,\n  \"update_summary\": \"如有更新，请写一段简练的后续报道（Focus on the NEW info only）\"\n}}",
             prev_content, cluster.main_item.title, current_summary
         );
-        
+
         #[derive(serde::Deserialize, schemars::JsonSchema)]
         struct UpdateCheck {
             has_update: bool,
             #[serde(default)]
             update_summary: Option<String>,
         }
-        
-        match self.llm.chat_json::<UpdateCheck>(&prompt, "update_check", false).await {
+
+        match self
+            .llm
+            .chat_json::<UpdateCheck>(&prompt, "update_check", false)
+            .await
+        {
             Ok(check) => {
                 if check.has_update {
                     Ok(check.update_summary)
@@ -526,7 +653,7 @@ impl NewsAggregator {
         log::info!("Processing [{}]: {} clusters", category, clusters.len());
 
         const MIN_UNIQUE_TOPICS: usize = 3;
-        
+
         // Build context from clusters
         let mut source_text = String::new();
         let mut all_sources = Vec::new();
@@ -535,7 +662,10 @@ impl NewsAggregator {
         let mut topics_to_record = Vec::new();
 
         for (idx, cluster) in clusters.iter().enumerate() {
-            let summary = cluster.merged_summary.as_ref().unwrap_or(&cluster.main_item.description);
+            let summary = cluster
+                .merged_summary
+                .as_ref()
+                .unwrap_or(&cluster.main_item.description);
             let combined_text = format!("{} {}", cluster.main_item.title, summary);
 
             // --- HARD TIME FILTER (Mechanism 1) ---
@@ -544,44 +674,53 @@ impl NewsAggregator {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-                
+
             if cluster.main_item.timestamp < now_ts - 72 * 3600 {
-                log::info!("Time Filter: Discarding stale cluster '{}' (Age: {}h)", 
-                    cluster.main_item.title, 
-                    (now_ts - cluster.main_item.timestamp) / 3600);
-                
+                log::info!(
+                    "Time Filter: Discarding stale cluster '{}' (Age: {}h)",
+                    cluster.main_item.title,
+                    (now_ts - cluster.main_item.timestamp) / 3600
+                );
+
                 // Build a short vector and remove immediately
                 let stale_ids = vec![cluster.id.clone()];
                 let buf = self.buffer.lock().await;
                 if let Err(e) = buf.remove_clusters(category, &stale_ids) {
                     log::error!("Failed to remove stale cluster from DB: {}", e);
                 }
-                
+
                 continue;
             }
             // --------------------------------------
-            
+
             // Check global history for previously reported topics
             // Relaxed threshold: 12 (catch more candidates)
             let existing_record = self.registry.is_duplicate(&combined_text, 12)?;
-            
+
             let mut is_follow_up = false;
             let mut matched_record = None;
 
             if let Some((candidate_record, distance)) = existing_record {
-                 if distance < 3 {
-                     // Strong match: Assume it is the same/related topic without LLM (Fast path)
-                     log::info!("Strong history match (Dist: {}): {}", distance, candidate_record.title);
-                     matched_record = Some(candidate_record);
-                     is_follow_up = true;
-                 } else {
-                     // Borderline match (3 <= distance < 12): Verify with LLM
-                     log::info!("Borderline history match (Dist: {}). Verifying...", distance);
-                     
-                     // Use existing verify logic but adapted for history check
-                     // Need to construct a temp pending item to reuse logic or make a new prompt?
-                     // Let's make a direct prompt here for clarity.
-                     let prompt = format!(
+                if distance < 3 {
+                    // Strong match: Assume it is the same/related topic without LLM (Fast path)
+                    log::info!(
+                        "Strong history match (Dist: {}): {}",
+                        distance,
+                        candidate_record.title
+                    );
+                    matched_record = Some(candidate_record);
+                    is_follow_up = true;
+                } else {
+                    // Borderline match (3 <= distance < 12): Verify with LLM
+                    log::info!(
+                        "Borderline history match (Dist: {}). Verifying...",
+                        distance
+                    );
+
+                    // Use existing verify logic but adapted for history check
+                    // Need to construct a temp pending item to reuse logic or make a new prompt?
+                    // Let's make a direct prompt here for clarity.
+                    let prompt = format!(
                         "判断这两条新闻是否属于同一事件或强相关后续？\n\n\
                         历史报道:\n标题: {}\n摘要: {}\n\n\
                         今日新闻:\n标题: {}\n摘要: {}\n\n\
@@ -590,7 +729,7 @@ impl NewsAggregator {
                         candidate_record.title, candidate_record.summary,
                         cluster.main_item.title, summary
                     );
-                    
+
                     let response = self.llm.chat(&prompt, false).await?;
                     if response.to_uppercase().contains("YES") {
                         log::info!("LLM confirmed history match: {}", cluster.main_item.title);
@@ -599,27 +738,38 @@ impl NewsAggregator {
                     } else {
                         log::info!("LLM rejected history match. Treating as NEW.");
                     }
-                 }
+                }
             }
 
             if is_follow_up {
                 let prev_record = matched_record.unwrap();
                 // Topic was previously reported - check if there's new information
-                match self.check_for_updates(&cluster, summary, &prev_record).await {
+                match self
+                    .check_for_updates(&cluster, summary, &prev_record)
+                    .await
+                {
                     Ok(Some(update_summary)) => {
                         // Has new information - include as a follow-up story
                         log::info!("Follow-up story: {}", cluster.main_item.title);
                         unique_topic_count += 1;
-                        
+
                         // Queue for registry update (only commit if episode is published)
-                        topics_to_record.push((combined_text.clone(), cluster.main_item.title.clone(), summary.to_string()));
-                        
-                        let source_str = cluster.main_item.source_name.as_deref().unwrap_or("Unknown");
+                        topics_to_record.push((
+                            combined_text.clone(),
+                            cluster.main_item.title.clone(),
+                            summary.to_string(),
+                        ));
+
+                        let source_str = cluster
+                            .main_item
+                            .source_name
+                            .as_deref()
+                            .unwrap_or("Unknown");
                         source_text.push_str(&format!(
                             "### Story {} (后续报道)\nSource: {}\nTitle: {}\nSummary: {}\n\n---\n\n", 
                             idx + 1, source_str, cluster.main_item.title, update_summary
                         ));
-                        
+
                         all_sources.push(crate::core::nexus::SourceInfo {
                             url: cluster.main_item.link.clone(),
                             title: format!("[更新] {}", cluster.main_item.title),
@@ -630,17 +780,22 @@ impl NewsAggregator {
                             id: idx + 1,
                             title: format!("[更新] {}", cluster.main_item.title),
                             summary: update_summary.clone(),
-                            source_name: cluster.main_item.source_name.as_deref().unwrap_or("Unknown").to_string(),
+                            source_name: cluster
+                                .main_item
+                                .source_name
+                                .as_deref()
+                                .unwrap_or("Unknown")
+                                .to_string(),
                             original_url: cluster.main_item.link.clone(),
                             is_update: true,
                             publish_time: cluster.main_item.timestamp as i64,
                         });
-                    },
+                    }
                     Ok(None) => {
                         // No substantial new information - discard
                         log::info!("Skipping (no new info): {}", cluster.main_item.title);
                         continue;
-                    },
+                    }
                     Err(e) => {
                         log::warn!("Update check failed: {}, skipping", e);
                         continue;
@@ -648,13 +803,26 @@ impl NewsAggregator {
                 }
             } else {
                 // New topic - queue for record with full details
-                topics_to_record.push((combined_text.clone(), cluster.main_item.title.clone(), summary.to_string()));
+                topics_to_record.push((
+                    combined_text.clone(),
+                    cluster.main_item.title.clone(),
+                    summary.to_string(),
+                ));
                 unique_topic_count += 1;
-                
-                let source_str = cluster.main_item.source_name.as_deref().unwrap_or("Unknown");
-                source_text.push_str(&format!("### Story {}\nSource: {}\nTitle: {}\nSummary: {}\n\n---\n\n", 
-                    idx + 1, source_str, cluster.main_item.title, summary));
-                
+
+                let source_str = cluster
+                    .main_item
+                    .source_name
+                    .as_deref()
+                    .unwrap_or("Unknown");
+                source_text.push_str(&format!(
+                    "### Story {}\nSource: {}\nTitle: {}\nSummary: {}\n\n---\n\n",
+                    idx + 1,
+                    source_str,
+                    cluster.main_item.title,
+                    summary
+                ));
+
                 all_sources.push(crate::core::nexus::SourceInfo {
                     url: cluster.main_item.link.clone(),
                     title: cluster.main_item.title.clone(),
@@ -665,13 +833,18 @@ impl NewsAggregator {
                     id: idx + 1,
                     title: cluster.main_item.title.clone(),
                     summary: summary.clone(),
-                    source_name: cluster.main_item.source_name.as_deref().unwrap_or("Unknown").to_string(),
+                    source_name: cluster
+                        .main_item
+                        .source_name
+                        .as_deref()
+                        .unwrap_or("Unknown")
+                        .to_string(),
                     original_url: cluster.main_item.link.clone(),
                     is_update: false,
                     publish_time: cluster.main_item.timestamp as i64,
                 });
             }
-            
+
             // Add related items as sources
             for related in &cluster.related_items {
                 all_sources.push(crate::core::nexus::SourceInfo {
@@ -683,7 +856,11 @@ impl NewsAggregator {
         }
 
         if unique_topic_count < MIN_UNIQUE_TOPICS {
-            log::info!("Postponing [{}]: Only {} unique topics after dedup", category, unique_topic_count);
+            log::info!(
+                "Postponing [{}]: Only {} unique topics after dedup",
+                category,
+                unique_topic_count
+            );
             return Ok(false);
         }
 
@@ -691,17 +868,22 @@ impl NewsAggregator {
             return Ok(false);
         }
 
-        log::info!("Generating episode for [{}]: {} unique topics", category, unique_topic_count);
-        
-        log::info!("Generating episode for [{}]: {} unique topics", category, unique_topic_count);
-        
+        log::info!(
+            "Generating episode for [{}]: {} unique topics",
+            category,
+            unique_topic_count
+        );
+
+        log::info!(
+            "Generating episode for [{}]: {} unique topics",
+            category,
+            unique_topic_count
+        );
+
         // Call produce_episode with smart flow enabled (via items)
-        let result = self.produce_episode(
-            category, 
-            &source_text,
-            Some(&broadcast_items),
-            false
-        ).await;
+        let result = self
+            .produce_episode(category, &source_text, Some(&broadcast_items), false)
+            .await;
 
         let (script, generated_title, audio_bytes, duration, skipped) = match result {
             Ok(r) => r,
@@ -724,7 +906,12 @@ impl NewsAggregator {
             id: None,
             title: final_title,
             summary: Some(script),
-            original_url: Some(all_sources.first().map(|s| s.url.clone()).unwrap_or_default()), 
+            original_url: Some(
+                all_sources
+                    .first()
+                    .map(|s| s.url.clone())
+                    .unwrap_or_default(),
+            ),
             cover_image_url: None,
             audio_url: None, // Will be filled by Nexus if file is provided
             publish_time: Some(chrono::Utc::now().timestamp()),
@@ -732,26 +919,33 @@ impl NewsAggregator {
             sources: Some(all_sources),
             category: Some(category.to_string()),
         };
-        
+
         self.nexus.push_item_multipart(payload, audio_bytes).await?;
         log::info!("Published Digest for [{}]", category);
-        
+
         // Finalize: Commit all recorded topics to registry now that publication succeeded
         for (text, title, sum) in topics_to_record {
             if let Err(e) = self.registry.record_topic_with_details(&text, &title, &sum) {
                 log::error!("Failed to record topic in registry: {}", e);
             }
         }
-        
+
         Ok(true)
     }
 
     // --- Core Unified Content Engine ---
 
-    async fn produce_episode(&self, category: &str, context: &str, items: Option<&[BroadcastItem]>, is_regen: bool) -> Result<(String, Option<String>, Option<Vec<u8>>, i64, bool)> {
+    async fn produce_episode(
+        &self,
+        category: &str,
+        context: &str,
+        items: Option<&[BroadcastItem]>,
+        is_regen: bool,
+    ) -> Result<(String, Option<String>, Option<Vec<u8>>, i64, bool)> {
         // 1. Resolve Host & Voice
         let host = self.hosts.as_ref().and_then(|h| {
-            h.iter().find(|host| host.categories.iter().any(|c| c == category))
+            h.iter()
+                .find(|host| host.categories.iter().any(|c| c == category))
         });
         let host_name = host.map(|h| h.name.clone()).unwrap_or("主播".to_string());
         let host_voice = host.map(|h| h.voice.clone());
@@ -761,10 +955,15 @@ impl NewsAggregator {
 
         // Initialize Tracer
         let logger = Arc::new(Mutex::new(TraceLogger::new(category)));
-        logger.lock().await.log("Start", &format!("Producing Episode for [{}]. Regen: {}", category, is_regen));
+        logger.lock().await.log(
+            "Start",
+            &format!("Producing Episode for [{}]. Regen: {}", category, is_regen),
+        );
 
         let host_val = if let Some(hosts) = &self.hosts {
-            hosts.iter().find(|h| h.categories.contains(&category.to_string()))
+            hosts
+                .iter()
+                .find(|h| h.categories.contains(&category.to_string()))
         } else {
             None
         };
@@ -780,43 +979,55 @@ impl NewsAggregator {
             let mut all_samples: Vec<i16> = Vec::new();
             let mut sample_rate = 24000;
             let mut failed_chunks: Vec<usize> = Vec::new();
-            
+
             let mut chunk_idx = 0;
             while let Some(chunk_text) = rx.recv().await {
                 chunk_idx += 1;
                 // Avoid synthesizing completely empty text or SKIP strings
                 let tts_text = clean_for_tts(&chunk_text);
-                if tts_text.trim().is_empty() || tts_text.trim().contains("SKIP") { continue; }
-                log::info!("[TTS Pipeline] Generating audio for chunk {} ({} chars)", chunk_idx, tts_text.chars().count());
-                
+                if tts_text.trim().is_empty() || tts_text.trim().contains("SKIP") {
+                    continue;
+                }
+                log::info!(
+                    "[TTS Pipeline] Generating audio for chunk {} ({} chars)",
+                    chunk_idx,
+                    tts_text.chars().count()
+                );
+
                 let result = if let Some(voice) = &host_voice_clone {
-                    tts_client.speak_with_voice(&tts_text, voice, host_prompt_clone.as_deref()).await
+                    tts_client
+                        .speak_with_voice(&tts_text, voice, host_prompt_clone.as_deref())
+                        .await
                 } else {
                     tts_client.speak(&tts_text).await
                 };
-                
+
                 match result {
                     Ok(wav_bytes) => {
                         let cursor = std::io::Cursor::new(wav_bytes);
                         if let Ok(mut reader) = hound::WavReader::new(cursor) {
                             sample_rate = reader.spec().sample_rate;
-                            let new_samples: Vec<i16> = reader.samples::<i16>().filter_map(Result::ok).collect();
-                            
+                            let new_samples: Vec<i16> =
+                                reader.samples::<i16>().filter_map(Result::ok).collect();
+
                             // Crossfade: 50ms overlap between chunks for seamless audio
                             if all_samples.is_empty() {
                                 all_samples.extend(new_samples);
                             } else {
                                 let crossfade_duration = 0.05; // 50ms
-                                let crossfade_len = (sample_rate as f64 * crossfade_duration) as usize;
-                                let overlap = crossfade_len.min(all_samples.len()).min(new_samples.len());
-                                
+                                let crossfade_len =
+                                    (sample_rate as f64 * crossfade_duration) as usize;
+                                let overlap =
+                                    crossfade_len.min(all_samples.len()).min(new_samples.len());
+
                                 let start_idx = all_samples.len() - overlap;
                                 for i in 0..overlap {
                                     let fade_out = 1.0 - (i as f32 / overlap as f32);
                                     let fade_in = i as f32 / overlap as f32;
                                     let old_val = all_samples[start_idx + i] as f32;
                                     let new_val = new_samples[i] as f32;
-                                    all_samples[start_idx + i] = (old_val * fade_out + new_val * fade_in) as i16;
+                                    all_samples[start_idx + i] =
+                                        (old_val * fade_out + new_val * fade_in) as i16;
                                 }
                                 // Append the non-overlapping remainder
                                 if overlap < new_samples.len() {
@@ -831,16 +1042,19 @@ impl NewsAggregator {
                     }
                 }
             }
-            
+
             // If any chunk failed, report error so the episode is retried
             if !failed_chunks.is_empty() {
-                return Err(format!("TTS generation failed for chunks: {:?}", failed_chunks));
+                return Err(format!(
+                    "TTS generation failed for chunks: {:?}",
+                    failed_chunks
+                ));
             }
-            
+
             if all_samples.is_empty() {
                 return Err("TTS pipeline produced no audio samples".to_string());
             }
-            
+
             let mut out_cursor = std::io::Cursor::new(Vec::new());
             let spec = hound::WavSpec {
                 channels: 1,
@@ -854,7 +1068,7 @@ impl NewsAggregator {
                 }
                 let _ = writer.finalize();
             }
-            
+
             Ok(out_cursor.into_inner())
         });
 
@@ -868,18 +1082,19 @@ impl NewsAggregator {
             if !is_regen {
                 // Generate a deterministic hash from the sorted URLs of the items
                 let mut hasher = twox_hash::XxHash64::with_seed(0);
-                let mut urls: Vec<String> = item_list.iter().map(|i| i.original_url.clone()).collect();
+                let mut urls: Vec<String> =
+                    item_list.iter().map(|i| i.original_url.clone()).collect();
                 urls.sort();
                 for url in urls {
                     hasher.write(url.as_bytes());
                 }
                 let hash = hasher.finish();
-                
+
                 let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
                 let draft_dir = home.join(".freshloop/cache/tts_drafts").join(category);
                 let _ = std::fs::create_dir_all(&draft_dir);
                 let draft_file = draft_dir.join(format!("{:016x}.json", hash));
-                
+
                 #[derive(serde::Deserialize, serde::Serialize)]
                 struct TtsDraft {
                     raw_script: String,
@@ -891,7 +1106,10 @@ impl NewsAggregator {
                         Ok(contents) => {
                             if let Ok(draft) = serde_json::from_str::<TtsDraft>(&contents) {
                                 log::info!("TTS DRAFT CACHE HIT! Using pre-generated script for cluster hash {:016x}", hash);
-                                logger.lock().await.log("Cache Hit", "Recovered LLM generated script from disk.");
+                                logger
+                                    .lock()
+                                    .await
+                                    .log("Cache Hit", "Recovered LLM generated script from disk.");
                                 cached_script = Some(draft.raw_script);
                                 cached_title = draft.generated_title;
                             }
@@ -906,37 +1124,49 @@ impl NewsAggregator {
         // SMART FLOW (Unified)
         // Check if we recovered from cache
         let (raw_script, generated_title) = if let Some(script) = cached_script {
-             let _ = tx.send(script.clone()).await;
-             (script, cached_title)
+            let _ = tx.send(script.clone()).await;
+            (script, cached_title)
         } else if let Some(item_list) = items {
-            log::info!("Starting Smart Episode Generation for {} items...", item_list.len());
-            
+            log::info!(
+                "Starting Smart Episode Generation for {} items...",
+                item_list.len()
+            );
+
             // Step A: Intelligent Structure Planning (Sort + Group)
             let tracer_clone = logger.clone();
             let mut plans = match self.plan_episode_structure(item_list, tracer_clone).await {
                 Ok(p) => {
                     log::info!("Smart Flow: Planned {} segments", p.len());
                     p
-                },
+                }
                 Err(e) => {
-                    logger.lock().await.log("Planning Failed", &format!("Error: {}. Fallback to simple grouping.", e));
+                    logger.lock().await.log(
+                        "Planning Failed",
+                        &format!("Error: {}. Fallback to simple grouping.", e),
+                    );
                     log::warn!("Smart Flow Planning failed: {}, falling back.", e);
                     // Fallback: chunks of 4 with default sequence action
                     let ids: Vec<usize> = item_list.iter().map(|i| i.id).collect();
-                    ids.chunks(4).map(|c| SegmentPlan {
-                        action: "sequence".to_string(),
-                        ids: c.to_vec(),
-                        transition_rationale: None,
-                        group_theme: None,
-                        merge_reason: None,
-                    }).collect()
+                    ids.chunks(4)
+                        .map(|c| SegmentPlan {
+                            action: "sequence".to_string(),
+                            ids: c.to_vec(),
+                            transition_rationale: None,
+                            group_theme: None,
+                            merge_reason: None,
+                        })
+                        .collect()
                 }
             };
 
             // Topic cap: limit to 15 groups to avoid shallow coverage
             const MAX_GROUPS: usize = 15;
             if plans.len() > MAX_GROUPS {
-                log::info!("Capping episode from {} groups to {} groups", plans.len(), MAX_GROUPS);
+                log::info!(
+                    "Capping episode from {} groups to {} groups",
+                    plans.len(),
+                    MAX_GROUPS
+                );
                 plans.truncate(MAX_GROUPS);
             }
 
@@ -947,16 +1177,18 @@ impl NewsAggregator {
             }
 
             // Step B (Unified): Generate Full Episode Script
-            let script = self.generate_full_episode_script(
-                category,
-                &host_name,
-                &all_items,
-                &plans,
-                &holiday_context,
-                logger.clone(),
-                Some(tx.clone())
-            ).await?;
-            
+            let script = self
+                .generate_full_episode_script(
+                    category,
+                    &host_name,
+                    &all_items,
+                    &plans,
+                    &holiday_context,
+                    logger.clone(),
+                    Some(tx.clone()),
+                )
+                .await?;
+
             // Step C: Extract title from content
             let title = match self.extract_episode_title(item_list, category).await {
                 Ok(t) => Some(t),
@@ -965,42 +1197,53 @@ impl NewsAggregator {
                     None
                 }
             };
-            
+
             // Cache the newly generated script and title to disk
             if let Some(path) = &tts_cache_path {
-                 #[derive(serde::Serialize)]
-                 struct TtsDraft<'a> {
-                     raw_script: &'a str,
-                     generated_title: Option<&'a String>,
-                 }
-                 let draft = TtsDraft { raw_script: &script, generated_title: title.as_ref() };
-                 if let Ok(json) = serde_json::to_string(&draft) {
-                     if let Err(e) = std::fs::write(path, json) {
-                         log::warn!("Failed to save TTS draft to disk: {}", e);
-                     } else {
-                         log::info!("Saved TTS draft to disk: {:?}", path);
-                     }
-                 }
+                #[derive(serde::Serialize)]
+                struct TtsDraft<'a> {
+                    raw_script: &'a str,
+                    generated_title: Option<&'a String>,
+                }
+                let draft = TtsDraft {
+                    raw_script: &script,
+                    generated_title: title.as_ref(),
+                };
+                if let Ok(json) = serde_json::to_string(&draft) {
+                    if let Err(e) = std::fs::write(path, json) {
+                        log::warn!("Failed to save TTS draft to disk: {}", e);
+                    } else {
+                        log::info!("Saved TTS draft to disk: {:?}", path);
+                    }
+                }
             }
 
             (script, title)
-
         } else {
             // No Items (Regen or legacy fallback): Use simple prompt
-             let prompt = self.build_prompt(category, &host_name, context, &holiday_context, is_regen);
-             let response = self.llm.chat(&prompt, is_regen).await?;
-             logger.lock().await.log_llm("Simple Generation", "Used legacy/regen one-shot prompt", &prompt, &response);
-             let _ = tx.send(response.clone()).await;
-             (response, None) // No title extraction for legacy mode
+            let prompt =
+                self.build_prompt(category, &host_name, context, &holiday_context, is_regen);
+            let response = self.llm.chat(&prompt, is_regen).await?;
+            logger.lock().await.log_llm(
+                "Simple Generation",
+                "Used legacy/regen one-shot prompt",
+                &prompt,
+                &response,
+            );
+            let _ = tx.send(response.clone()).await;
+            (response, None) // No title extraction for legacy mode
         };
-        
+
         drop(tx); // Close the channel
-        
+
         // 3. (Processed above)
-        
+
         // 4. Check for SKIP
         if raw_script.trim().contains("SKIP") || raw_script.trim().len() < 10 {
-            logger.lock().await.log("Result", "LLM indicated SKIP or empty script.");
+            logger
+                .lock()
+                .await
+                .log("Result", "LLM indicated SKIP or empty script.");
             log::info!("LLM indicated SKIP or empty script.");
             // Try saving trace even on skip
             let _ = logger.lock().await.save();
@@ -1017,7 +1260,7 @@ impl NewsAggregator {
             if let Some(newline_idx) = final_full_text.find('\n') {
                 let title_line = &final_full_text[..newline_idx];
                 final_title = Some(title_line.trim_start_matches("TITLE:").trim().to_string());
-                script_body = final_full_text[newline_idx+1..].trim().to_string();
+                script_body = final_full_text[newline_idx + 1..].trim().to_string();
             }
         }
 
@@ -1042,21 +1285,27 @@ impl NewsAggregator {
         // 7. Calculate Duration (Use WAV for accuracy) & Convert to MP3
         let mut duration = 0;
         let final_audio = if !wav_audio_bytes.is_empty() {
-             let cursor = std::io::Cursor::new(&wav_audio_bytes);
-             if let Ok(reader) = hound::WavReader::new(cursor) {
-                 duration = (reader.duration() as f64 / reader.spec().sample_rate as f64) as i64;
-             }
-             
-             // CONVERT TO MP3
-             logger.lock().await.log("Audio Processing", &format!("WAV generated ({}s). Converting to MP3 (128k)...", duration));
-             match self.tts.convert_to_mp3(&wav_audio_bytes).await {
-                 Ok(mp3_bytes) => Some(mp3_bytes),
-                 Err(e) => {
-                     logger.lock().await.log("Audio Processing Error", &format!("MP3 Conversion failed: {}", e));
-                     log::error!("MP3 Conversion failed: {}. Falling back to WAV.", e);
-                     Some(wav_audio_bytes)
-                 }
-             }
+            let cursor = std::io::Cursor::new(&wav_audio_bytes);
+            if let Ok(reader) = hound::WavReader::new(cursor) {
+                duration = (reader.duration() as f64 / reader.spec().sample_rate as f64) as i64;
+            }
+
+            // CONVERT TO MP3
+            logger.lock().await.log(
+                "Audio Processing",
+                &format!("WAV generated ({}s). Converting to MP3 (128k)...", duration),
+            );
+            match self.tts.convert_to_mp3(&wav_audio_bytes).await {
+                Ok(mp3_bytes) => Some(mp3_bytes),
+                Err(e) => {
+                    logger.lock().await.log(
+                        "Audio Processing Error",
+                        &format!("MP3 Conversion failed: {}", e),
+                    );
+                    log::error!("MP3 Conversion failed: {}. Falling back to WAV.", e);
+                    Some(wav_audio_bytes)
+                }
+            }
         } else {
             None
         };
@@ -1067,10 +1316,10 @@ impl NewsAggregator {
 
         // 8. Clean up TTS Cache on pure success
         if let Some(path) = tts_cache_path {
-             if path.exists() && final_audio.is_some() {
-                  let _ = std::fs::remove_file(&path);
-                  log::info!("Cleaned up TTS draft cache file.");
-             }
+            if path.exists() && final_audio.is_some() {
+                let _ = std::fs::remove_file(&path);
+                log::info!("Cleaned up TTS draft cache file.");
+            }
         }
 
         Ok((script_body, final_title, final_audio, duration, false))
@@ -1090,10 +1339,18 @@ impl NewsAggregator {
             "10-01" => greeting.push_str("今天是国庆节，"),
             _ => {}
         }
-        if l_month == 1 && l_day == 1 { greeting.push_str("今天是农历正月初一，春节快乐！"); }
-        if l_month == 1 && l_day == 15 { greeting.push_str("今天是元宵节，"); }
-        if l_month == 5 && l_day == 5 { greeting.push_str("今天是端午节，"); }
-        if l_month == 8 && l_day == 15 { greeting.push_str("今天是中秋节，"); }
+        if l_month == 1 && l_day == 1 {
+            greeting.push_str("今天是农历正月初一，春节快乐！");
+        }
+        if l_month == 1 && l_day == 15 {
+            greeting.push_str("今天是元宵节，");
+        }
+        if l_month == 5 && l_day == 5 {
+            greeting.push_str("今天是端午节，");
+        }
+        if l_month == 8 && l_day == 15 {
+            greeting.push_str("今天是中秋节，");
+        }
 
         if !greeting.is_empty() {
             format!("特别提示：{} 请在开场问候中自然融入节日祝福。", greeting)
@@ -1102,10 +1359,17 @@ impl NewsAggregator {
         }
     }
 
-    fn build_prompt(&self, category: &str, host: &str, context: &str, holiday: &str, is_regen: bool) -> String {
+    fn build_prompt(
+        &self,
+        category: &str,
+        host: &str,
+        context: &str,
+        holiday: &str,
+        is_regen: bool,
+    ) -> String {
         let now = chrono::Local::now();
         let time_info = now.format("%Y年%-m月%-d日 %H点").to_string();
-                let regen_instruction = if is_regen {
+        let regen_instruction = if is_regen {
             "注意：这是一个【重新生成】请求。请专注于改进提供的具体新闻故事，保留所有有意义的细节。"
         } else {
             "注意：这是一组新闻摘要。请将它们整合成一份连贯的【新闻简报】。如果有多条不同的新闻，请逐一播报。使用简洁的过渡方式，直接用新闻中的人物、地点、事件等信息进行衔接。"
@@ -1147,17 +1411,21 @@ impl NewsAggregator {
     // --- New Helper Functions ---
 
     /// Compress long summaries before segmentation
-    async fn compress_summaries(&self, items: &mut Vec<BroadcastItem>, max_chars: usize) -> Result<()> {
+    async fn compress_summaries(
+        &self,
+        items: &mut Vec<BroadcastItem>,
+        max_chars: usize,
+    ) -> Result<()> {
         for item in items.iter_mut() {
             let char_count = item.summary.chars().count();
             if char_count > max_chars {
                 log::info!("Compressing summary ({} chars): {}", char_count, item.title);
-                
+
                 let prompt = format!(
                     "精简以下新闻摘要至{}字以内，必须保留人名、公司名、数字、日期：\n\n{}\n\n仅输出精简后摘要：",
                     max_chars, item.summary
                 );
-                
+
                 let compressed = self.llm.chat(&prompt, false).await?;
                 item.summary = compressed.trim().to_string();
             }
@@ -1174,10 +1442,14 @@ impl NewsAggregator {
         plans: &[SegmentPlan],
         holiday_context: &str,
         logger: Arc<Mutex<TraceLogger>>,
-        tx: Option<tokio::sync::mpsc::Sender<String>>
+        tx: Option<tokio::sync::mpsc::Sender<String>>,
     ) -> Result<String> {
         let total_items = items.len();
-        log::info!("Unified Generation: {} groups, {} items", plans.len(), total_items);
+        log::info!(
+            "Unified Generation: {} groups, {} items",
+            plans.len(),
+            total_items
+        );
 
         // Chunking logic to avoid huge prompts (e.g. 130k chars)
         let mut chunks: Vec<Vec<SegmentPlan>> = Vec::new();
@@ -1196,7 +1468,7 @@ impl NewsAggregator {
         if !current_chunk.is_empty() {
             chunks.push(current_chunk);
         }
-        
+
         let mut full_script = String::new();
         let total_chunks = chunks.len();
         let mut previous_chunk_ending: Option<String> = None;
@@ -1209,30 +1481,51 @@ impl NewsAggregator {
             let mut ros = String::new();
             if is_first {
                 ros.push_str(&format!("【节目单 - {}频道】\n", category));
-                ros.push_str(&format!("时间: {}\n", chrono::Local::now().format("%Y-%m-%d")));
+                ros.push_str(&format!(
+                    "时间: {}\n",
+                    chrono::Local::now().format("%Y-%m-%d")
+                ));
                 ros.push_str(&format!("主播: {}\n", host_name));
                 if !holiday_context.is_empty() {
-                     ros.push_str(&format!("节日: {}\n", holiday_context));
+                    ros.push_str(&format!("节日: {}\n", holiday_context));
                 }
             }
-            ros.push_str(&format!("\n--- 第 {}/{} 部分播报流程 ---\n", chunk_idx + 1, total_chunks));
+            ros.push_str(&format!(
+                "\n--- 第 {}/{} 部分播报流程 ---\n",
+                chunk_idx + 1,
+                total_chunks
+            ));
 
             for (idx, plan) in plan_chunk.iter().enumerate() {
                 let theme = plan.group_theme.as_deref().unwrap_or("新闻组");
                 let action = &plan.action;
                 let rationale = plan.transition_rationale.as_deref().unwrap_or("自然过渡");
-                ros.push_str(&format!("{}. [{}] 主题：{} (过渡策略：{})\n", idx + 1, action.to_uppercase(), theme, rationale));
+                ros.push_str(&format!(
+                    "{}. [{}] 主题：{} (过渡策略：{})\n",
+                    idx + 1,
+                    action.to_uppercase(),
+                    theme,
+                    rationale
+                ));
             }
 
             // 2. Build Content Block (Grouped)
             let mut content = String::new();
             for (idx, plan) in plan_chunk.iter().enumerate() {
-                content.push_str(&format!("\n=== 第 {}/{} 部分 - 第 {} 组 (主题：{}) ===\n", chunk_idx + 1, total_chunks, idx + 1, plan.group_theme.as_deref().unwrap_or("Untitled")));
-                
+                content.push_str(&format!(
+                    "\n=== 第 {}/{} 部分 - 第 {} 组 (主题：{}) ===\n",
+                    chunk_idx + 1,
+                    total_chunks,
+                    idx + 1,
+                    plan.group_theme.as_deref().unwrap_or("Untitled")
+                ));
+
                 for id in &plan.ids {
                     if let Some(item) = items.iter().find(|i| i.id == *id) {
-                         content.push_str(&format!("--- Item ---\n标题: {}\n来源: {}\n摘要: {}\n", 
-                            item.title, item.source_name, item.summary));
+                        content.push_str(&format!(
+                            "--- Item ---\n标题: {}\n来源: {}\n摘要: {}\n",
+                            item.title, item.source_name, item.summary
+                        ));
                     }
                 }
             }
@@ -1244,15 +1537,22 @@ impl NewsAggregator {
             let full_content_block = content;
 
             let requirement_intro_outro = if total_chunks == 1 {
-                format!("必须包含 [开场白] -> [正文(按顺序串联)] -> [结束语]。\n\
+                format!(
+                    "必须包含 [开场白] -> [正文(按顺序串联)] -> [结束语]。\n\
                 - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (包含日期)\n\
-                - 结束语: \"以上就是本期内容...\"", category)
+                - 结束语: \"以上就是本期内容...\"",
+                    category
+                )
             } else if is_first {
-                format!("必须包含 [开场白] -> [正文(按顺序串联)]，不要写结束语，因为后面还有内容。\n\
-                - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (包含日期)", category)
+                format!(
+                    "必须包含 [开场白] -> [正文(按顺序串联)]，不要写结束语，因为后面还有内容。\n\
+                - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (包含日期)",
+                    category
+                )
             } else if is_last {
                 "必须包含 [正文(按顺序串联)] -> [结束语]，不要写开场白，直接承接上半部分。\n\
-                - 结束语: \"以上就是本期内容...\"".to_string()
+                - 结束语: \"以上就是本期内容...\""
+                    .to_string()
             } else {
                 "必须只包含 [正文(按顺序串联)]，不要写开场白，不要写结束语，直接承接上半部分并为下半部分留口子。".to_string()
             };
@@ -1311,48 +1611,70 @@ impl NewsAggregator {
             );
 
             // 4. LLM Call
-            logger.lock().await.log("Unified Gen Chunk", &format!("Starting generation for chunk {}/{}... (Length: {})", chunk_idx + 1, total_chunks, prompt.len()));
+            logger.lock().await.log(
+                "Unified Gen Chunk",
+                &format!(
+                    "Starting generation for chunk {}/{}... (Length: {})",
+                    chunk_idx + 1,
+                    total_chunks,
+                    prompt.len()
+                ),
+            );
             let response = self.llm.chat(&prompt, false).await?;
-            
-            logger.lock().await.log_llm("Unified Result Chunk", &format!("Script Chunk {}/{}", chunk_idx + 1, total_chunks), &prompt, &response);
+
+            logger.lock().await.log_llm(
+                "Unified Result Chunk",
+                &format!("Script Chunk {}/{}", chunk_idx + 1, total_chunks),
+                &prompt,
+                &response,
+            );
 
             let cleaned = clean_content(response);
-            
+
             // Capture the tail for the next chunk's context
             let tail_chars = 150; // Extract last 150 chars
             let char_count = cleaned.chars().count();
             if char_count > tail_chars {
-                previous_chunk_ending = Some(cleaned.chars().skip(char_count - tail_chars).collect());
+                previous_chunk_ending =
+                    Some(cleaned.chars().skip(char_count - tail_chars).collect());
             } else {
                 previous_chunk_ending = Some(cleaned.clone());
             }
 
             full_script.push_str(&cleaned);
             full_script.push_str("\n\n");
-            
+
             if let Some(sender) = &tx {
-                 if let Err(e) = sender.send(cleaned.clone()).await {
-                     log::warn!("Failed to send chunk to TTS pipeline: {}", e);
-                 }
+                if let Err(e) = sender.send(cleaned.clone()).await {
+                    log::warn!("Failed to send chunk to TTS pipeline: {}", e);
+                }
             }
         }
 
         // 5. Post-Processing / Safety
         let final_script = full_script.trim().to_string();
         if final_script.len() < 300 && total_chunks == 1 {
-             return Err(anyhow::anyhow!("Generated script too short (<300 chars). Likely just an intro."));
+            return Err(anyhow::anyhow!(
+                "Generated script too short (<300 chars). Likely just an intro."
+            ));
         }
 
         Ok(final_script)
     }
 
     /// Extract episode title from news content
-    async fn extract_episode_title(&self, items: &[BroadcastItem], category: &str) -> Result<String> {
-        let top_titles: String = items.iter().take(5)
+    async fn extract_episode_title(
+        &self,
+        items: &[BroadcastItem],
+        category: &str,
+    ) -> Result<String> {
+        let top_titles: String = items
+            .iter()
+            .take(5)
             .map(|i| format!("- {}", i.title))
             .collect::<Vec<_>>()
             .join("\n");
-        
+
         let prompt = format!(
             "从以下新闻中提取2-3个最重要的关键事件，生成简洁标题。\n\n\
             频道：{}\n今日新闻：\n{}\n\n\
@@ -1364,19 +1686,21 @@ impl NewsAggregator {
             示例：苹果发布M5芯片/SpaceX星舰第七次试飞",
             category, top_titles
         );
-        
+
         let response = self.llm.chat(&prompt, false).await?;
-        
+
         // Post-processing: clean up the title
         let mut title = response.trim().to_string();
-        
+
         // Try to extract from JSON if LLM still returned JSON despite instructions
         if title.contains('{') {
             let json_clean = title.trim_matches('`').trim().to_string();
             if let Some(start) = json_clean.find('{') {
                 if let Some(end) = json_clean.rfind('}') {
                     if start <= end {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_clean[start..=end]) {
+                        if let Ok(val) =
+                            serde_json::from_str::<serde_json::Value>(&json_clean[start..=end])
+                        {
                             if let Some(t) = val["title"].as_str() {
                                 title = t.trim().to_string();
                             }
@@ -1385,7 +1709,7 @@ impl NewsAggregator {
                 }
             }
         }
-        
+
         // Strip wrapping quotes
         title = title.trim_matches('"').trim_matches('\'').to_string();
         for ch in ['\u{201c}', '\u{201d}', '\u{2018}', '\u{2019}'] {
@@ -1399,7 +1723,7 @@ impl NewsAggregator {
                 break;
             }
         }
-        
+
         // Validate: reject obviously bad titles
         let now = chrono::Local::now();
         let date_suffix = now.format("%m.%d").to_string();
@@ -1411,33 +1735,37 @@ impl NewsAggregator {
             || title.contains('\n')
             || title.to_lowercase().contains("news digest")
             || title.to_lowercase().contains("news briefing");
-        
+
         if is_invalid {
-            log::warn!("Invalid title detected: \'{}\', using fallback", title.chars().take(50).collect::<String>());
+            log::warn!(
+                "Invalid title detected: \'{}\', using fallback",
+                title.chars().take(50).collect::<String>()
+            );
             // Build fallback from top 2-3 item titles
-            let short_titles: Vec<String> = items.iter().take(3)
+            let short_titles: Vec<String> = items
+                .iter()
+                .take(3)
                 .map(|i| i.title.chars().take(12).collect::<String>())
                 .collect();
             title = format!("{} {}", short_titles.join("/"), date_suffix);
         }
-        
+
         // Final length guard
         if title.chars().count() > 40 {
             title = title.chars().take(40).collect();
         }
-        
+
         Ok(title)
     }
 
-
-
     /// Step 1 (New): Entity-Based Grouping with Rich Context
     async fn group_items_by_entity(&self, items: &[BroadcastItem]) -> Result<Vec<ClusterGroup>> {
-        let item_list: String = items.iter()
+        let item_list: String = items
+            .iter()
             .map(|item| format!("ID {}: {} ({})", item.id, item.title, item.source_name))
             .collect::<Vec<_>>()
             .join("\n");
-            
+
         let prompt = format!(
             "Role: 新闻编辑助理 - 聚类专家。\n\
             Task: 将以下新闻按主题/实体分组，并说明分组理由。\n\
@@ -1464,48 +1792,63 @@ impl NewsAggregator {
         );
 
         let response = self.llm.chat(&prompt, false).await?;
-        
+
         // Parse JSON
         let json_clean = response.trim().trim_matches('`').trim();
-        
+
         // Safe JSON array extraction
         let json_str = match (json_clean.find('['), json_clean.rfind(']')) {
             (Some(s), Some(e)) if e >= s => &json_clean[s..=e],
             _ => "[]",
         };
         if let Ok(groups) = serde_json::from_str::<Vec<ClusterGroup>>(json_str) {
-                 // Validate all IDs exist
-                 let valid_ids: std::collections::HashSet<usize> = items.iter().map(|i| i.id).collect();
-                 let all_valid = groups.iter().all(|g| g.ids.iter().all(|id| valid_ids.contains(id)));
-                 if all_valid && !groups.is_empty() {
-                     return Ok(groups);
-                 }
+            // Validate all IDs exist
+            let valid_ids: std::collections::HashSet<usize> = items.iter().map(|i| i.id).collect();
+            let all_valid = groups
+                .iter()
+                .all(|g| g.ids.iter().all(|id| valid_ids.contains(id)));
+            if all_valid && !groups.is_empty() {
+                return Ok(groups);
+            }
         }
-        
+
         // Fallback: Each item is its own group with generic theme
-        Ok(items.iter().map(|i| ClusterGroup {
-            ids: vec![i.id],
-            theme: i.title.chars().take(20).collect::<String>() + "...",
-            clustering_reason: "独立新闻".to_string(),
-        }).collect())
+        Ok(items
+            .iter()
+            .map(|i| ClusterGroup {
+                ids: vec![i.id],
+                theme: i.title.chars().take(20).collect::<String>() + "...",
+                clustering_reason: "独立新闻".to_string(),
+            })
+            .collect())
     }
 
     /// Step 2: Intelligent Structure Planning (Two-Pass: Cluster -> Sequence)
-    async fn plan_episode_structure(&self, items: &[BroadcastItem], logger: Arc<Mutex<TraceLogger>>) -> Result<Vec<SegmentPlan>> {
+    async fn plan_episode_structure(
+        &self,
+        items: &[BroadcastItem],
+        logger: Arc<Mutex<TraceLogger>>,
+    ) -> Result<Vec<SegmentPlan>> {
         // Phase 1: Clustering with Rich Context
         log::info!("Phase 1: Clustering {} items by entity...", items.len());
         let cluster_groups = match self.group_items_by_entity(items).await {
             Ok(g) => g,
             Err(e) => {
                 log::warn!("Clustering failed: {}. Falling back to singletons.", e);
-                items.iter().map(|i| ClusterGroup {
-                    ids: vec![i.id],
-                    theme: i.title.chars().take(20).collect::<String>() + "...",
-                    clustering_reason: "聚类失败回退".to_string(),
-                }).collect()
+                items
+                    .iter()
+                    .map(|i| ClusterGroup {
+                        ids: vec![i.id],
+                        theme: i.title.chars().take(20).collect::<String>() + "...",
+                        clustering_reason: "聚类失败回退".to_string(),
+                    })
+                    .collect()
             }
         };
-        logger.lock().await.log("Clustering Result", &format!("{:?}", cluster_groups));
+        logger
+            .lock()
+            .await
+            .log("Clustering Result", &format!("{:?}", cluster_groups));
 
         // Filter out low-value classified ads (rentals, job search, ads) if they have only 1 item
         let mut filtered_groups = Vec::new();
@@ -1514,19 +1857,22 @@ impl NewsAggregator {
             // Only filter if it's a singleton (a single forum post)
             if group.ids.len() == 1 {
                 let theme_lower = group.theme.to_lowercase();
-                if theme_lower.contains("求职") 
-                    || theme_lower.contains("招聘") 
-                    || theme_lower.contains("合租") 
-                    || theme_lower.contains("转让") 
-                    || theme_lower.contains("出售") 
-                    || theme_lower.contains("出二手") 
-                    || theme_lower.contains("接单") 
+                if theme_lower.contains("求职")
+                    || theme_lower.contains("招聘")
+                    || theme_lower.contains("合租")
+                    || theme_lower.contains("转让")
+                    || theme_lower.contains("出售")
+                    || theme_lower.contains("出二手")
+                    || theme_lower.contains("接单")
                 {
                     is_low_value = true;
                 }
             }
             if is_low_value {
-                log::info!("Filtered out low-value classified ad group: {}", group.theme);
+                log::info!(
+                    "Filtered out low-value classified ad group: {}",
+                    group.theme
+                );
             } else {
                 filtered_groups.push(group);
             }
@@ -1537,12 +1883,17 @@ impl NewsAggregator {
         // Build descriptions with theme info
         let mut group_descriptions = Vec::new();
         for (idx, group) in cluster_groups.iter().enumerate() {
-            let titles: Vec<String> = group.ids.iter()
+            let titles: Vec<String> = group
+                .ids
+                .iter()
                 .filter_map(|id| items.iter().find(|i| i.id == *id).map(|i| i.title.clone()))
                 .collect();
             group_descriptions.push(format!(
-                "Group {}: 【主题: {}】{} (聚类原因: {})", 
-                idx, group.theme, titles.join(" / "), group.clustering_reason
+                "Group {}: 【主题: {}】{} (聚类原因: {})",
+                idx,
+                group.theme,
+                titles.join(" / "),
+                group.clustering_reason
             ));
         }
 
@@ -1574,12 +1925,15 @@ impl NewsAggregator {
             #[serde(default)]
             transition_rationale: Option<String>,
         }
-        
+
         let response = self.llm.chat(&prompt_v2, false).await?;
-        logger.lock().await.log_llm("Planning Phase 2", "Sequencing", &prompt_v2, &response);
+        logger
+            .lock()
+            .await
+            .log_llm("Planning Phase 2", "Sequencing", &prompt_v2, &response);
 
         let json_clean = response.trim().trim_matches('`').trim();
-        
+
         // Safe JSON array extraction
         let steps: Vec<Step> = match (json_clean.find('['), json_clean.rfind(']')) {
             (Some(s), Some(e)) if e >= s => {
@@ -1597,32 +1951,31 @@ impl NewsAggregator {
                     ids: cluster.ids.clone(),
                     transition_rationale: step.transition_rationale,
                     group_theme: Some(cluster.theme.clone()),
-                    merge_reason: if step.action == "merge" { 
-                        Some(cluster.clustering_reason.clone()) 
-                    } else { 
-                        None 
+                    merge_reason: if step.action == "merge" {
+                        Some(cluster.clustering_reason.clone())
+                    } else {
+                        None
                     },
                 });
             }
         }
-        
+
         // Fallback if empty or failed
         if final_plans.is_empty() {
-             log::warn!("Planning V2 failed/empty. Using raw groups.");
-             for cluster in cluster_groups {
-                 final_plans.push(SegmentPlan { 
-                     action: "sequence".to_string(), 
-                     ids: cluster.ids, 
-                     transition_rationale: None,
-                     group_theme: Some(cluster.theme),
-                     merge_reason: None,
-                 });
-             }
+            log::warn!("Planning V2 failed/empty. Using raw groups.");
+            for cluster in cluster_groups {
+                final_plans.push(SegmentPlan {
+                    action: "sequence".to_string(),
+                    ids: cluster.ids,
+                    transition_rationale: None,
+                    group_theme: Some(cluster.theme),
+                    merge_reason: None,
+                });
+            }
         }
 
         Ok(final_plans)
     }
-
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1658,16 +2011,16 @@ struct SegmentPlan {
     #[serde(default)]
     transition_rationale: Option<String>, // Planner-Driven Transition Logic
     #[serde(default)]
-    group_theme: Option<String>,          // 这组新闻的主题 (如 "科技巨头动态")
+    group_theme: Option<String>, // 这组新闻的主题 (如 "科技巨头动态")
     #[serde(default)]
-    merge_reason: Option<String>,         // 为什么合并 (如 "同一公司的多个产品发布")
+    merge_reason: Option<String>, // 为什么合并 (如 "同一公司的多个产品发布")
 }
 
 /// Rich clustering result with reasoning
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct ClusterGroup {
     ids: Vec<usize>,
-    theme: String,           // 这组的主题
+    theme: String,             // 这组的主题
     clustering_reason: String, // 为什么放在一起
 }
 
@@ -1684,7 +2037,7 @@ fn clean_content(text: String) -> String {
     // 2. Remove specific banned phrases (Ending cues that might slip through)
     let banned = [
         "本条播放完毕",
-        "（播报结束）", 
+        "（播报结束）",
         "播报结束",
         "谢谢收听",
         "以上是",
@@ -1695,9 +2048,10 @@ fn clean_content(text: String) -> String {
 
     // 3. Remove Title/Source lines often hallucinated
     // e.g. "Title: ..." or "Source: ..." or "### Segment 1"
-    let re_meta = Regex::new(r"(?im)^(Title|Source|Category|###|Group|Segment)\s*[:：].*$").unwrap();
+    let re_meta =
+        Regex::new(r"(?im)^(Title|Source|Category|###|Group|Segment)\s*[:：].*$").unwrap();
     cleaned = re_meta.replace_all(&cleaned, "").to_string();
-    
+
     // 4. Remove standalone ### headers
     let re_h3 = Regex::new(r"(?m)^###.*$").unwrap();
     cleaned = re_h3.replace_all(&cleaned, "").to_string();

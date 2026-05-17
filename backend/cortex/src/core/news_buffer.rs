@@ -126,20 +126,23 @@ impl NewsBuffer {
             .collect())
     }
 
-    /// Get cluster statistics per category: (cluster_count, oldest_timestamp)
+    /// Get cluster statistics per category: (cluster_count, oldest_timestamp).
     pub fn get_category_stats(&self) -> Result<std::collections::HashMap<String, (usize, u64)>> {
         let mut stats: std::collections::HashMap<String, (usize, u64)> =
             std::collections::HashMap::new();
 
         for item in self.db.iter() {
-            let (_, val) = item?;
+            let (key, val) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.contains('#') {
+                continue;
+            }
+
             if let Ok(cluster) = serde_json::from_slice::<ClusterData>(&val) {
                 let category = cluster.main_item.category.clone();
                 let entry = stats.entry(category).or_insert((0, u64::MAX));
-                entry.0 += 1; // Count
-                if cluster.created_at < entry.1 {
-                    entry.1 = cluster.created_at; // Oldest
-                }
+                entry.0 += 1;
+                entry.1 = entry.1.min(cluster.created_at);
             }
         }
         Ok(stats)
@@ -251,25 +254,82 @@ impl NewsBuffer {
 
     /// Get database size estimate in bytes
     pub fn get_db_size(&self) -> Result<u64> {
-        let mut total_size: u64 = 0;
-        // Estimate size by iterating all entries
-        for item in self.db.iter() {
-            let (key, val) = item?;
-            total_size += key.len() as u64 + val.len() as u64;
-        }
-        // Also count processed_links tree
-        if let Ok(tree) = self.db.open_tree("processed_links") {
-            for item in tree.iter() {
-                let (key, val) = item?;
-                total_size += key.len() as u64 + val.len() as u64;
-            }
-        }
-        Ok(total_size)
+        Ok(self.db.size_on_disk().unwrap_or(0))
     }
 
     /// Get count of processed links
     pub fn get_processed_links_count(&self) -> Result<usize> {
         let tree = self.db.open_tree("processed_links")?;
         Ok(tree.iter().count())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_cache_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "freshloop-news-buffer-test-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn item(category: &str, title: &str) -> PendingNewsItem {
+        PendingNewsItem {
+            title: title.to_string(),
+            link: format!("https://example.com/{}", title),
+            description: "summary".to_string(),
+            category: category.to_string(),
+            source_name: Some("test".to_string()),
+            timestamp: 1_700_000_000,
+            original_text: "original".to_string(),
+        }
+    }
+
+    #[test]
+    fn category_stats_count_clusters_and_track_oldest_timestamp() {
+        let cache_dir = temp_cache_dir();
+        let cache_dir_str = cache_dir.to_string_lossy().to_string();
+        let buffer = NewsBuffer::new(&cache_dir_str).expect("create buffer");
+
+        let mut first = ClusterData::new(item("Tech", "first"));
+        first.id = "first".to_string();
+        first.created_at = 300;
+        buffer.store_cluster(&first).expect("store first");
+
+        let mut second = ClusterData::new(item("Tech", "second"));
+        second.id = "second".to_string();
+        second.created_at = 100;
+        buffer.store_cluster(&second).expect("store second");
+
+        let mut third = ClusterData::new(item("Life", "third"));
+        third.id = "third".to_string();
+        third.created_at = 200;
+        buffer.store_cluster(&third).expect("store third");
+
+        let stats = buffer.get_category_stats().expect("stats");
+        assert_eq!(stats.get("Tech"), Some(&(2, 100)));
+        assert_eq!(stats.get("Life"), Some(&(1, 200)));
+
+        drop(buffer);
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn category_stats_ignore_processed_link_tree_entries() {
+        let cache_dir = temp_cache_dir();
+        let cache_dir_str = cache_dir.to_string_lossy().to_string();
+        let buffer = NewsBuffer::new(&cache_dir_str).expect("create buffer");
+
+        buffer
+            .mark_link_processed("https://example.com/processed")
+            .expect("mark processed");
+
+        let stats = buffer.get_category_stats().expect("stats");
+        assert!(stats.is_empty());
+
+        drop(buffer);
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 }

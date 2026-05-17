@@ -6,8 +6,10 @@ import 'package:android_client/src/rust/models.dart';
 import 'package:android_client/src/rust/frb_generated.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'audio_handler.dart';
+import 'feed_api.dart';
 import 'ui/theme.dart';
 import 'ui/feed_screen.dart';
+import 'ui/reading_screen.dart';
 import 'update_manager.dart';
 import 'dart:async';
 
@@ -76,6 +78,10 @@ Future<void> main() async {
               }
               return feed!;
             },
+          ),
+          ChangeNotifierProvider(
+            create: (_) =>
+                ReadingFeedProvider(CuratedFeedApi(baseUrl: baseUrl)),
           ),
         ],
         child: const FreshLoopApp(),

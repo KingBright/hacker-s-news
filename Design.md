@@ -45,7 +45,7 @@ Worker Side (Cortex 节点)/opt/freshloop/worker/
 └── cortex_app        # 工作端二进制文件
 4.2 配置文件 (config.toml)Cortex 通过此文件管理所有业务逻辑配置。[nexus]
 api_url = "[http://192.168.1.10:8899](http://192.168.1.10:)"  # Nexus 服务地址
-auth_key = "my-secret-key-123"        # 通信鉴权密钥
+auth_key = "CHANGE_ME_NEXUS_KEY"      # 通信鉴权密钥
 
 [llm]
 model = "llama3"

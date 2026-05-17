@@ -1,18 +1,30 @@
 use crate::core::aggregator::NewsAggregator;
-use crate::core::config::Config;
+use crate::core::config::{Config, CuratedFeedConfig};
+use crate::core::content::{
+    clean_text_for_processing, fetch_feed_entries, fetch_url_bytes, parse_opml_sources,
+    FeedFetchOptions,
+};
 use crate::core::llm::LlmClient;
 use crate::core::news_buffer::{NewsBuffer, PendingNewsItem};
 use crate::core::nexus::NexusClient;
+use crate::core::products::curated_feed::CuratedFeedPipeline;
 use crate::core::topic_registry::TopicRegistry;
 use crate::core::tts::TtsClient;
 use anyhow::Result;
-use axum::{extract::State, routing::{get, post}, Json, Router};
-use regex::Regex;
+use axum::{
+    extract::State,
+    http::{header, HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use sysinfo::{get_current_pid, System};
 use tokio::time::{self, Duration};
 use tokio_cron_scheduler::{Job, JobScheduler};
-use sysinfo::{System, get_current_pid};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 struct ItemAnalysis {
@@ -39,9 +51,25 @@ async fn run_one_cycle(
     let feed_count = config.rss_feeds.as_ref().map(|f| f.len()).unwrap_or(0);
     log::info!("Configured RSS feeds: {}", feed_count);
     if let Some(feeds) = &config.rss_feeds {
-        let proxy = config.http_proxy.as_deref();
+        let fetch_options = FeedFetchOptions::new(config.http_proxy.clone());
+        let curated_source_urls = collect_curated_source_urls(&config).await;
+        if !curated_source_urls.is_empty() {
+            log::info!(
+                "Radio RSS exclusion loaded {} curated source URLs",
+                curated_source_urls.len()
+            );
+        }
+
         for url in feeds {
-            match fetch_rss_items(url, proxy).await {
+            if curated_source_urls.contains(&normalize_feed_url(url)) {
+                log::info!(
+                    "Skipping Radio RSS source already owned by curated feed: {}",
+                    url
+                );
+                continue;
+            }
+
+            match fetch_feed_entries(url, &fetch_options).await {
                 Ok(items) => all_candidate_items.extend(items),
                 Err(e) => log::warn!("Failed to fetch RSS {}: {}", url, e),
             }
@@ -120,7 +148,10 @@ async fn run_one_cycle(
                     tokio::time::sleep(delay).await;
                 } else {
                     log::error!("Failed to connect to Nexus for deduplication after 5 attempts");
-                    return Err(anyhow::anyhow!("Failed to connect to Nexus for deduplication after 5 attempts: {}", e));
+                    return Err(anyhow::anyhow!(
+                        "Failed to connect to Nexus for deduplication after 5 attempts: {}",
+                        e
+                    ));
                 }
             }
         }
@@ -131,7 +162,6 @@ async fn run_one_cycle(
         .filter(|i| !existing_urls.contains(&i.link))
         .collect();
 
-    use std::collections::HashSet;
     let mut unique_links = HashSet::new();
     let mut unique_items = Vec::new();
     for item in new_items {
@@ -167,7 +197,7 @@ async fn run_one_cycle(
     let category_names_str = valid_category_names.join("、");
 
     for item in unique_items {
-        let clean_desc = clean_text(&item.description, 5000);
+        let clean_desc = clean_text_for_processing(&item.description, 5000);
         let analysis_prompt = format!(
             "Analyze this news item.\nTitle: {}\nContent: {}\n\n\
             Task:\n\
@@ -180,78 +210,80 @@ async fn run_one_cycle(
             item.title, clean_desc, topics_str, category_names_str
         );
 
-        match llm.chat_json::<ItemAnalysis>(&analysis_prompt, "item_analysis", false).await {
+        match llm
+            .chat_json::<ItemAnalysis>(&analysis_prompt, "item_analysis", false)
+            .await
+        {
             Ok(analysis) => {
-                    if analysis.category == "广告"
-                        || analysis.category == "Advertisement"
-                        || analysis.score < 6
-                    {
-                        log::info!(
-                            "[FILTER] Discarding Low Quality/Ad: [{}] {} (Score: {})",
-                            analysis.category,
-                            analysis.title,
-                            analysis.score
-                        );
+                if analysis.category == "广告"
+                    || analysis.category == "Advertisement"
+                    || analysis.score < 6
+                {
+                    log::info!(
+                        "[FILTER] Discarding Low Quality/Ad: [{}] {} (Score: {})",
+                        analysis.category,
+                        analysis.title,
+                        analysis.score
+                    );
+                    let buf = buffer.lock().await;
+                    buf.mark_link_processed(&item.link).ok();
+                    continue;
+                }
+
+                let normalized_category = {
+                    let llm_cat = analysis.category.trim();
+                    if valid_category_names.contains(&llm_cat.to_string()) {
+                        llm_cat.to_string()
+                    } else {
+                        let mut matched = None;
+                        let llm_cat_clean = llm_cat.replace(" ", "");
+                        for valid_name in &valid_category_names {
+                            let valid_name_clean = valid_name.replace(" ", "");
+                            if valid_name_clean.contains(&llm_cat_clean)
+                                || llm_cat_clean.contains(&valid_name_clean)
+                            {
+                                matched = Some(valid_name.clone());
+                                break;
+                            }
+                        }
+                        match matched {
+                            Some(name) => {
+                                log::info!("[CATEGORY FIX] Normalized '{}' -> '{}'", llm_cat, name);
+                                name
+                            }
+                            None => {
+                                log::warn!(
+                                    "[CATEGORY FIX] Unknown category '{}', falling back to '其他'",
+                                    llm_cat
+                                );
+                                "其他".to_string()
+                            }
+                        }
+                    }
+                };
+
+                log::info!(
+                    "Buffering item: [{}] {}",
+                    normalized_category,
+                    analysis.title
+                );
+                let pending = PendingNewsItem {
+                    title: analysis.title,
+                    link: item.link.clone(),
+                    description: analysis.summary,
+                    category: normalized_category,
+                    source_name: item.source_name.clone(),
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                    original_text: clean_desc.clone(),
+                };
+
+                match aggregator.push_with_clustering(pending).await {
+                    Ok(_) => {
                         let buf = buffer.lock().await;
                         buf.mark_link_processed(&item.link).ok();
-                        continue;
                     }
-
-                    let normalized_category = {
-                        let llm_cat = analysis.category.trim();
-                        if valid_category_names.contains(&llm_cat.to_string()) {
-                            llm_cat.to_string()
-                        } else {
-                            let mut matched = None;
-                            let llm_cat_clean = llm_cat.replace(" ", "");
-                            for valid_name in &valid_category_names {
-                                let valid_name_clean = valid_name.replace(" ", "");
-                                if valid_name_clean.contains(&llm_cat_clean)
-                                    || llm_cat_clean.contains(&valid_name_clean)
-                                {
-                                    matched = Some(valid_name.clone());
-                                    break;
-                                }
-                            }
-                            match matched {
-                                Some(name) => {
-                                    log::info!(
-                                        "[CATEGORY FIX] Normalized '{}' -> '{}'",
-                                        llm_cat,
-                                        name
-                                    );
-                                    name
-                                }
-                                None => {
-                                    log::warn!("[CATEGORY FIX] Unknown category '{}', falling back to '其他'", llm_cat);
-                                    "其他".to_string()
-                                }
-                            }
-                        }
-                    };
-
-                    log::info!(
-                        "Buffering item: [{}] {}",
-                        normalized_category,
-                        analysis.title
-                    );
-                    let pending = PendingNewsItem {
-                        title: analysis.title,
-                        link: item.link.clone(),
-                        description: analysis.summary,
-                        category: normalized_category,
-                        source_name: item.source_name.clone(),
-                        timestamp: chrono::Utc::now().timestamp() as u64,
-                        original_text: clean_desc.clone(),
-                    };
-
-                    match aggregator.push_with_clustering(pending).await {
-                        Ok(_) => {
-                            let buf = buffer.lock().await;
-                            buf.mark_link_processed(&item.link).ok();
-                        }
-                        Err(e) => log::error!("Failed to push with clustering: {}", e),
-                    }
+                    Err(e) => log::error!("Failed to push with clustering: {}", e),
+                }
             }
             Err(e) => {
                 log::warn!("LLM analysis failed for '{}': {}", item.title, e);
@@ -268,6 +300,87 @@ async fn run_one_cycle(
     }
     log::info!("News Cycle Finished.");
     Ok(())
+}
+
+async fn collect_curated_source_urls(config: &Config) -> HashSet<String> {
+    let mut urls = HashSet::new();
+    let Some(feed_config) = config.curated_feed.as_ref() else {
+        return urls;
+    };
+    if !feed_config.enabled {
+        return urls;
+    }
+
+    let Some(sources) = feed_config.feeds.as_ref() else {
+        return urls;
+    };
+
+    let fetch_options = curated_feed_fetch_options(config, feed_config);
+    for source in sources {
+        let kind = source.kind.as_deref().unwrap_or_else(|| {
+            if source.url.to_ascii_lowercase().ends_with(".opml") {
+                "opml"
+            } else {
+                "rss"
+            }
+        });
+
+        if kind.eq_ignore_ascii_case("opml") {
+            match fetch_url_bytes(&source.url, &fetch_options).await {
+                Ok(bytes) => match parse_opml_sources(&bytes, source.source_group.as_deref()) {
+                    Ok(parsed) => {
+                        urls.extend(
+                            parsed
+                                .into_iter()
+                                .map(|source| normalize_feed_url(&source.url)),
+                        );
+                    }
+                    Err(e) => log::warn!(
+                        "Failed to parse curated OPML for Radio exclusions {}: {}",
+                        source.url,
+                        e
+                    ),
+                },
+                Err(e) => log::warn!(
+                    "Failed to fetch curated OPML for Radio exclusions {}: {}",
+                    source.url,
+                    e
+                ),
+            }
+        } else {
+            urls.insert(normalize_feed_url(&source.url));
+        }
+    }
+
+    urls
+}
+
+fn curated_feed_fetch_options(
+    config: &Config,
+    feed_config: &CuratedFeedConfig,
+) -> FeedFetchOptions {
+    FeedFetchOptions::new(config.http_proxy.clone())
+        .with_prefer_proxy(feed_config.prefer_proxy.unwrap_or(false))
+}
+
+fn normalize_feed_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if let Ok(parsed) = reqwest::Url::parse(trimmed) {
+        let scheme = parsed.scheme().to_ascii_lowercase();
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        let port = parsed
+            .port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        let path = parsed.path().trim_end_matches('/');
+        let query = parsed
+            .query()
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default();
+        return format!("{scheme}://{host}{port}{path}{query}");
+    }
+
+    trimmed.trim_end_matches('/').to_ascii_lowercase()
 }
 
 pub async fn run_news_loop(
@@ -298,6 +411,12 @@ pub async fn run_news_loop(
         tts.clone(),
         nexus.clone(),
         config.hosts.clone(),
+    ));
+    let curated_pipeline = Arc::new(CuratedFeedPipeline::new(
+        config.clone(),
+        llm.clone(),
+        tts.clone(),
+        nexus.clone(),
     ));
 
     // Migration / Startup Maintenance
@@ -331,7 +450,8 @@ pub async fn run_news_loop(
         loop {
             interval.tick().await;
             let buf = buffer_clone.lock().await;
-            match buf.prune_old_links(3 * 24 * 3600) { // 3 days TTL
+            match buf.prune_old_links(3 * 24 * 3600) {
+                // 3 days TTL
                 Ok(n) => {
                     if n > 0 {
                         log::info!("Link Prune: Removed {} old processed links", n);
@@ -350,7 +470,8 @@ pub async fn run_news_loop(
         loop {
             interval.tick().await;
             let buf = buffer_clone2.lock().await;
-            match buf.prune_old_clusters(7 * 24 * 3600) { // 7 days TTL
+            match buf.prune_old_clusters(7 * 24 * 3600) {
+                // 7 days TTL
                 Ok(n) => {
                     if n > 0 {
                         log::info!("Cluster Prune: Removed {} old clusters", n);
@@ -477,6 +598,93 @@ pub async fn run_news_loop(
         sched.add(job).await.expect("Failed to add hourly job");
     }
 
+    if curated_pipeline.is_enabled() {
+        let curated_times = config
+            .curated_feed
+            .as_ref()
+            .and_then(|feed| feed.schedule_times.clone())
+            .unwrap_or_else(|| vec!["08:30".to_string()]);
+
+        for time_str in curated_times {
+            if let Some(cron_str) = local_time_to_utc_cron(&time_str, config.timezone_offset) {
+                log::info!(
+                    "Adding curated feed job: {} (Local) -> {} (UTC Cron)",
+                    time_str,
+                    cron_str
+                );
+                let pipeline = curated_pipeline.clone();
+                let gn = get_now.clone();
+                let job = Job::new_async(cron_str.as_str(), move |_uuid, _l| {
+                    let pipeline = pipeline.clone();
+                    let now = gn();
+                    Box::pin(async move {
+                        if let Err(e) = pipeline.run_once(now).await {
+                            log::error!("Scheduled curated feed cycle failed: {}", e);
+                        }
+                    })
+                })
+                .expect("Failed to create curated feed job");
+                sched
+                    .add(job)
+                    .await
+                    .expect("Failed to add curated feed job");
+            } else {
+                log::warn!("Invalid curated feed schedule time '{}'", time_str);
+            }
+        }
+
+        let weekly_digest_enabled = config
+            .curated_feed
+            .as_ref()
+            .and_then(|feed| feed.weekly_digest_enabled)
+            .unwrap_or(true);
+        if weekly_digest_enabled {
+            let weekly_times = config
+                .curated_feed
+                .as_ref()
+                .and_then(|feed| feed.weekly_digest_schedule_times.clone())
+                .unwrap_or_else(|| vec!["21:00".to_string()]);
+
+            for time_str in weekly_times {
+                if let Some(cron_str) = local_time_to_utc_cron(&time_str, config.timezone_offset) {
+                    log::info!(
+                        "Adding curated weekly digest check: {} (Local) -> {} (UTC Cron)",
+                        time_str,
+                        cron_str
+                    );
+                    let pipeline = curated_pipeline.clone();
+                    let gn = get_now.clone();
+                    let job = Job::new_async(cron_str.as_str(), move |_uuid, _l| {
+                        let pipeline = pipeline.clone();
+                        let now = gn();
+                        Box::pin(async move {
+                            match pipeline.run_weekly_digest(now, false).await {
+                                Ok(stats) if stats.published => log::info!(
+                                    "Scheduled curated weekly digest published: included={}",
+                                    stats.included_items
+                                ),
+                                Ok(stats) => log::info!(
+                                    "Scheduled curated weekly digest skipped: {:?}",
+                                    stats.skipped_reason
+                                ),
+                                Err(e) => {
+                                    log::error!("Scheduled curated weekly digest failed: {}", e)
+                                }
+                            }
+                        })
+                    })
+                    .expect("Failed to create curated weekly digest job");
+                    sched
+                        .add(job)
+                        .await
+                        .expect("Failed to add curated weekly digest job");
+                } else {
+                    log::warn!("Invalid curated weekly digest schedule time '{}'", time_str);
+                }
+            }
+        }
+    }
+
     // 3. Maintenance job (every minute)
     let m_aggregator = aggregator.clone();
     let maintenance_job = Job::new_async("0 * * * * *", move |_uuid, _l| {
@@ -497,6 +705,21 @@ pub async fn run_news_loop(
     log::info!("Job scheduler started successfully.");
 
     // Start HTTP trigger server (replaces the idle sleep loop)
+    let bind_addr = std::env::var("CORTEX_BIND_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:3721".to_string())
+        .parse::<SocketAddr>()
+        .expect("CORTEX_BIND_ADDR must be a valid socket address, e.g. 127.0.0.1:3721");
+    let api_key = std::env::var("CORTEX_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty());
+
+    if !bind_addr.ip().is_loopback() && api_key.is_none() {
+        panic!(
+            "Refusing to bind Cortex trigger API to non-loopback address {} without CORTEX_API_KEY",
+            bind_addr
+        );
+    }
+
     let app_state = Arc::new(TriggerState {
         config: config.clone(),
         llm: llm.clone(),
@@ -504,21 +727,28 @@ pub async fn run_news_loop(
         aggregator: aggregator.clone(),
         buffer: buffer.clone(),
         registry: registry.clone(),
+        curated_pipeline: curated_pipeline.clone(),
         get_now: Box::new(get_now),
         running: tokio::sync::Mutex::new(false),
+        api_key,
     });
 
     let app = Router::new()
         .route("/api/trigger", post(handle_trigger))
+        .route("/api/trigger/feed", post(handle_feed_trigger))
+        .route("/api/trigger/feed/weekly", post(handle_feed_weekly_trigger))
         .route("/api/status", get(handle_status))
         .route("/api/memory", get(handle_memory))
         .route("/api/health/nexus", get(handle_nexus_health))
         .with_state(app_state);
 
-    let bind_addr = "0.0.0.0:3721";
     log::info!("Cortex trigger API listening on {}", bind_addr);
-    let listener = tokio::net::TcpListener::bind(bind_addr).await.expect("Failed to bind trigger API");
-    axum::serve(listener, app).await.expect("Trigger API server failed");
+    let listener = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .expect("Failed to bind trigger API");
+    axum::serve(listener, app)
+        .await
+        .expect("Trigger API server failed");
 }
 
 // --- HTTP Trigger API ---
@@ -530,8 +760,10 @@ struct TriggerState {
     aggregator: Arc<NewsAggregator>,
     buffer: Arc<tokio::sync::Mutex<NewsBuffer>>,
     registry: Arc<TopicRegistry>,
+    curated_pipeline: Arc<CuratedFeedPipeline>,
     get_now: Box<dyn Fn() -> chrono::DateTime<chrono::FixedOffset> + Send + Sync>,
     running: tokio::sync::Mutex<bool>,
+    api_key: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -549,10 +781,85 @@ struct TriggerQuery {
     flush_only: bool,
 }
 
+#[derive(serde::Deserialize, Default)]
+struct FeedWeeklyTriggerQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+fn has_valid_cortex_key(headers: &HeaderMap, expected_key: &Option<String>) -> bool {
+    let Some(expected_key) = expected_key.as_deref() else {
+        return true;
+    };
+
+    let direct_key = headers
+        .get("X-CORTEX-KEY")
+        .and_then(|value| value.to_str().ok());
+    if direct_key.is_some_and(|key| constant_time_eq(key, expected_key)) {
+        return true;
+    }
+
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|key| constant_time_eq(key, expected_key))
+}
+
+fn unauthorized_response() -> axum::response::Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "success": false,
+            "message": "Invalid or missing Cortex API key"
+        })),
+    )
+        .into_response()
+}
+
+fn local_time_to_utc_cron(time_str: &str, timezone_offset: Option<i32>) -> Option<String> {
+    let parts: Vec<&str> = time_str.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let h: i32 = parts[0].parse().ok()?;
+    let m: i32 = parts[1].parse().ok()?;
+    if !(0..=23).contains(&h) || !(0..=59).contains(&m) {
+        return None;
+    }
+
+    let offset = timezone_offset.unwrap_or(8);
+    let mut utc_h = h - offset;
+    while utc_h < 0 {
+        utc_h += 24;
+    }
+    while utc_h >= 24 {
+        utc_h -= 24;
+    }
+    Some(format!("0 {} {} * * *", m, utc_h))
+}
+
 async fn handle_trigger(
     State(state): State<Arc<TriggerState>>,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<TriggerQuery>,
-) -> Json<TriggerResponse> {
+) -> impl IntoResponse {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+
     // Prevent concurrent triggers
     {
         let mut running = state.running.lock().await;
@@ -560,7 +867,8 @@ async fn handle_trigger(
             return Json(TriggerResponse {
                 success: false,
                 message: "A cycle is already running. Please wait.".to_string(),
-            });
+            })
+            .into_response();
         }
         *running = true;
     }
@@ -569,7 +877,10 @@ async fn handle_trigger(
     let flush_only = query.flush_only;
 
     if flush_only {
-        log::info!("[Trigger API] Flush-only triggered at {} (skipping RSS+LLM, running TTS directly)", now);
+        log::info!(
+            "[Trigger API] Flush-only triggered at {} (skipping RSS+LLM, running TTS directly)",
+            now
+        );
     } else {
         log::info!("[Trigger API] Manual cycle triggered at {}", now);
     }
@@ -585,28 +896,158 @@ async fn handle_trigger(
     tokio::spawn(async move {
         let result = if flush_only {
             // Skip RSS + LLM, directly process buffered clusters
-            log::info!("[Flush-Only] Running aggregator.try_process() on existing buffered data...");
+            log::info!(
+                "[Flush-Only] Running aggregator.try_process() on existing buffered data..."
+            );
             aggregator.try_process().await
         } else {
             run_one_cycle(config, llm, nexus, aggregator, buffer, now).await
         };
         match &result {
-            Ok(()) => log::info!("[Trigger API] {} completed successfully", if flush_only { "Flush-only" } else { "Manual cycle" }),
-            Err(e) => log::error!("[Trigger API] {} failed: {}", if flush_only { "Flush-only" } else { "Manual cycle" }, e),
+            Ok(()) => log::info!(
+                "[Trigger API] {} completed successfully",
+                if flush_only {
+                    "Flush-only"
+                } else {
+                    "Manual cycle"
+                }
+            ),
+            Err(e) => log::error!(
+                "[Trigger API] {} failed: {}",
+                if flush_only {
+                    "Flush-only"
+                } else {
+                    "Manual cycle"
+                },
+                e
+            ),
         }
         *state_clone.running.lock().await = false;
     });
 
-    let mode = if flush_only { "Flush-only (TTS only)" } else { "Full cycle" };
+    let mode = if flush_only {
+        "Flush-only (TTS only)"
+    } else {
+        "Full cycle"
+    };
     Json(TriggerResponse {
         success: true,
         message: format!("{} triggered at {}. Running in background.", mode, now),
     })
+    .into_response()
+}
+
+async fn handle_feed_trigger(
+    State(state): State<Arc<TriggerState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+
+    {
+        let mut running = state.running.lock().await;
+        if *running {
+            return Json(TriggerResponse {
+                success: false,
+                message: "A cycle is already running. Please wait.".to_string(),
+            })
+            .into_response();
+        }
+        *running = true;
+    }
+
+    let now = (state.get_now)();
+    let pipeline = state.curated_pipeline.clone();
+    let state_clone = state.clone();
+
+    tokio::spawn(async move {
+        let result = pipeline.run_once(now).await;
+        match &result {
+            Ok(stats) => log::info!(
+                "[Trigger API] curated feed completed: sources={}, entries={}, published={}, audio={}, skipped={}",
+                stats.resolved_sources,
+                stats.fetched_entries,
+                stats.published_items,
+                stats.published_audio_items,
+                stats.skipped_items
+            ),
+            Err(e) => log::error!("[Trigger API] curated feed failed: {}", e),
+        }
+        *state_clone.running.lock().await = false;
+    });
+
+    Json(TriggerResponse {
+        success: true,
+        message: format!(
+            "Curated feed cycle triggered at {}. Running in background.",
+            now
+        ),
+    })
+    .into_response()
+}
+
+async fn handle_feed_weekly_trigger(
+    State(state): State<Arc<TriggerState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<FeedWeeklyTriggerQuery>,
+) -> impl IntoResponse {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+
+    {
+        let mut running = state.running.lock().await;
+        if *running {
+            return Json(TriggerResponse {
+                success: false,
+                message: "A cycle is already running. Please wait.".to_string(),
+            })
+            .into_response();
+        }
+        *running = true;
+    }
+
+    let now = (state.get_now)();
+    let force = query.force;
+    let pipeline = state.curated_pipeline.clone();
+    let state_clone = state.clone();
+
+    tokio::spawn(async move {
+        let result = pipeline.run_weekly_digest(now, force).await;
+        match &result {
+            Ok(stats) if stats.published => log::info!(
+                "[Trigger API] curated weekly digest published: considered={}, included={}",
+                stats.considered_items,
+                stats.included_items
+            ),
+            Ok(stats) => log::info!(
+                "[Trigger API] curated weekly digest skipped: {:?}",
+                stats.skipped_reason
+            ),
+            Err(e) => log::error!("[Trigger API] curated weekly digest failed: {}", e),
+        }
+        *state_clone.running.lock().await = false;
+    });
+
+    Json(TriggerResponse {
+        success: true,
+        message: format!(
+            "Curated weekly digest triggered at {} (force={}). Running in background.",
+            now, force
+        ),
+    })
+    .into_response()
 }
 
 async fn handle_status(
     State(state): State<Arc<TriggerState>>,
-) -> Json<serde_json::Value> {
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+
     let running = *state.running.lock().await;
     let category_stats = {
         let buf = state.buffer.lock().await;
@@ -619,10 +1060,13 @@ async fn handle_status(
         "status": if running { "running" } else { "idle" },
         "current_time": now.to_string(),
         "pending_clusters": total_clusters,
+        "curated_feed_enabled": state.curated_pipeline.is_enabled(),
+        "curated_weekly_digest_enabled": state.config.curated_feed.as_ref().and_then(|feed| feed.weekly_digest_enabled).unwrap_or(true),
         "categories": category_stats.iter().map(|(k, (count, oldest))| {
             serde_json::json!({ "name": k, "clusters": count, "oldest_ts": oldest })
         }).collect::<Vec<_>>(),
     }))
+    .into_response()
 }
 
 // --- Memory Diagnostics API ---
@@ -682,24 +1126,32 @@ struct ComponentMemoryInfo {
 
 async fn handle_memory(
     State(state): State<Arc<TriggerState>>,
-) -> Json<MemorySnapshot> {
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+
     let mut system = System::new_all();
     system.refresh_all();
 
     let pid = get_current_pid().unwrap_or_else(|_| sysinfo::Pid::from_u32(0));
-    let process = system.process(pid).map(|p| ProcessMemoryInfo {
-        pid: pid.as_u32(),
-        name: p.name().to_str().unwrap_or("unknown").to_string(),
-        memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
-        virtual_memory_mb: p.virtual_memory() as f64 / 1024.0 / 1024.0,
-        cpu_percent: p.cpu_usage() as f64,
-    }).unwrap_or_else(|| ProcessMemoryInfo {
-        pid: pid.as_u32(),
-        name: "unknown".to_string(),
-        memory_mb: 0.0,
-        virtual_memory_mb: 0.0,
-        cpu_percent: 0.0,
-    });
+    let process = system
+        .process(pid)
+        .map(|p| ProcessMemoryInfo {
+            pid: pid.as_u32(),
+            name: p.name().to_str().unwrap_or("unknown").to_string(),
+            memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
+            virtual_memory_mb: p.virtual_memory() as f64 / 1024.0 / 1024.0,
+            cpu_percent: p.cpu_usage() as f64,
+        })
+        .unwrap_or_else(|| ProcessMemoryInfo {
+            pid: pid.as_u32(),
+            name: "unknown".to_string(),
+            memory_mb: 0.0,
+            virtual_memory_mb: 0.0,
+            cpu_percent: 0.0,
+        });
 
     let total_memory = system.total_memory();
     let used_memory = system.used_memory();
@@ -759,163 +1211,39 @@ async fn handle_memory(
         system: system_info,
         components,
     })
+    .into_response()
 }
 
 /// Trigger a fresh health check to Nexus (bypasses DNS cache)
 async fn handle_nexus_health(
     State(state): State<Arc<TriggerState>>,
-) -> Json<serde_json::Value> {
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+
     match state.nexus.health_check().await {
-        Ok(health) => {
-            Json(serde_json::json!({
-                "success": true,
-                "healthy": health.is_healthy,
-                "latency_ms": health.latency_ms,
-                "last_check": health.last_check,
-                "error_count": health.error_count,
-                "last_error": health.last_error,
-                "message": if health.is_healthy {
-                    "Nexus is healthy"
-                } else {
-                    "Nexus health check failed"
-                }
-            }))
-        }
-        Err(e) => {
-            Json(serde_json::json!({
-                "success": false,
-                "healthy": false,
-                "error": e.to_string(),
-                "message": "Failed to check Nexus health"
-            }))
-        }
-    }
-}
-
-// Refactored from process_category
-
-fn clean_text(input: &str, max_chars: usize) -> String {
-    // 1. Strip HTML tags
-    let re = Regex::new(r"<[^>]*>").unwrap();
-    let no_html = re.replace_all(input, " ");
-
-    // 2. Fix HTML Entities (Basic)
-    let entity_fixed = no_html
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&#39;", "'");
-
-    // 3. Normalize Punctuation (Half -> Full for TTS)
-    // This helps the LLM and TTS model better understand sentence structure
-    let punct_fixed = entity_fixed
-        .replace(",", "，")
-        .replace("?", "？")
-        .replace("!", "！")
-        .replace("(", "（")
-        .replace(")", "）");
-    // Note: We keep '.' as is for now, or convert to '。' if it looks like a sentence end.
-    // But for mixed English content, blindly converting '.' might be risky (e.g. v2.0).
-    // Let's stick to safe separators.
-
-    // 4. Remove Noise Symbols (Common in RSS titles)
-    let noise_fixed = punct_fixed
-        .replace("【", " ")
-        .replace("】", " ")
-        .replace("[", " ")
-        .replace("]", " ")
-        .replace("|", " ");
-
-    // 5. Collapse whitespace
-    let re_space = Regex::new(r"\s+").unwrap();
-    let clean = re_space.replace_all(&noise_fixed, " ");
-
-    // 6. Truncate
-    if clean.chars().count() > max_chars {
-        let mut s: String = clean.chars().take(max_chars).collect();
-        s.push_str("...");
-        s
-    } else {
-        clean.to_string()
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct RssItem {
-    title: String,
-    link: String,
-    description: String,
-    #[allow(dead_code)]
-    pub_date: Option<String>,
-    source_name: Option<String>,
-}
-
-async fn fetch_rss_items(url: &str, proxy_url: Option<&str>) -> Result<Vec<RssItem>> {
-    let client_builder = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10));
-
-    let client = client_builder.build()?;
-    
-    let mut response = client.get(url).send().await;
-
-    // Retry with proxy if direct fetch fails and proxy is configured
-    if response.is_err() {
-        if let Some(proxy) = proxy_url {
-            log::info!("Direct fetch failed for {}, retrying with proxy: {}", url, proxy);
-            let proxy_client = reqwest::Client::builder()
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .timeout(std::time::Duration::from_secs(30))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .proxy(reqwest::Proxy::all(proxy)?)
-                .build()?;
-            response = proxy_client.get(url).send().await;
-        }
-    }
-
-    let content = response?.bytes().await?;
-    let cursor = std::io::Cursor::new(content);
-    let feed = feed_rs::parser::parse(cursor)?;
-
-    let source_title = feed.title.map(|t| t.content).unwrap_or_default();
-
-    let items = feed
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let title = entry.title.map(|t| t.content).unwrap_or_default();
-            let link = entry
-                .links
-                .first()
-                .map(|l| l.href.clone())
-                .unwrap_or_default();
-
-            // Try summary first, then content body
-            let description = entry
-                .summary
-                .map(|s| s.content)
-                .or_else(|| entry.content.and_then(|c| c.body))
-                .unwrap_or_default();
-
-            let pub_date = entry.published.map(|d| d.to_rfc3339());
-
-            RssItem {
-                title,
-                link,
-                description,
-                pub_date,
-                source_name: if source_title.is_empty() {
-                    None
-                } else {
-                    Some(source_title.clone())
-                },
+        Ok(health) => Json(serde_json::json!({
+            "success": true,
+            "healthy": health.is_healthy,
+            "latency_ms": health.latency_ms,
+            "last_check": health.last_check,
+            "error_count": health.error_count,
+            "last_error": health.last_error,
+            "message": if health.is_healthy {
+                "Nexus is healthy"
+            } else {
+                "Nexus health check failed"
             }
-        })
-        .filter(|i| !i.link.is_empty())
-        .collect();
-
-    Ok(items)
+        }))
+        .into_response(),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "healthy": false,
+            "error": e.to_string(),
+            "message": "Failed to check Nexus health"
+        }))
+        .into_response(),
+    }
 }

@@ -1,8 +1,8 @@
-pub mod engine;
-pub mod config;
-pub mod audio;
 pub mod adapters;
+pub mod audio;
+pub mod config;
+pub mod engine;
 
-pub use engine::{TtsEngine, EngineFactory};
-pub use config::{TtsConfig, VoicePrompt, VoxCpmConfig, Qwen3Config};
-pub use audio::{chunk_text, append_with_crossfade, convert_to_mp3};
+pub use audio::{append_with_crossfade, chunk_text, convert_to_mp3};
+pub use config::{Qwen3Config, TtsConfig, VoicePrompt, VoxCpmConfig};
+pub use engine::{EngineFactory, TtsEngine};

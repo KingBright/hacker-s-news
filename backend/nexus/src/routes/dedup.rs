@@ -1,10 +1,10 @@
+use crate::AppState;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
-use crate::AppState;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -35,10 +35,14 @@ pub async fn check_files(
     }
 
     if payload.urls.is_empty() {
-        return Json(CheckResponse { existing_urls: vec![] }).into_response();
+        return Json(CheckResponse {
+            existing_urls: vec![],
+        })
+        .into_response();
     }
 
-    // Query both source_items (legacy dedup table) and items.original_url (authoritative content table).
+    // Query legacy radio sources, radio items, and curated feed items so product
+    // lines do not regenerate the same source URL in parallel.
     let placeholders: Vec<String> = payload.urls.iter().map(|_| "?".to_string()).collect();
     let query = format!(
         r#"
@@ -49,12 +53,22 @@ pub async fn check_files(
         WHERE original_url IS NOT NULL
           AND original_url != ''
           AND original_url IN ({})
+        UNION
+        SELECT original_url AS url
+        FROM feed_items
+        WHERE original_url IS NOT NULL
+          AND original_url != ''
+          AND original_url IN ({})
         "#,
+        placeholders.join(","),
         placeholders.join(","),
         placeholders.join(",")
     );
 
     let mut query_builder = sqlx::query_as::<_, (String,)>(&query);
+    for url in &payload.urls {
+        query_builder = query_builder.bind(url);
+    }
     for url in &payload.urls {
         query_builder = query_builder.bind(url);
     }

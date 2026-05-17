@@ -1,9 +1,9 @@
-use anyhow::Result;
 use crate::core::config::TtsConfig as CortexTtsConfig;
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tts::{TtsEngine, EngineFactory};
-use tts::{TtsConfig as LibTtsConfig, VoxCpmConfig, Qwen3Config};
+use tts::{EngineFactory, TtsEngine};
+use tts::{Qwen3Config, TtsConfig as LibTtsConfig, VoxCpmConfig};
 
 // Maximum total characters to prevent excessive memory usage
 // ~8000 chars ≈ 15-25 minutes audio ≈ 80-150MB memory
@@ -44,11 +44,26 @@ impl TtsClient {
         self.speak_and_convert(text, None, None).await
     }
 
-    pub async fn speak_with_voice(&self, text: &str, voice_path: &str, prompt_override: Option<&str>) -> Result<Vec<u8>> {
-        self.speak_and_convert(text, Some(voice_path.to_string()), prompt_override.map(|s| s.to_string())).await
+    pub async fn speak_with_voice(
+        &self,
+        text: &str,
+        voice_path: &str,
+        prompt_override: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        self.speak_and_convert(
+            text,
+            Some(voice_path.to_string()),
+            prompt_override.map(|s| s.to_string()),
+        )
+        .await
     }
 
-    async fn speak_and_convert(&self, raw_text: &str, voice_override: Option<String>, prompt_override: Option<String>) -> Result<Vec<u8>> {
+    async fn speak_and_convert(
+        &self,
+        raw_text: &str,
+        voice_override: Option<String>,
+        prompt_override: Option<String>,
+    ) -> Result<Vec<u8>> {
         let text = if raw_text.chars().count() > MAX_TOTAL_CHARS {
             log::warn!(
                 "[TTS] Text too long ({} chars > {} limit), truncating",
@@ -62,7 +77,7 @@ impl TtsClient {
         };
 
         log::info!("Synthesizing long text through abstracted TTS library...");
-        
+
         let mut engine = self.engine.lock().await;
 
         // If specific custom voices are requested outside of the default config, build dynamic cache prompt here
@@ -76,7 +91,20 @@ impl TtsClient {
             }
         }
 
-        let pcm_samples = engine.synthesize_long_text(&text).await?;
+        let pcm_samples_result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            engine.synthesize_long_text(&text),
+        )
+        .await;
+
+        let pcm_samples = match pcm_samples_result {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "TTS generation timed out after 60 seconds (preventing memory leak)"
+                ))
+            }
+        };
 
         // Encode PCM float samples into standard 16-bit WAV
         let wav_bytes = self.create_wav_bytes(&pcm_samples, engine.sample_rate() as u32)?;

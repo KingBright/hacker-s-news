@@ -1,12 +1,12 @@
+use crate::core::nexus::{ItemPayload, NexusClient};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use sled::Db;
-use serde::{Serialize, Deserialize};
 use std::path::Path;
-use crate::core::nexus::{NexusClient, ItemPayload};
 use std::sync::Arc;
 
 // Retry configuration constants
-const MAX_RETRY_COUNT: u8 = 5;        // Maximum retry attempts before giving up
+const MAX_RETRY_COUNT: u8 = 5; // Maximum retry attempts before giving up
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RetryAction {
@@ -24,10 +24,10 @@ pub enum RetryAction {
 #[derive(Debug, Serialize, Deserialize)]
 struct RetryEntry {
     action: RetryAction,
-    created_at: i64,     // Unix timestamp of creation
-    retry_count: u8,     // Number of retry attempts
-    #[serde(default)]    // Backward compatible: defaults to 0 for old entries
-    last_retry_at: i64,  // Unix timestamp of last retry attempt
+    created_at: i64, // Unix timestamp of creation
+    retry_count: u8, // Number of retry attempts
+    #[serde(default)] // Backward compatible: defaults to 0 for old entries
+    last_retry_at: i64, // Unix timestamp of last retry attempt
 }
 
 pub struct RetryManager {
@@ -40,7 +40,7 @@ impl RetryManager {
     pub fn new(cache_dir: &str, nexus: Arc<NexusClient>) -> Result<Self> {
         let db = sled::open(Path::new(cache_dir).join("retry_db"))?;
         std::fs::create_dir_all(Path::new(cache_dir).join("audio_cache"))?;
-        
+
         Ok(Self {
             db,
             nexus,
@@ -110,18 +110,22 @@ impl RetryManager {
             // Backoff: 1min, 5min, 15min, 1hr, 4hr based on retry count
             let backoff_secs = match entry.retry_count {
                 0 => 0,
-                1 => 60,           // 1 minute
-                2 => 300,          // 5 minutes
-                3 => 900,          // 15 minutes
-                4 => 3600,         // 1 hour
-                _ => 14400,        // 4 hours
+                1 => 60,    // 1 minute
+                2 => 300,   // 5 minutes
+                3 => 900,   // 15 minutes
+                4 => 3600,  // 1 hour
+                _ => 14400, // 4 hours
             };
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64;
             // Use last_retry_at for backoff, fall back to created_at if never retried
-            let reference_time = if entry.last_retry_at > 0 { entry.last_retry_at } else { entry.created_at };
+            let reference_time = if entry.last_retry_at > 0 {
+                entry.last_retry_at
+            } else {
+                entry.created_at
+            };
             let elapsed_since_last = now - reference_time;
 
             // Skip if not enough time has passed since last retry attempt
@@ -135,7 +139,8 @@ impl RetryManager {
                 continue;
             }
 
-            log::info!("Retrying action: {:?} (attempt {}/{})",
+            log::info!(
+                "Retrying action: {:?} (attempt {}/{})",
                 String::from_utf8_lossy(&key),
                 entry.retry_count + 1,
                 MAX_RETRY_COUNT
@@ -193,8 +198,11 @@ impl RetryManager {
 
             if should_remove {
                 // Cleanup local file if it was UploadAudio
-                if let Ok(RetryEntry { action: RetryAction::UploadAudio { file_path, .. }, .. }) =
-                    serde_json::from_slice::<RetryEntry>(&val) {
+                if let Ok(RetryEntry {
+                    action: RetryAction::UploadAudio { file_path, .. },
+                    ..
+                }) = serde_json::from_slice::<RetryEntry>(&val)
+                {
                     let _ = std::fs::remove_file(&file_path);
                 }
                 self.db.remove(&key)?;
@@ -210,14 +218,17 @@ impl RetryManager {
 
     async fn execute_action(&self, action: &RetryAction) -> Result<()> {
         match action {
-            RetryAction::UploadAudio { filename, file_path } => {
+            RetryAction::UploadAudio {
+                filename,
+                file_path,
+            } => {
                 let data = tokio::fs::read(file_path).await?;
                 self.nexus.upload_audio(data, filename).await?;
-            },
+            }
             RetryAction::PushItem(payload) => {
                 // ItemPayload is Clone now
                 self.nexus.push_item(payload.clone()).await?;
-            },
+            }
             RetryAction::MarkUrl { url, category } => {
                 self.nexus.mark_url(url, category).await?;
             }
@@ -227,7 +238,9 @@ impl RetryManager {
 
     // Helper to save audio to disk for retry
     pub async fn cache_audio(&self, data: &[u8], filename: &str) -> Result<String> {
-        let path = Path::new(&self.cache_dir).join("audio_cache").join(filename);
+        let path = Path::new(&self.cache_dir)
+            .join("audio_cache")
+            .join(filename);
         tokio::fs::write(&path, data).await?;
         Ok(path.to_string_lossy().to_string())
     }

@@ -276,7 +276,7 @@ function Install-CortexService {
         @"
 [nexus]
 api_url = "http://localhost:8899"
-auth_key = "my-secret-key-123"
+auth_key = "CHANGE_ME_NEXUS_KEY"
 
 [llm]
 model = "llama3"

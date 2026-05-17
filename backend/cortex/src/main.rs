@@ -142,20 +142,41 @@ async fn run_service() -> Result<()> {
         let dummy_config = r#"
 [nexus]
 api_url = "http://localhost:8899"
-auth_key = "my-secret-key-123"
+auth_key = "CHANGE_ME_NEXUS_KEY"
 
 [llm]
 model = "llama3"
 api_url = "http://localhost:11434"
 
 [tts]
-model_path = "./zh_CN-huayan-medium.onnx"
+engine = "voxcpm"
 
-[[sources]]
-name = "Hacker News"
-url = "https://news.ycombinator.com/rss"
-interval_min = 60
-tags = ["Tech", "Global"]
+rss_feeds = ["https://news.ycombinator.com/rss"]
+
+[[categories]]
+name = "Tech"
+description = "Technology news"
+
+[curated_feed]
+enabled = true
+schedule_times = ["08:30"]
+source_group = "karpathy_hn"
+max_items_per_cycle = 20
+max_age_days = 2
+min_quality_score = 6
+article_audio_enabled = true
+article_audio_min_quality_score = 8
+article_audio_max_items_per_cycle = 3
+weekly_digest_enabled = true
+weekly_digest_schedule_times = ["21:00"]
+weekly_digest_min_items = 3
+weekly_digest_max_items = 12
+
+[[curated_feed.feeds]]
+name = "Karpathy Blog"
+url = "https://karpathy.bearblog.dev/feed/"
+kind = "rss"
+tags = ["AI", "Programming"]
 "#;
         std::fs::write(config_path, dummy_config)?;
     }
@@ -225,15 +246,7 @@ tags = ["Tech", "Global"]
     log::info!("Starting Cortex service...");
 
     // Run the main news loop
-    cortex::core::news::run_news_loop(
-        config,
-        llm,
-        tts,
-        nexus,
-        retry_manager,
-        cache_dir_str,
-    )
-    .await;
+    cortex::core::news::run_news_loop(config, llm, tts, nexus, retry_manager, cache_dir_str).await;
 
     Ok(())
 }

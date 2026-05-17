@@ -30,9 +30,9 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
 
     // Configure connection pool with proper settings
     let pool = SqlitePoolOptions::new()
-        .max_connections(10)              // Maximum concurrent connections
-        .min_connections(2)               // Minimum idle connections
-        .acquire_timeout(Duration::from_secs(30))  // Timeout for acquiring connection
+        .max_connections(10) // Maximum concurrent connections
+        .min_connections(2) // Minimum idle connections
+        .acquire_timeout(Duration::from_secs(30)) // Timeout for acquiring connection
         .idle_timeout(Some(Duration::from_secs(600))) // Close idle connections after 10 mins
         .max_lifetime(Some(Duration::from_secs(3600))) // Connection lifetime 1 hour
         .connect(&database_url)
@@ -81,6 +81,65 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
             password_hash TEXT NOT NULL,
             created_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS feed_items (
+            id TEXT PRIMARY KEY,
+            product_line TEXT NOT NULL,
+            item_type TEXT NOT NULL,
+            primary_mode TEXT NOT NULL,
+            title TEXT NOT NULL,
+            subtitle TEXT,
+            source_name TEXT,
+            source_url TEXT,
+            original_url TEXT,
+            canonical_url TEXT,
+            content_hash TEXT,
+            publish_time INTEGER,
+            created_at INTEGER,
+            updated_at INTEGER,
+            has_audio BOOLEAN DEFAULT 0,
+            audio_url TEXT,
+            duration_sec INTEGER,
+            reading_time_min INTEGER,
+            quality_score INTEGER,
+            tags TEXT,
+            status TEXT DEFAULT 'published'
+        );
+        CREATE TABLE IF NOT EXISTS feed_item_contents (
+            item_id TEXT PRIMARY KEY,
+            original_html TEXT,
+            reader_markdown TEXT,
+            plain_text TEXT,
+            compressed_markdown TEXT,
+            audio_script TEXT,
+            key_points_json TEXT,
+            created_at INTEGER,
+            updated_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS feed_reading_progress (
+            user_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            scroll_ratio REAL,
+            anchor TEXT,
+            updated_at INTEGER,
+            read_at INTEGER,
+            PRIMARY KEY (user_id, item_id, mode)
+        );
+        CREATE TABLE IF NOT EXISTS weekly_digests (
+            id TEXT PRIMARY KEY,
+            feed_item_id TEXT,
+            week_start INTEGER NOT NULL,
+            week_end INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            digest_markdown TEXT,
+            audio_script TEXT,
+            audio_url TEXT,
+            duration_sec INTEGER,
+            included_item_ids_json TEXT,
+            themes_json TEXT,
+            created_at INTEGER,
+            status TEXT DEFAULT 'published'
+        );
         "#,
     )
     .execute(&pool)
@@ -106,6 +165,15 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN category TEXT")
         .execute(&pool)
         .await; // New category column
+    let _ = sqlx::query("ALTER TABLE feed_items ADD COLUMN duration_sec INTEGER")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE feed_item_contents ADD COLUMN audio_script TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE weekly_digests ADD COLUMN duration_sec INTEGER")
+        .execute(&pool)
+        .await;
 
     // Add unique index on original_url for deduplication (idempotent)
     // First, clean up existing data to prevent index creation failures
@@ -121,14 +189,40 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
                 WHERE original_url IS NOT NULL AND original_url != ''
             ) WHERE rn = 1
         ) AND original_url IS NOT NULL AND original_url != ''
-        "#
+        "#,
     )
     .execute(&pool)
     .await;
 
     // 2. Create the unique index (IF NOT EXISTS makes this idempotent)
     let _ = sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_original_url ON items(original_url)"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_original_url ON items(original_url)",
+    )
+    .execute(&pool)
+    .await;
+
+    let _ = sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_feed_items_original_url ON feed_items(original_url) WHERE original_url IS NOT NULL AND original_url != ''"
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_feed_items_product_time ON feed_items(product_line, publish_time DESC)"
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_feed_items_type_time ON feed_items(item_type, publish_time DESC)"
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_weekly_digests_range ON weekly_digests(week_start DESC, week_end DESC)"
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_digests_unique_range ON weekly_digests(week_start, week_end)"
     )
     .execute(&pool)
     .await;

@@ -9,9 +9,19 @@ import 'hero_card.dart';
 import 'animated_eq.dart';
 import 'morphing_player.dart';
 import 'login_modal.dart';
+import 'reading_screen.dart';
 
-class FeedScreen extends StatelessWidget {
+enum ProductLine { radio, reading }
+
+class FeedScreen extends StatefulWidget {
   const FeedScreen({super.key});
+
+  @override
+  State<FeedScreen> createState() => _FeedScreenState();
+}
+
+class _FeedScreenState extends State<FeedScreen> {
+  ProductLine _productLine = ProductLine.radio;
 
   @override
   Widget build(BuildContext context) {
@@ -22,82 +32,30 @@ class FeedScreen extends StatelessWidget {
           children: [
             Column(
               children: [
-                _buildHeader(),
+                _buildHeader(
+                  productLine: _productLine,
+                  onChanged: (productLine) {
+                    setState(() => _productLine = productLine);
+                  },
+                ),
                 Expanded(
-                  child: Consumer<FeedProvider>(
-                    builder: (context, provider, child) {
-                      return RefreshIndicator(
-                        color: AppTheme.primaryGreen,
-                        backgroundColor: AppTheme.surfaceHighlight,
-                        onRefresh: () async {
-                          provider.page = 1;
-                          provider.items.clear();
-                          await provider.fetchItems();
-                        },
-                        child: ListView.builder(
-                          padding: const EdgeInsets.only(
-                            bottom: 120,
-                          ), // Space for morphing player
-                          itemCount:
-                              provider.items.length +
-                              2, // HeroCard + Items + LoadMore
-                          itemBuilder: (context, index) {
-                            if (index == 0) {
-                              return HeroCard(
-                                unreadCount: provider.items.length,
-                                onRefresh: () {
-                                  provider.page = 1;
-                                  provider.items.clear();
-                                  provider.fetchItems();
-                                },
-                                isLoading:
-                                    provider.isLoading &&
-                                    provider.items.isEmpty,
-                              );
-                            }
-
-                            final itemIndex = index - 1;
-                            if (itemIndex == provider.items.length) {
-                              if (provider.isLoading) {
-                                return const Center(
-                                  child: Padding(
-                                    padding: EdgeInsets.all(16.0),
-                                    child: CircularProgressIndicator(
-                                      color: AppTheme.primaryGreen,
-                                    ),
-                                  ),
-                                );
-                              }
-                              return Padding(
-                                padding: const EdgeInsets.all(16.0),
-                                child: TextButton(
-                                  onPressed: provider.fetchItems,
-                                  style: TextButton.styleFrom(
-                                    foregroundColor: AppTheme.primaryGreen,
-                                  ),
-                                  child: const Text('Load More'),
-                                ),
-                              );
-                            }
-
-                            final item = provider.items[itemIndex];
-                            return _buildFeedItem(context, item, itemIndex);
-                          },
-                        ),
-                      );
-                    },
-                  ),
+                  child: _productLine == ProductLine.radio
+                      ? _RadioFeedList(buildFeedItem: _buildFeedItem)
+                      : const ReadingScreen(),
                 ),
               ],
             ),
-            const MorphingPlayer(),
+            if (_productLine == ProductLine.radio) const MorphingPlayer(),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildHeader() {
+  Widget _buildHeader({
+    required ProductLine productLine,
+    required ValueChanged<ProductLine> onChanged,
+  }) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       decoration: BoxDecoration(
@@ -106,120 +64,157 @@ class FeedScreen extends StatelessWidget {
           bottom: BorderSide(color: Colors.white.withValues(alpha: 0.05)),
         ),
       ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      child: Column(
         children: [
           Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Container(
-                width: 40,
-                height: 40,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(12),
-                  color: AppTheme.surfaceHighlight,
-                ),
-                child: const Icon(Icons.waves, color: AppTheme.primaryGreen),
-              ),
-              const SizedBox(width: 12),
-              const Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+              Row(
                 children: [
-                  Text(
-                    "FreshLoop",
-                    style: TextStyle(
-                      fontSize: 22,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: -0.5,
+                  Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      color: AppTheme.surfaceHighlight,
+                    ),
+                    child: const Icon(
+                      Icons.waves,
+                      color: AppTheme.primaryGreen,
                     ),
                   ),
-                  Text(
-                    "AUDIO BRIEFING • ZEN MODE",
-                    style: TextStyle(
-                      fontSize: 9,
-                      color: AppTheme.textMuted,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 1.0,
-                    ),
+                  const SizedBox(width: 12),
+                  const Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "FreshLoop",
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: -0.5,
+                        ),
+                      ),
+                      Text(
+                        "RADIO + READING",
+                        style: TextStyle(
+                          fontSize: 9,
+                          color: AppTheme.textMuted,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1.0,
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
-            ],
-          ),
-          Consumer<AuthProvider>(
-            builder: (context, auth, child) {
-              if (auth.isAuthenticated) {
-                return GestureDetector(
-                  onTap: () {
-                    showDialog(
-                      context: context,
-                      builder: (context) => AlertDialog(
-                        backgroundColor: const Color(0xFF18181B),
-                        title: Text('Hi, ${auth.user!.username}'),
-                        content: const Text('Do you want to log out?'),
-                        actions: [
-                          TextButton(
-                            onPressed: () => Navigator.pop(context),
-                            child: const Text('Cancel'),
+              Consumer<AuthProvider>(
+                builder: (context, auth, child) {
+                  if (auth.isAuthenticated) {
+                    return GestureDetector(
+                      onTap: () {
+                        showDialog(
+                          context: context,
+                          builder: (context) => AlertDialog(
+                            backgroundColor: const Color(0xFF18181B),
+                            title: Text('Hi, ${auth.user!.username}'),
+                            content: const Text('Do you want to log out?'),
+                            actions: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(context),
+                                child: const Text('Cancel'),
+                              ),
+                              TextButton(
+                                onPressed: () {
+                                  auth.logout();
+                                  Navigator.pop(context);
+                                },
+                                child: const Text(
+                                  'Log Out',
+                                  style: TextStyle(color: Colors.redAccent),
+                                ),
+                              ),
+                            ],
                           ),
-                          TextButton(
-                            onPressed: () {
-                              auth.logout();
-                              Navigator.pop(context);
-                            },
-                            child: const Text(
-                              'Log Out',
-                              style: TextStyle(color: Colors.redAccent),
+                        );
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: AppTheme.primaryGreen.withValues(alpha: 0.1),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: AppTheme.primaryGreen.withValues(alpha: 0.3),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(
+                              Icons.person,
+                              color: AppTheme.primaryGreen,
+                              size: 16,
                             ),
-                          ),
-                        ],
+                            const SizedBox(width: 4),
+                            Text(
+                              auth.user!.username,
+                              style: const TextStyle(
+                                color: AppTheme.primaryGreen,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     );
-                  },
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      color: AppTheme.primaryGreen.withValues(alpha: 0.1),
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(
-                        color: AppTheme.primaryGreen.withValues(alpha: 0.3),
-                      ),
-                    ),
-                    child: Row(
-                      children: [
-                        const Icon(
-                          Icons.person,
-                          color: AppTheme.primaryGreen,
-                          size: 16,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          auth.user!.username,
-                          style: const TextStyle(
-                            color: AppTheme.primaryGreen,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 13,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              }
+                  }
 
-              return IconButton(
-                icon: const Icon(Icons.person_outline),
-                onPressed: () {
-                  showDialog(
-                    context: context,
-                    builder: (context) => const LoginModal(),
+                  return IconButton(
+                    icon: const Icon(Icons.person_outline),
+                    onPressed: () {
+                      showDialog(
+                        context: context,
+                        builder: (context) => const LoginModal(),
+                      );
+                    },
+                    style: IconButton.styleFrom(
+                      backgroundColor: Colors.white10,
+                    ),
                   );
                 },
-                style: IconButton.styleFrom(backgroundColor: Colors.white10),
-              );
-            },
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(4),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: _ProductLineButton(
+                    icon: Icons.radio,
+                    label: 'Radio',
+                    selected: productLine == ProductLine.radio,
+                    onTap: () => onChanged(ProductLine.radio),
+                  ),
+                ),
+                Expanded(
+                  child: _ProductLineButton(
+                    icon: Icons.menu_book,
+                    label: 'Reading',
+                    selected: productLine == ProductLine.reading,
+                    onTap: () => onChanged(ProductLine.reading),
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -408,6 +403,103 @@ class FeedScreen extends StatelessWidget {
               ),
             );
           },
+        );
+      },
+    );
+  }
+}
+
+class _ProductLineButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _ProductLineButton({
+    required this.icon,
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return TextButton.icon(
+      onPressed: onTap,
+      icon: Icon(icon, size: 17),
+      label: Text(label),
+      style: TextButton.styleFrom(
+        backgroundColor: selected ? AppTheme.primaryGreen : Colors.transparent,
+        foregroundColor: selected ? Colors.black : Colors.white70,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        textStyle: const TextStyle(fontWeight: FontWeight.w900),
+      ),
+    );
+  }
+}
+
+class _RadioFeedList extends StatelessWidget {
+  final Widget Function(BuildContext context, Item item, int index)
+  buildFeedItem;
+
+  const _RadioFeedList({required this.buildFeedItem});
+
+  @override
+  Widget build(BuildContext context) {
+    return Consumer<FeedProvider>(
+      builder: (context, provider, child) {
+        return RefreshIndicator(
+          color: AppTheme.primaryGreen,
+          backgroundColor: AppTheme.surfaceHighlight,
+          onRefresh: () async {
+            provider.page = 1;
+            provider.items.clear();
+            await provider.fetchItems();
+          },
+          child: ListView.builder(
+            padding: const EdgeInsets.only(bottom: 120),
+            itemCount: provider.items.length + 2,
+            itemBuilder: (context, index) {
+              if (index == 0) {
+                return HeroCard(
+                  unreadCount: provider.items.length,
+                  onRefresh: () {
+                    provider.page = 1;
+                    provider.items.clear();
+                    provider.fetchItems();
+                  },
+                  isLoading: provider.isLoading && provider.items.isEmpty,
+                );
+              }
+
+              final itemIndex = index - 1;
+              if (itemIndex == provider.items.length) {
+                if (provider.isLoading) {
+                  return const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(16.0),
+                      child: CircularProgressIndicator(
+                        color: AppTheme.primaryGreen,
+                      ),
+                    ),
+                  );
+                }
+                return Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: TextButton(
+                    onPressed: provider.fetchItems,
+                    style: TextButton.styleFrom(
+                      foregroundColor: AppTheme.primaryGreen,
+                    ),
+                    child: const Text('Load More'),
+                  ),
+                );
+              }
+
+              final item = provider.items[itemIndex];
+              return buildFeedItem(context, item, itemIndex);
+            },
+          ),
         );
       },
     );

@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useRef, useCallback } from 'react';
 import Image from 'next/image';
+import Link from 'next/link';
 import { Item } from '../src/types';
 
 const SPEED_OPTIONS: number[] = [1.0, 1.25, 1.5, 1.75, 2.0];
@@ -925,26 +926,44 @@ export default function Home() {
       {/* Header */}
       <header className="sticky top-0 z-20 bg-background-dark/95 backdrop-blur-md px-4 pt-12 pb-4 border-b border-white/5">
         <div className="flex items-center justify-between">
-          <div>
-            <div className="flex items-center gap-3" onClick={handleDebugTrigger}>
-              <div className="size-10 rounded-xl overflow-hidden shadow-lg ring-1 ring-white/10">
+          <div className="flex-1 min-w-0 mr-4">
+            <div className="flex items-center gap-2 sm:gap-3" onClick={handleDebugTrigger}>
+              <div className="size-8 sm:size-10 shrink-0 rounded-xl overflow-hidden shadow-lg ring-1 ring-white/10">
                 <Image src="/logo.png" alt="FreshLoop Logo" width={40} height={40} className="w-full h-full object-cover" />
               </div>
-              <h1 className="text-[28px] font-bold leading-none tracking-tight text-white">FreshLoop</h1>
-              {showDebug && <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />}
+              <h1 className="text-xl sm:text-[28px] font-bold leading-none tracking-tight text-white truncate">FreshLoop</h1>
+              {showDebug && <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse shrink-0" />}
             </div>
-            <p className="text-xs text-slate-500 dark:text-[#93c8a8] mt-1 font-medium tracking-wide uppercase">Audio Briefing • Zen Mode</p>
+            <p className="text-[10px] sm:text-xs text-slate-500 dark:text-[#93c8a8] mt-1 font-medium tracking-wide uppercase truncate">Audio Briefing • Zen Mode</p>
           </div>
-          <button
-            onClick={() => user ? (confirm('Logout?') && handleLogout()) : setShowLogin(true)}
-            className="flex items-center gap-2 bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded-full transition-colors"
-          >
-            <div className={`size-6 rounded-full flex items-center justify-center ${user ? 'bg-primary text-black' : 'bg-primary text-black'}`}>
-              <span className="material-symbols-outlined text-[16px]">person</span>
-            </div>
-            {user && <span className="text-xs font-medium text-white/80">{user.username}</span>}
-          </button>
+          <div className="flex items-center gap-2">
+            <a
+              href="/android-app.apk"
+              download="FreshLoop.apk"
+              className="flex items-center justify-center bg-green-500/10 hover:bg-green-500/20 text-green-400 size-8 rounded-full transition-colors ring-1 ring-green-500/30 shrink-0"
+              title="Download Android App"
+            >
+              <span className="material-symbols-outlined text-[18px]">android</span>
+            </a>
+            <button
+              onClick={() => user ? (confirm('Logout?') && handleLogout()) : setShowLogin(true)}
+              className="flex items-center gap-1.5 bg-white/5 hover:bg-white/10 pl-1.5 pr-3 py-1 rounded-full transition-colors shrink-0 max-w-[120px]"
+            >
+              <div className={`size-6 rounded-full flex items-center justify-center shrink-0 ${user ? 'bg-primary text-black' : 'bg-white/20 text-white'}`}>
+                <span className="material-symbols-outlined text-[14px]">person</span>
+              </div>
+              {user && <span className="text-[11px] font-medium text-white/80 truncate">{user.username}</span>}
+            </button>
+          </div>
         </div>
+        <nav className="mt-4 grid grid-cols-2 gap-2 rounded-lg bg-white/5 p-1 ring-1 ring-white/10">
+          <Link href="/" className="rounded-md bg-primary px-3 py-2 text-center text-sm font-bold text-black">
+            Radio
+          </Link>
+          <Link href="/feed" className="rounded-md px-3 py-2 text-center text-sm font-bold text-white/70 hover:bg-white/10 hover:text-white">
+            Reading
+          </Link>
+        </nav>
       </header>
 
       <LoginModal

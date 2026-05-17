@@ -11,5 +11,6 @@ config.toml
 scripts/deploy.sh
 .code_analysis/
 .runtime/
+.secrets/
 DIAG_*.md
 backend/target-local/

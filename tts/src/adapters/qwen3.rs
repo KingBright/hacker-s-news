@@ -1,9 +1,9 @@
-use anyhow::Result;
-use std::sync::{Arc, Mutex};
-use candle_core::Device;
-use qwen3_tts::{Qwen3TTS, AudioBuffer, Language, VoiceClonePrompt as QwenPrompt};
-use crate::engine::TtsEngine;
 use crate::config::VoicePrompt;
+use crate::engine::TtsEngine;
+use anyhow::Result;
+use candle_core::Device;
+use qwen3_tts::{AudioBuffer, Language, Qwen3TTS, VoiceClonePrompt as QwenPrompt};
+use std::sync::{Arc, Mutex};
 
 pub struct Qwen3Adapter {
     model: Arc<Mutex<Qwen3TTS>>,
@@ -33,7 +33,8 @@ impl TtsEngine for Qwen3Adapter {
         if let Some(wav_path) = prompt.wav_path.as_ref().map(|p| p.replace("file://", "")) {
             let ref_audio = AudioBuffer::load(&(wav_path))?;
             let model = self.model.lock().unwrap();
-            let qwen_prompt = model.create_voice_clone_prompt(&ref_audio, prompt.text.as_deref())?;
+            let qwen_prompt =
+                model.create_voice_clone_prompt(&ref_audio, prompt.text.as_deref())?;
             self.prompt = Some(qwen_prompt);
         }
         Ok(())
@@ -51,9 +52,9 @@ impl TtsEngine for Qwen3Adapter {
                 prompt,
                 Language::Chinese,
                 Some(qwen3_tts::SynthesisOptions {
-                    max_length: 2048,
+                    max_length: 1024,
                     ..Default::default()
-                })
+                }),
             )?
         } else {
             model.synthesize(chunk, None)?

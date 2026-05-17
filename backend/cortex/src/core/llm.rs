@@ -105,13 +105,25 @@ impl LlmClient {
 
             // Write to date-stamped file (e.g. llm_audit_2026-03-15.log)
             let rotated_path = if let Some(stem) = base_path.file_stem() {
-                let ext = base_path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "log".to_string());
-                base_path.with_file_name(format!("{}_{}.{}", stem.to_string_lossy(), date_suffix, ext))
+                let ext = base_path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "log".to_string());
+                base_path.with_file_name(format!(
+                    "{}_{}.{}",
+                    stem.to_string_lossy(),
+                    date_suffix,
+                    ext
+                ))
             } else {
                 base_path.clone()
             };
 
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&rotated_path) {
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&rotated_path)
+            {
                 let _ = writeln!(file, "{}", log_entry);
             }
 
@@ -230,10 +242,8 @@ impl LlmClient {
                     if let Some(ref fb_url) = self.config.fallback_url {
                         if !fb_url.is_empty() {
                             use_fallback_endpoint = true;
-                            let fallback_url = format!(
-                                "{}/chat/completions",
-                                fb_url.trim_end_matches('/')
-                            );
+                            let fallback_url =
+                                format!("{}/chat/completions", fb_url.trim_end_matches('/'));
                             log::warn!("Switching to fallback endpoint: {}", fallback_url);
                             fallback_url
                         } else {
@@ -257,8 +267,12 @@ impl LlmClient {
                     Err(e) => {
                         last_err = Some(e.to_string());
                         if attempt < 6 {
-                            log::warn!("LLM connection attempt {}/7 failed: {}. Retrying in {}s...",
-                                attempt + 1, e, delay.as_secs());
+                            log::warn!(
+                                "LLM connection attempt {}/7 failed: {}. Retrying in {}s...",
+                                attempt + 1,
+                                e,
+                                delay.as_secs()
+                            );
                             sleep(delay).await;
                         } else {
                             log::error!("LLM connection failed after all 7 attempts: {}", e);
@@ -271,7 +285,11 @@ impl LlmClient {
                 Some(r) => r,
                 None => {
                     let e = last_err.unwrap_or_else(|| "Unknown connection error".to_string());
-                    log::error!("Failed to connect to LLM at {} after all attempts: {}", url, e);
+                    log::error!(
+                        "Failed to connect to LLM at {} after all attempts: {}",
+                        url,
+                        e
+                    );
                     return Err(anyhow::anyhow!("LLM Connection Failed: {}", e));
                 }
             }
@@ -374,13 +392,16 @@ impl LlmClient {
         //    - "json_object": OpenAI JSON mode (valid JSON, no schema enforcement)
         //    - "none" / other: plain text, schema hint in prompt
         let json_mode = self.config.json_mode.as_str();
-        
+
         // For json_object and none modes, embed schema description in prompt
         // (json_schema mode enforces at API level, so no prompt hint needed)
         let content_with_hint = if json_mode != "json_schema" {
             // Build a compact schema description from the JSON Schema
             let schema_str = serde_json::to_string(&schema_value).unwrap_or_default();
-            format!("{}\n\nRespond ONLY with a valid JSON object. Schema: {}", prompt, schema_str)
+            format!(
+                "{}\n\nRespond ONLY with a valid JSON object. Schema: {}",
+                prompt, schema_str
+            )
         } else {
             prompt.to_string()
         };
@@ -426,9 +447,14 @@ impl LlmClient {
 
         log::info!(
             "Sending structured JSON request to {} (schema: {}, prompt: {} chars)",
-            url, schema_name, prompt.len()
+            url,
+            schema_name,
+            prompt.len()
         );
-        self.log_audit("INPUT (JSON)", &format!("[Schema: {}]\n{}", schema_name, prompt));
+        self.log_audit(
+            "INPUT (JSON)",
+            &format!("[Schema: {}]\n{}", schema_name, prompt),
+        );
 
         // 4. Retry mechanism (same as chat())
         let res = {
@@ -451,10 +477,8 @@ impl LlmClient {
                     if let Some(ref fb_url) = self.config.fallback_url {
                         if !fb_url.is_empty() {
                             use_fallback_endpoint = true;
-                            let fallback_url = format!(
-                                "{}/chat/completions",
-                                fb_url.trim_end_matches('/')
-                            );
+                            let fallback_url =
+                                format!("{}/chat/completions", fb_url.trim_end_matches('/'));
                             log::warn!("Switching to fallback endpoint: {}", fallback_url);
                             fallback_url
                         } else {
@@ -478,8 +502,12 @@ impl LlmClient {
                     Err(e) => {
                         last_err = Some(e.to_string());
                         if attempt < 6 {
-                            log::warn!("LLM connection attempt {}/7 failed: {}. Retrying in {}s...",
-                                attempt + 1, e, delay.as_secs());
+                            log::warn!(
+                                "LLM connection attempt {}/7 failed: {}. Retrying in {}s...",
+                                attempt + 1,
+                                e,
+                                delay.as_secs()
+                            );
                             sleep(delay).await;
                         } else {
                             log::error!("LLM connection failed after all 7 attempts: {}", e);
@@ -492,7 +520,11 @@ impl LlmClient {
                 Some(r) => r,
                 None => {
                     let e = last_err.unwrap_or_else(|| "Unknown connection error".to_string());
-                    log::error!("Failed to connect to LLM at {} after all attempts: {}", url, e);
+                    log::error!(
+                        "Failed to connect to LLM at {} after all attempts: {}",
+                        url,
+                        e
+                    );
                     return Err(anyhow::anyhow!("LLM Connection Failed: {}", e));
                 }
             }
@@ -502,7 +534,10 @@ impl LlmClient {
             let status = res.status();
             let error_text = res.text().await.unwrap_or_default();
             log::error!("LLM Error {}: {}", status, error_text);
-            self.log_audit("ERROR (JSON)", &format!("Status: {}, Body: {}", status, error_text));
+            self.log_audit(
+                "ERROR (JSON)",
+                &format!("Status: {}, Body: {}", status, error_text),
+            );
             return Err(anyhow::anyhow!("LLM API Error {}: {}", status, error_text));
         }
 
@@ -530,17 +565,33 @@ impl LlmClient {
             Ok(v) => v,
             Err(e) => {
                 // Fallback: try to extract JSON from response (for "none" mode or imperfect output)
-                let extracted = if let (Some(s), Some(e_pos)) = (json_content.find('{'), json_content.rfind('}')) {
-                    if e_pos >= s { &json_content[s..=e_pos] } else { json_content }
-                } else if let (Some(s), Some(e_pos)) = (json_content.find('['), json_content.rfind(']')) {
-                    if e_pos >= s { &json_content[s..=e_pos] } else { json_content }
+                let extracted = if let (Some(s), Some(e_pos)) =
+                    (json_content.find('{'), json_content.rfind('}'))
+                {
+                    if e_pos >= s {
+                        &json_content[s..=e_pos]
+                    } else {
+                        json_content
+                    }
+                } else if let (Some(s), Some(e_pos)) =
+                    (json_content.find('['), json_content.rfind(']'))
+                {
+                    if e_pos >= s {
+                        &json_content[s..=e_pos]
+                    } else {
+                        json_content
+                    }
                 } else {
                     json_content
                 };
-                
+
                 serde_json::from_str(extracted).map_err(|_| {
-                    log::error!("Structured JSON parse failed (schema: {}): {}. Content: {}", 
-                        schema_name, e, json_content);
+                    log::error!(
+                        "Structured JSON parse failed (schema: {}): {}. Content: {}",
+                        schema_name,
+                        e,
+                        json_content
+                    );
                     anyhow::anyhow!("Structured JSON parse error: {}", e)
                 })?
             }

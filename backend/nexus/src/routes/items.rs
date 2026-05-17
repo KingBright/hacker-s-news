@@ -1,3 +1,4 @@
+use crate::AppState;
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
@@ -5,9 +6,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use uuid::Uuid;
 use sqlx::FromRow;
-use crate::AppState;
+use uuid::Uuid;
 
 // Input validation constants
 const MAX_TITLE_LENGTH: usize = 500;
@@ -163,29 +163,45 @@ pub async fn create_item(
 
     // === INPUT VALIDATION ===
     if payload.title.is_empty() || payload.title.len() > MAX_TITLE_LENGTH {
-        return (StatusCode::BAD_REQUEST, Json(json!({
-            "error": format!("Title must be 1-{} characters", MAX_TITLE_LENGTH)
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Title must be 1-{} characters", MAX_TITLE_LENGTH)
+            })),
+        )
+            .into_response();
     }
 
     if let Some(ref url) = payload.original_url {
         if url.len() > MAX_URL_LENGTH {
-            return (StatusCode::BAD_REQUEST, Json(json!({
-                "error": format!("URL exceeds maximum length of {}", MAX_URL_LENGTH)
-            }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("URL exceeds maximum length of {}", MAX_URL_LENGTH)
+                })),
+            )
+                .into_response();
         }
         if !url.is_empty() && !is_valid_url(url) {
-            return (StatusCode::BAD_REQUEST, Json(json!({
-                "error": "Invalid URL format (must start with http:// or https://)"
-            }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Invalid URL format (must start with http:// or https://)"
+                })),
+            )
+                .into_response();
         }
     }
 
     if let Some(ref summary) = payload.summary {
         if summary.len() > MAX_SUMMARY_LENGTH {
-            return (StatusCode::BAD_REQUEST, Json(json!({
-                "error": format!("Summary exceeds maximum length of {}", MAX_SUMMARY_LENGTH)
-            }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("Summary exceeds maximum length of {}", MAX_SUMMARY_LENGTH)
+                })),
+            )
+                .into_response();
         }
     }
 
@@ -318,7 +334,10 @@ pub async fn create_item_multipart(
             }
         } else if name == "file" {
             let filename = field.file_name().unwrap_or("audio.wav").to_string();
-            let clean_name = Path::new(&filename).file_name().and_then(|n| n.to_str()).unwrap_or("audio.wav");
+            let clean_name = Path::new(&filename)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("audio.wav");
             let target_name = format!("{}_{}", id, clean_name);
             let target_path = Path::new(&state.audio_dir).join(&target_name);
 
@@ -326,13 +345,23 @@ pub async fn create_item_multipart(
 
             let mut file = match tokio::fs::File::create(&target_path).await {
                 Ok(f) => f,
-                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create file: {}", e)).into_response(),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to create file: {}", e),
+                    )
+                        .into_response()
+                }
             };
 
             while let Ok(Some(chunk)) = field.chunk().await {
                 if let Err(e) = file.write_all(&chunk).await {
                     let _ = tokio::fs::remove_file(&target_path).await;
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)).into_response();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to write file: {}", e),
+                    )
+                        .into_response();
                 }
             }
             saved_file = true;
@@ -341,10 +370,10 @@ pub async fn create_item_multipart(
     }
 
     let Some(mut item_req) = payload else {
-         if let Some(path) = file_path {
-             let _ = tokio::fs::remove_file(path).await;
-         }
-         return (StatusCode::BAD_REQUEST, "Missing payload").into_response();
+        if let Some(path) = file_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        return (StatusCode::BAD_REQUEST, "Missing payload").into_response();
     };
 
     if saved_file {
@@ -426,13 +455,17 @@ pub async fn create_item_multipart(
                 }
             }
             Json(json!({ "id": id, "status": "created" })).into_response()
-        },
+        }
         Err(e) => {
             tracing::error!("DB Insert Failed: {}", e);
             if let Some(path) = file_path {
                 let _ = tokio::fs::remove_file(path).await;
             }
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("DB Insert Failed: {}", e)).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB Insert Failed: {}", e),
+            )
+                .into_response()
         }
     }
 }

@@ -1,9 +1,9 @@
-use anyhow::Result;
-use std::sync::{Arc, Mutex};
-use candle_core::{Device, DType};
-use aha::models::voxcpm::generate::VoxCPMGenerate;
-use crate::engine::TtsEngine;
 use crate::config::VoicePrompt;
+use crate::engine::TtsEngine;
+use aha::models::voxcpm::generate::VoxCPMGenerate;
+use anyhow::Result;
+use candle_core::{DType, Device};
+use std::sync::{Arc, Mutex};
 
 pub struct VoxCpmAdapter {
     model: Arc<Mutex<VoxCPMGenerate>>,
@@ -39,25 +39,17 @@ impl TtsEngine for VoxCpmAdapter {
     fn synthesize_chunk(&mut self, chunk: &str) -> Result<Vec<f32>> {
         let mut model = self.model.lock().unwrap();
         let audio_tensor = if self.use_cache {
-            model.generate_use_prompt_cache(
-                chunk.to_string(),
-                2,
-                4096,
-                10,
-                2.0,
-                false,
-                6.0
-            )?
+            model.generate_use_prompt_cache(chunk.to_string(), 2, 1024, 10, 2.0, false, 6.0)?
         } else {
             model.inference(
                 chunk.to_string(),
                 None, // We didn't save prompt strings natively if cache wasn't built
-                None, 
-                2,      
-                4096,   
-                10,     
-                2.0,    
-                6.0,    
+                None,
+                2,
+                1024,
+                10,
+                2.0,
+                6.0,
             )?
         };
         Ok(audio_tensor.flatten_all()?.to_vec1::<f32>()?)

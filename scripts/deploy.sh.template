@@ -10,6 +10,144 @@ AUDIO_DIR=""
 BINARY_NAME=""
 DOMAIN=""
 
+# Security Configuration
+# NEXUS_KEY can be supplied by env, config.toml, or a local secret file.
+# If none exist, this script generates and persists a strong random key.
+NEXUS_KEY="${NEXUS_KEY:-}"
+NEXUS_KEY_FILE="${NEXUS_KEY_FILE:-.secrets/nexus_key}"
+
+is_placeholder_nexus_key() {
+    local legacy_demo_key="my-""secret-key-123"
+    local legacy_deploy_key="sk-""secure-hackerlife-2026"
+    case "${1:-}" in
+        ""|"CHANGE_ME_NEXUS_KEY"|"your-secret-api-key"|"$legacy_demo_key"|"$legacy_deploy_key")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+read_config_nexus_key() {
+    local config_file="${1:-config.toml}"
+    [ -f "$config_file" ] || return 1
+
+    awk '
+        /^\[nexus\][[:space:]]*$/ { in_nexus = 1; next }
+        /^\[/ { in_nexus = 0 }
+        in_nexus && /^[[:space:]]*auth_key[[:space:]]*=/ {
+            value = $0
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            sub(/^[[:space:]]*"/, "", value)
+            sub(/"[[:space:]]*(#.*)?$/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            print value
+            exit
+        }
+    ' "$config_file"
+}
+
+generate_nexus_key() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32
+        return
+    fi
+
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 64
+    echo
+}
+
+persist_nexus_key() {
+    local existing_key=""
+    if [ -f "$NEXUS_KEY_FILE" ]; then
+        existing_key="$(tr -d '\r\n' < "$NEXUS_KEY_FILE")"
+    fi
+
+    if [ "$existing_key" != "$NEXUS_KEY" ]; then
+        mkdir -p "$(dirname "$NEXUS_KEY_FILE")"
+        (umask 077 && printf '%s\n' "$NEXUS_KEY" > "$NEXUS_KEY_FILE")
+        chmod 600 "$NEXUS_KEY_FILE" 2>/dev/null || true
+    fi
+}
+
+sync_placeholder_config_key() {
+    [ -f "config.toml" ] || return
+
+    local config_key
+    config_key="$(read_config_nexus_key config.toml || true)"
+    if is_placeholder_nexus_key "$config_key"; then
+        local tmp_file
+        tmp_file="$(mktemp)"
+        awk -v key="$NEXUS_KEY" '
+            BEGIN { in_nexus = 0; seen_nexus = 0; wrote_key = 0 }
+            /^\[nexus\][[:space:]]*$/ {
+                in_nexus = 1
+                seen_nexus = 1
+                print
+                next
+            }
+            /^\[/ {
+                if (in_nexus && !wrote_key) {
+                    print "auth_key = \"" key "\""
+                    wrote_key = 1
+                }
+                in_nexus = 0
+            }
+            in_nexus && /^[[:space:]]*auth_key[[:space:]]*=/ {
+                print "auth_key = \"" key "\""
+                wrote_key = 1
+                next
+            }
+            { print }
+            END {
+                if (in_nexus && !wrote_key) {
+                    print "auth_key = \"" key "\""
+                    wrote_key = 1
+                }
+                if (!seen_nexus) {
+                    print ""
+                    print "[nexus]"
+                    print "auth_key = \"" key "\""
+                }
+            }
+        ' config.toml > "$tmp_file"
+        mv "$tmp_file" config.toml
+        chmod 600 config.toml 2>/dev/null || true
+        echo ">>> Synced generated Nexus key into local config.toml"
+    elif [ "$config_key" != "$NEXUS_KEY" ]; then
+        echo ">>> Warning: config.toml [nexus].auth_key differs from deploy key; Cortex must use the same key."
+    fi
+}
+
+ensure_nexus_key() {
+    [ "$DEPLOY_NEXUS" = true ] || return 0
+
+    local key_source=""
+    if ! is_placeholder_nexus_key "$NEXUS_KEY"; then
+        key_source="environment"
+    else
+        NEXUS_KEY="$(read_config_nexus_key config.toml || true)"
+        if ! is_placeholder_nexus_key "$NEXUS_KEY"; then
+            key_source="config.toml"
+        elif [ -f "$NEXUS_KEY_FILE" ]; then
+            NEXUS_KEY="$(tr -d '\r\n' < "$NEXUS_KEY_FILE")"
+            if ! is_placeholder_nexus_key "$NEXUS_KEY"; then
+                key_source="$NEXUS_KEY_FILE"
+            fi
+        fi
+    fi
+
+    if is_placeholder_nexus_key "$NEXUS_KEY"; then
+        NEXUS_KEY="$(generate_nexus_key)"
+        key_source="generated"
+    fi
+
+    persist_nexus_key
+    sync_placeholder_config_key
+    echo ">>> Nexus key source: $key_source ($NEXUS_KEY_FILE)"
+}
+
 # Argument Parsing
 DEPLOY_FRONTEND=false
 DEPLOY_NEXUS=false
@@ -34,6 +172,8 @@ else
         esac
     done
 fi
+
+ensure_nexus_key
 
 echo "Using server: $SERVER (Port: $SSH_PORT)"
 echo "Deploying to: $APP_DIR"
@@ -94,7 +234,7 @@ if [ "$DEPLOY_NEXUS" = true ]; then
     echo ">>> Generating Configuration File..."
     cat <<EOF > config.env
 PORT=8899
-NEXUS_KEY=sk-secure-hackerlife-2026
+NEXUS_KEY=$NEXUS_KEY
 STATIC_DIR=$APP_DIR/frontend
 AUDIO_DIR=$AUDIO_DIR
 DATABASE_URL=sqlite:$DATA_DIR/nexus.db

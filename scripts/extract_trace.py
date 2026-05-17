@@ -30,8 +30,8 @@ from typing import Optional, List, Dict, Tuple
 # ============================================================
 # Configuration
 # ============================================================
-NEXUS_API_URL = "https://news.hackerlife.fun:8443"
-NEXUS_AUTH_KEY = "sk-secure-hackerlife-2026"
+NEXUS_API_URL = os.environ.get("FRESHLOOP_NEXUS_URL", "https://news.hackerlife.fun:8443")
+NEXUS_AUTH_KEY = os.environ.get("FRESHLOOP_NEXUS_KEY", "")
 TRACE_LOG_DIR = os.path.expanduser("~/.freshloop/logs/traces")
 
 # Old category name -> normalized new name (lowercased, no spaces/underscores)
@@ -128,9 +128,11 @@ class DiagnosticResult:
 # SSL helper
 # ============================================================
 def _ssl_ctx():
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ca_file = os.environ.get("FRESHLOOP_CA_FILE")
+    ctx = ssl.create_default_context(cafile=ca_file)
+    if os.environ.get("FRESHLOOP_INSECURE_TLS") == "1":
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
 
@@ -145,8 +147,9 @@ class NexusClient:
     def _request(self, path):
         url = f"{self.api_url}{path}"
         req = urllib.request.Request(url)
-        req.add_header("x-api-key", self.auth_key)
-        req.add_header("X-NEXUS-KEY", self.auth_key)
+        if self.auth_key:
+            req.add_header("x-api-key", self.auth_key)
+            req.add_header("X-NEXUS-KEY", self.auth_key)
         req.add_header("User-Agent", "FreshLoop-Diagnostic/2.0")
         try:
             with urllib.request.urlopen(req, context=_ssl_ctx()) as resp:

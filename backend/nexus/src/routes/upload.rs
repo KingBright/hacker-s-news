@@ -34,30 +34,44 @@ pub async fn upload_audio(
                         .to_string();
 
                     let filepath = Path::new(&state.audio_dir).join(&sanitized_file_name);
-                    
+
                     // Create file for streaming
                     let mut file = match fs::File::create(&filepath).await {
                         Ok(f) => f,
-                        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create file: {}", e)).into_response(),
+                        Err(e) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to create file: {}", e),
+                            )
+                                .into_response()
+                        }
                     };
 
                     // Stream chunks directly to file
                     let mut field = field; // make mutable
                     while let Ok(Some(chunk)) = field.chunk().await {
-                         // use tokio::io::AsyncWriteExt;
-                         if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
-                             return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write chunk: {}", e)).into_response();
-                         }
+                        // use tokio::io::AsyncWriteExt;
+                        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await
+                        {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to write chunk: {}", e),
+                            )
+                                .into_response();
+                        }
                     }
 
                     return Json(json!({
                         "url": format!("/audio/{}", sanitized_file_name),
                         "filename": sanitized_file_name
-                    })).into_response();
+                    }))
+                    .into_response();
                 }
-            },
-            Ok(None) => break, 
-            Err(e) => return (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response(),
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response()
+            }
         }
     }
 

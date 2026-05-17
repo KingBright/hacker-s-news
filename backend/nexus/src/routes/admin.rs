@@ -1,11 +1,11 @@
+use crate::routes::items::Item;
+use crate::AppState;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
-use crate::AppState;
-use crate::routes::items::Item;
 
 #[derive(Deserialize)]
 pub struct UpdateItemRequest {
@@ -29,7 +29,7 @@ pub async fn update_item(
     // Build dynamic update query
     let mut query = "UPDATE items SET ".to_string();
     let mut updates = Vec::new();
-    
+
     if payload.rating.is_some() {
         updates.push("rating = ?");
     }
@@ -39,16 +39,16 @@ pub async fn update_item(
     if payload.is_deleted.is_some() {
         updates.push("is_deleted = ?");
     }
-    
+
     if updates.is_empty() {
-         return (StatusCode::BAD_REQUEST, "No fields to update").into_response();
+        return (StatusCode::BAD_REQUEST, "No fields to update").into_response();
     }
-    
+
     query.push_str(&updates.join(", "));
     query.push_str(" WHERE id = ?");
-    
+
     let mut sql = sqlx::query(&query);
-    
+
     if let Some(rating) = payload.rating {
         sql = sql.bind(rating);
     }
@@ -58,7 +58,7 @@ pub async fn update_item(
     if let Some(is_deleted) = payload.is_deleted {
         sql = sql.bind(is_deleted);
     }
-    
+
     sql = sql.bind(id);
 
     match sql.execute(&state.db).await {
@@ -67,10 +67,7 @@ pub async fn update_item(
     }
 }
 
-pub async fn export_items(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn export_items(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // Check Auth
     let api_key = headers.get("X-NEXUS-KEY").and_then(|v| v.to_str().ok());
     if api_key != Some(&state.api_key) {
