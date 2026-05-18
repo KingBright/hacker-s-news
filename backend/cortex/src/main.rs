@@ -159,16 +159,15 @@ description = "Technology news"
 
 [curated_feed]
 enabled = true
-schedule_times = ["08:30"]
+schedule_times = ["08:00"]
 source_group = "karpathy_hn"
 max_items_per_cycle = 20
 max_age_days = 2
 min_quality_score = 6
 article_audio_enabled = true
-article_audio_min_quality_score = 8
 article_audio_max_items_per_cycle = 3
 weekly_digest_enabled = true
-weekly_digest_schedule_times = ["21:00"]
+weekly_digest_schedule_times = ["18:00"]
 weekly_digest_min_items = 3
 weekly_digest_max_items = 12
 
