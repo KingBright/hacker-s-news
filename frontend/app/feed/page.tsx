@@ -92,81 +92,161 @@ function contentForMode(content: FeedItemContent | null, mode: ReadingMode) {
   if (mode === "compressed") {
     return (
       content.compressed_markdown ||
+      content.audio_script ||
       parseJsonList(content.key_points_json)
         .map((point) => `- ${point}`)
         .join("\n") ||
+      content.plain_text ||
       "这篇文章还没有生成干货压缩。"
     );
   }
   return content.reader_markdown || content.plain_text || "";
 }
 
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const pattern = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
+    const token = match[0];
+    if (token.startsWith("**")) {
+      nodes.push(
+        <strong key={`strong-${match.index}`} className="font-black text-white/90">
+          {token.slice(2, -2)}
+        </strong>,
+      );
+    } else if (token.startsWith("`")) {
+      nodes.push(
+        <code key={`code-${match.index}`} className="rounded bg-white/10 px-1.5 py-0.5 text-[0.92em] text-[#bff6d2]">
+          {token.slice(1, -1)}
+        </code>,
+      );
+    } else {
+      const link = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(token);
+      nodes.push(
+        link ? (
+          <a key={`link-${match.index}`} href={link[2]} target="_blank" rel="noreferrer" className="text-primary underline decoration-primary/35 underline-offset-4">
+            {link[1]}
+          </a>
+        ) : (
+          token
+        ),
+      );
+    }
+    cursor = match.index + token.length;
+  }
+
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return nodes;
+}
+
 function renderMarkdown(markdown: string) {
   const lines = markdown.split("\n");
   const nodes: ReactNode[] = [];
   let list: string[] = [];
+  let listKind: "ul" | "ol" = "ul";
+  let paragraph: string[] = [];
 
   const flushList = () => {
     if (list.length === 0) return;
     const items = list;
+    const kind = listKind;
     list = [];
+    const className = "my-5 space-y-2 pl-5 text-[15px] leading-7 text-white/76";
+    const children = items.map((item, index) => (
+      <li key={`${item}-${index}`} className={kind === "ul" ? "list-disc pl-1" : "list-decimal pl-1"}>
+        {renderInlineMarkdown(item)}
+      </li>
+    ));
+    nodes.push(kind === "ul" ? (
+      <ul key={`list-${nodes.length}`} className={className}>{children}</ul>
+    ) : (
+      <ol key={`list-${nodes.length}`} className={className}>{children}</ol>
+    ));
+  };
+
+  const flushParagraph = () => {
+    if (paragraph.length === 0) return;
+    const text = paragraph.join("\n").trim();
+    paragraph = [];
+    if (!text) return;
     nodes.push(
-      <ul key={`list-${nodes.length}`} className="my-5 space-y-2 pl-5 text-[15px] leading-7 text-white/75">
-        {items.map((item, index) => (
-          <li key={`${item}-${index}`} className="list-disc">
-            {item}
-          </li>
-        ))}
-      </ul>,
+      <p key={`p-${nodes.length}`} className="my-5 whitespace-pre-line text-[16px] leading-8 text-white/76">
+        {renderInlineMarkdown(text)}
+      </p>,
     );
+  };
+
+  const flushAll = () => {
+    flushParagraph();
+    flushList();
   };
 
   lines.forEach((line, index) => {
     const text = line.trim();
     if (!text) {
-      flushList();
+      flushAll();
       return;
     }
     if (text.startsWith("### ")) {
-      flushList();
+      flushAll();
       nodes.push(
-        <h3 key={index} className="mt-8 text-lg font-bold leading-tight text-white">
-          {text.slice(4)}
+        <h3 key={index} className="mt-8 text-lg font-black leading-tight text-white">
+          {renderInlineMarkdown(text.slice(4))}
         </h3>,
       );
       return;
     }
     if (text.startsWith("## ")) {
-      flushList();
+      flushAll();
       nodes.push(
         <h2 key={index} className="mt-9 text-xl font-black leading-tight text-white">
-          {text.slice(3)}
+          {renderInlineMarkdown(text.slice(3))}
         </h2>,
       );
       return;
     }
     if (text.startsWith("# ")) {
-      flushList();
+      flushAll();
       nodes.push(
         <h1 key={index} className="mt-8 text-2xl font-black leading-tight text-white">
-          {text.slice(2)}
+          {renderInlineMarkdown(text.slice(2))}
         </h1>,
       );
       return;
     }
-    if (text.startsWith("- ")) {
+    if (/^[-*+]\s+/.test(text)) {
+      flushParagraph();
+      if (list.length > 0 && listKind !== "ul") flushList();
+      listKind = "ul";
       list.push(text.slice(2));
       return;
     }
+    const ordered = /^(\d+)[.)]\s+(.+)$/.exec(text);
+    if (ordered) {
+      flushParagraph();
+      if (list.length > 0 && listKind !== "ol") flushList();
+      listKind = "ol";
+      list.push(ordered[2]);
+      return;
+    }
+    if (text.startsWith("> ")) {
+      flushAll();
+      nodes.push(
+        <blockquote key={index} className="my-6 border-l-2 border-primary/60 pl-4 text-[15px] leading-7 text-white/68">
+          {renderInlineMarkdown(text.slice(2))}
+        </blockquote>,
+      );
+      return;
+    }
     flushList();
-    nodes.push(
-      <p key={index} className="my-5 text-[16px] leading-8 text-white/75">
-        {text}
-      </p>,
-    );
+    paragraph.push(text);
   });
 
-  flushList();
+  flushAll();
   return nodes;
 }
 

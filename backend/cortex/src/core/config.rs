@@ -83,7 +83,6 @@ pub struct CuratedFeedConfig {
     pub min_quality_score: Option<u8>,
     pub prefer_proxy: Option<bool>,
     pub article_audio_enabled: Option<bool>,
-    pub article_audio_min_quality_score: Option<u8>,
     pub article_audio_max_items_per_cycle: Option<usize>,
     pub weekly_digest_enabled: Option<bool>,
     pub weekly_digest_schedule_times: Option<Vec<String>>,

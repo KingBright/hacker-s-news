@@ -25,8 +25,8 @@ use crate::core::tts::TtsClient;
 const DEFAULT_MAX_ITEMS_PER_CYCLE: usize = 30;
 const DEFAULT_MAX_AGE_DAYS: i64 = 2;
 const DEFAULT_MIN_QUALITY_SCORE: u8 = 6;
-const DEFAULT_ARTICLE_AUDIO_MIN_QUALITY_SCORE: u8 = 8;
 const DEFAULT_ARTICLE_AUDIO_MAX_ITEMS_PER_CYCLE: usize = 3;
+const DEFAULT_ARTICLE_CONTENT_BACKFILL_ITEMS: usize = 32;
 const DEFAULT_WEEKLY_DIGEST_MIN_ITEMS: usize = 3;
 const DEFAULT_WEEKLY_DIGEST_MAX_ITEMS: usize = 12;
 const SOURCE_FETCH_CONCURRENCY: usize = 12;
@@ -186,27 +186,20 @@ impl CuratedFeedPipeline {
             .max_items_per_cycle
             .unwrap_or(DEFAULT_MAX_ITEMS_PER_CYCLE);
         let article_audio_enabled = feed_config.article_audio_enabled.unwrap_or(true);
-        let article_audio_min_quality_score = feed_config
-            .article_audio_min_quality_score
-            .unwrap_or(DEFAULT_ARTICLE_AUDIO_MIN_QUALITY_SCORE);
         let article_audio_max_items = feed_config
             .article_audio_max_items_per_cycle
             .unwrap_or(DEFAULT_ARTICLE_AUDIO_MAX_ITEMS_PER_CYCLE);
         let mut audio_items_used = 0usize;
         let mut scheduled_audio_item_ids = HashSet::new();
-        if article_audio_enabled {
-            let backfilled = self
-                .backfill_missing_article_audio(
-                    article_audio_max_items,
-                    article_audio_min_quality_score,
-                    &scheduled_audio_item_ids,
-                )
-                .await?;
-            for item_id in backfilled {
-                scheduled_audio_item_ids.insert(item_id);
-                audio_items_used += 1;
-                stats.published_audio_items += 1;
-            }
+
+        let repaired_content = self
+            .backfill_missing_article_content(DEFAULT_ARTICLE_CONTENT_BACKFILL_ITEMS)
+            .await?;
+        if repaired_content > 0 {
+            log::info!(
+                "[CuratedFeed] repaired {} curated article content payloads",
+                repaired_content
+            );
         }
 
         log::info!(
@@ -262,14 +255,7 @@ impl CuratedFeedPipeline {
         for (source, entry) in candidates {
             let allow_audio = article_audio_enabled && audio_items_used < article_audio_max_items;
             match self
-                .process_entry(
-                    &source,
-                    entry,
-                    min_quality_score,
-                    allow_audio,
-                    article_audio_min_quality_score,
-                    now,
-                )
+                .process_entry(&source, entry, min_quality_score, allow_audio, now)
                 .await
             {
                 Ok(ProcessEntryOutcome::Published {
@@ -295,7 +281,6 @@ impl CuratedFeedPipeline {
             let backfilled = self
                 .backfill_missing_article_audio(
                     article_audio_max_items - audio_items_used,
-                    article_audio_min_quality_score,
                     &scheduled_audio_item_ids,
                 )
                 .await?;
@@ -409,7 +394,6 @@ impl CuratedFeedPipeline {
         entry: FetchedEntry,
         min_quality_score: u8,
         allow_audio: bool,
-        article_audio_min_quality_score: u8,
         now: DateTime<FixedOffset>,
     ) -> Result<ProcessEntryOutcome> {
         let snapshot = build_article_snapshot(&entry);
@@ -449,15 +433,30 @@ impl CuratedFeedPipeline {
         } else {
             analysis.title.clone()
         };
-        let key_points_json = serde_json::to_string(&analysis.key_points).ok();
+        let compressed_markdown = finalized_article_compressed_markdown(
+            &entry.title,
+            &snapshot,
+            analysis.compressed_markdown.as_str(),
+        );
+        let audio_script = finalized_article_audio_script(
+            &entry.title,
+            &snapshot,
+            analysis.audio_script.as_str(),
+            compressed_markdown.as_str(),
+        );
+        let key_points = if analysis.key_points.is_empty() {
+            fallback_key_points(compressed_markdown.as_str())
+        } else {
+            analysis.key_points.clone()
+        };
+        let key_points_json = serde_json::to_string(&key_points).ok();
         let tags = build_tags(source, &analysis);
-        let compressed_markdown = non_empty_string(analysis.compressed_markdown.clone());
-        let audio_script = non_empty_string(analysis.audio_script.clone());
-        let should_generate_audio =
-            allow_audio && analysis.quality_score >= article_audio_min_quality_score;
-        let audio_text = if should_generate_audio {
+        let audio_text = if allow_audio {
             Some(build_article_audio_text(
-                &title, source, &entry, &analysis, &snapshot,
+                &title,
+                source,
+                &entry,
+                audio_script.as_str(),
             ))
         } else {
             None
@@ -477,8 +476,9 @@ impl CuratedFeedPipeline {
             canonical_url: Some(entry.link.clone()),
             content_hash: Some(snapshot.content_hash.clone()),
             publish_time: Some(publish_time),
-            has_audio: Some(false),
+            has_audio: Some(audio_text.is_some()),
             audio_url: None,
+            clear_audio: None,
             duration_sec: None,
             reading_time_min: Some(snapshot.reading_time_min),
             quality_score: Some(i32::from(analysis.quality_score)),
@@ -488,8 +488,8 @@ impl CuratedFeedPipeline {
                 original_html: Some(entry.description),
                 reader_markdown: Some(snapshot.reader_markdown),
                 plain_text: Some(snapshot.plain_text),
-                compressed_markdown,
-                audio_script,
+                compressed_markdown: Some(compressed_markdown),
+                audio_script: Some(audio_script),
                 key_points_json,
             }),
         };
@@ -529,6 +529,7 @@ impl CuratedFeedPipeline {
                 publish_time: Some(publish_time),
                 has_audio: Some(true),
                 audio_url: None,
+                clear_audio: None,
                 duration_sec: None,
                 reading_time_min: Some(snapshot.reading_time_min),
                 quality_score: Some(i32::from(analysis.quality_score)),
@@ -537,6 +538,11 @@ impl CuratedFeedPipeline {
                 content: None,
             };
             tokio::spawn(async move {
+                let reset_update = FeedItemPayload {
+                    has_audio: Some(false),
+                    clear_audio: Some(true),
+                    ..audio_update.clone()
+                };
                 match generate_audio_file_with(
                     tts,
                     nexus.clone(),
@@ -564,6 +570,13 @@ impl CuratedFeedPipeline {
                         }
                     }
                     Err(e) => {
+                        if let Err(reset_err) = nexus.push_feed_item(reset_update).await {
+                            log::warn!(
+                                "[CuratedFeed] failed to reset article audio state {}: {}",
+                                item_id,
+                                reset_err
+                            );
+                        }
                         log::warn!(
                             "[CuratedFeed] article audio failed for '{}'; readable item remains published: {}",
                             title_for_log,
@@ -584,7 +597,6 @@ impl CuratedFeedPipeline {
     async fn backfill_missing_article_audio(
         &self,
         max_items: usize,
-        min_quality_score: u8,
         excluded_ids: &HashSet<String>,
     ) -> Result<Vec<String>> {
         if max_items == 0 {
@@ -615,10 +627,6 @@ impl CuratedFeedPipeline {
             {
                 continue;
             }
-            let quality_score = item.quality_score.unwrap_or_default();
-            if quality_score < i32::from(min_quality_score) {
-                continue;
-            }
             let Some(content) = self.nexus.fetch_feed_item_content(&item_id).await? else {
                 continue;
             };
@@ -633,15 +641,38 @@ impl CuratedFeedPipeline {
             update.primary_mode = "read".to_string();
             update.has_audio = Some(true);
             update.audio_url = None;
+            update.clear_audio = None;
             update.duration_sec = None;
             update.status = Some("published".to_string());
             update.content = None;
+
+            match self.nexus.push_feed_item(update.clone()).await {
+                Ok(result) => log::info!(
+                    "[CuratedFeed] marked article audio pending {} status={}",
+                    result.id,
+                    result.status
+                ),
+                Err(e) => {
+                    log::warn!(
+                        "[CuratedFeed] failed to mark article audio pending {}: {}",
+                        item_id,
+                        e
+                    );
+                    continue;
+                }
+            }
 
             let nexus = self.nexus.clone();
             let tts = self.tts.clone();
             let title_for_log = item.title.clone();
             let scheduled_id = item_id.clone();
+            let scheduled_id_for_task = scheduled_id.clone();
             tokio::spawn(async move {
+                let reset_update = FeedItemPayload {
+                    has_audio: Some(false),
+                    clear_audio: Some(true),
+                    ..update.clone()
+                };
                 match generate_audio_file_with(
                     tts,
                     nexus.clone(),
@@ -667,11 +698,20 @@ impl CuratedFeedPipeline {
                             ),
                         }
                     }
-                    Err(e) => log::warn!(
-                        "[CuratedFeed] article audio backfill failed for '{}': {}",
-                        title_for_log,
-                        e
-                    ),
+                    Err(e) => {
+                        if let Err(reset_err) = nexus.push_feed_item(reset_update).await {
+                            log::warn!(
+                                "[CuratedFeed] failed to reset article audio backfill state {}: {}",
+                                scheduled_id_for_task,
+                                reset_err
+                            );
+                        }
+                        log::warn!(
+                            "[CuratedFeed] article audio backfill failed for '{}': {}",
+                            title_for_log,
+                            e
+                        );
+                    }
                 }
             });
             scheduled_ids.push(scheduled_id);
@@ -687,6 +727,143 @@ impl CuratedFeedPipeline {
         Ok(scheduled_ids)
     }
 
+    async fn backfill_missing_article_content(&self, max_items: usize) -> Result<usize> {
+        if max_items == 0 {
+            return Ok(0);
+        }
+
+        let items = self
+            .nexus
+            .fetch_feed_items("curated_feed", "article", 100)
+            .await?;
+        let mut repaired = 0usize;
+
+        for item in items {
+            if repaired >= max_items {
+                break;
+            }
+            let Some(item_id) = item.id.clone() else {
+                continue;
+            };
+            let Some(mut content) = self.nexus.fetch_feed_item_content(&item_id).await? else {
+                continue;
+            };
+            let needs_repair = article_content_needs_repair(&content);
+            if !needs_repair {
+                continue;
+            }
+            let should_refresh_audio = item
+                .audio_url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty());
+
+            let plain_text = content
+                .plain_text
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .or_else(|| {
+                    content
+                        .reader_markdown
+                        .as_deref()
+                        .filter(|text| !text.trim().is_empty())
+                })
+                .unwrap_or("");
+            if plain_text.chars().filter(|ch| !ch.is_whitespace()).count() < 80 {
+                continue;
+            }
+
+            let snapshot = ArticleSnapshot {
+                reader_markdown: content.reader_markdown.clone().unwrap_or_default(),
+                plain_text: plain_text.to_string(),
+                reading_time_min: item
+                    .reading_time_min
+                    .unwrap_or_else(|| estimate_reading_time_min(plain_text)),
+                content_hash: item.content_hash.clone().unwrap_or_else(|| {
+                    content_hash(
+                        &item.title,
+                        item.original_url.as_deref().unwrap_or_default(),
+                        plain_text,
+                    )
+                }),
+            };
+            let repair_context = snapshot
+                .plain_text
+                .chars()
+                .take(ARTICLE_CONTEXT_LIMIT)
+                .collect::<String>();
+            let analysis = match self
+                .analyze_article_text(
+                    item.source_name.as_deref().unwrap_or("Unknown"),
+                    &item.title,
+                    item.original_url.as_deref().unwrap_or_default(),
+                    &repair_context,
+                )
+                .await
+            {
+                Ok(analysis) => analysis,
+                Err(e) => {
+                    log::warn!(
+                        "[CuratedFeed] content repair LLM failed for '{}'; using deterministic fallback: {}",
+                        item.title,
+                        e
+                    );
+                    fallback_analysis_from_text(&item.title, &snapshot)
+                }
+            };
+
+            let compressed_markdown = finalized_article_compressed_markdown(
+                &item.title,
+                &snapshot,
+                analysis.compressed_markdown.as_str(),
+            );
+            let audio_script = finalized_article_audio_script(
+                &item.title,
+                &snapshot,
+                analysis.audio_script.as_str(),
+                compressed_markdown.as_str(),
+            );
+            let key_points = if analysis.key_points.is_empty() {
+                fallback_key_points(compressed_markdown.as_str())
+            } else {
+                analysis.key_points
+            };
+
+            content.compressed_markdown = Some(compressed_markdown);
+            content.audio_script = Some(audio_script);
+            content.key_points_json = serde_json::to_string(&key_points).ok();
+
+            let mut update = item.clone();
+            update.id = Some(item_id.clone());
+            update.product_line = Some("curated_feed".to_string());
+            update.item_type = "article".to_string();
+            update.primary_mode = "read".to_string();
+            if should_refresh_audio {
+                update.has_audio = Some(false);
+                update.audio_url = None;
+                update.clear_audio = Some(true);
+                update.duration_sec = None;
+            }
+            update.content = Some(content);
+            match self.nexus.push_feed_item(update).await {
+                Ok(result) => {
+                    repaired += 1;
+                    log::info!(
+                        "[CuratedFeed] repaired article content {} status={}",
+                        result.id,
+                        result.status
+                    );
+                }
+                Err(e) => log::warn!(
+                    "[CuratedFeed] failed to repair article content {}: {}",
+                    item_id,
+                    e
+                ),
+            }
+        }
+
+        Ok(repaired)
+    }
+
     async fn analyze_article(
         &self,
         source: &ContentSource,
@@ -698,17 +875,29 @@ impl CuratedFeedPipeline {
             .chars()
             .take(ARTICLE_CONTEXT_LIMIT)
             .collect::<String>();
+        self.analyze_article_text(&source.name, &entry.title, &entry.link, &context)
+            .await
+    }
+
+    async fn analyze_article_text(
+        &self,
+        source_name: &str,
+        title: &str,
+        url: &str,
+        context: &str,
+    ) -> Result<ArticleAnalysis> {
         let prompt = format!(
-            "你是 FreshLoop 精选阅读频道的主编。请评估这篇订阅文章是否值得进入每日精选，并生成中文干货压缩和单独的收听稿。\n\n\
+            "你是 FreshLoop 精选阅读频道的信息压缩编辑。请判断这篇订阅文章是否进入每日精选，并生成忠实于作者原意的中文压缩稿和单独收听稿。\n\n\
 来源: {}\n标题: {}\nURL: {}\n正文:\n{}\n\n\
 要求:\n\
 1. quality_score 用 0-10 评分，重点看原创性、信息密度、长期价值、技术/思想含量。\n\
 2. should_publish 只有在值得读时才为 true。\n\
-3. compressed_markdown 用中文 Markdown，结构为：核心观点、关键干货、限制/风险、适合谁读。\n\
-4. audio_script 是给耳朵听的干货版，不朗读原文，不保留 Markdown 符号；开头直入主题，口语自然，2-4 分钟。\n\
-5. key_points 给出 3-7 条最重要结论。\n\
-6. 不要编造正文外的信息。",
-            source.name, entry.title, entry.link, context
+3. compressed_markdown 必须是信息压缩，不是评论。只还原作者的主张、论证、事实、例子和结论，不写 FreshLoop 的评价，不写“适合谁读”，不写“值得/不值得”，不替作者扩展观点。\n\
+4. compressed_markdown 用中文 Markdown，建议结构为：作者主张、论证脉络、关键事实与例子、原文结论。若原文没有某类信息，可省略对应小节。\n\
+5. audio_script 是给耳朵听的信息压缩版，不朗读原文，不保留 Markdown 符号；保持作者观点顺序，口语自然，2-4 分钟。\n\
+6. key_points 给出 3-7 条作者在文中表达的关键观点或事实。\n\
+7. 只能使用正文信息，不要编造正文外的信息，不要加入你的判断。",
+            source_name, title, url, context
         );
 
         self.llm
@@ -1025,21 +1214,101 @@ fn build_article_audio_text(
     title: &str,
     source: &ContentSource,
     entry: &FetchedEntry,
-    analysis: &ArticleAnalysis,
-    snapshot: &ArticleSnapshot,
+    audio_script: &str,
 ) -> String {
-    let body = if !analysis.audio_script.trim().is_empty() {
-        analysis.audio_script.as_str()
-    } else if !analysis.compressed_markdown.trim().is_empty() {
-        analysis.compressed_markdown.as_str()
-    } else {
-        snapshot.plain_text.as_str()
-    };
     let source = source_name(source, entry).unwrap_or_else(|| source.name.clone());
     format!(
         "这里是 FreshLoop 精选订阅。今天听一篇来自{}的干货版，标题是《{}》。\n\n{}",
-        source, title, body
+        source, title, audio_script
     )
+}
+
+fn finalized_article_compressed_markdown(
+    title: &str,
+    snapshot: &ArticleSnapshot,
+    generated: &str,
+) -> String {
+    let generated = generated.trim();
+    if !generated.is_empty() && !compressed_markdown_needs_repair(generated) {
+        return normalize_article_markdown(generated);
+    }
+
+    fallback_compressed_markdown(title, snapshot)
+}
+
+fn finalized_article_audio_script(
+    title: &str,
+    snapshot: &ArticleSnapshot,
+    generated: &str,
+    compressed_markdown: &str,
+) -> String {
+    let generated = prepare_tts_text(generated, ARTICLE_AUDIO_CHAR_LIMIT);
+    if generated.chars().filter(|ch| !ch.is_whitespace()).count() >= 80 {
+        return generated;
+    }
+
+    let compressed = prepare_tts_text(compressed_markdown, ARTICLE_AUDIO_CHAR_LIMIT);
+    if compressed.chars().filter(|ch| !ch.is_whitespace()).count() >= 80 {
+        return format!("下面是《{}》的信息压缩版。\n\n{}", title, compressed);
+    }
+
+    fallback_article_audio_script(title, snapshot)
+}
+
+fn normalize_article_markdown(markdown: &str) -> String {
+    markdown
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\n\n\n", "\n\n")
+        .trim()
+        .to_string()
+}
+
+fn article_content_needs_repair(content: &FeedItemContentPayload) -> bool {
+    let compressed = content.compressed_markdown.as_deref().unwrap_or("");
+    let audio_script = content.audio_script.as_deref().unwrap_or("");
+    compressed.trim().is_empty()
+        || audio_script.trim().is_empty()
+        || compressed_markdown_needs_repair(compressed)
+        || audio_script_needs_repair(audio_script)
+}
+
+fn compressed_markdown_needs_repair(markdown: &str) -> bool {
+    let markdown = markdown.trim();
+    if markdown.is_empty() {
+        return true;
+    }
+
+    [
+        "适合谁读",
+        "值得读",
+        "不值得读",
+        "FreshLoop 认为",
+        "我的评价",
+    ]
+    .iter()
+    .any(|marker| markdown.contains(marker))
+}
+
+fn audio_script_needs_repair(script: &str) -> bool {
+    let script = script.trim();
+    if script.is_empty() {
+        return true;
+    }
+
+    [
+        "适合谁读",
+        "适合先听",
+        "值得读",
+        "值得听",
+        "不值得读",
+        "FreshLoop 认为",
+        "我的评价",
+    ]
+    .iter()
+    .any(|marker| script.contains(marker))
 }
 
 fn article_audio_text_from_content(
@@ -1077,14 +1346,6 @@ fn article_audio_text_from_content(
         "这里是 FreshLoop 精选订阅。下面是《{}》的干货版。\n\n{}",
         title, prepared
     ))
-}
-
-fn non_empty_string(value: String) -> Option<String> {
-    if value.trim().is_empty() {
-        None
-    } else {
-        Some(value)
-    }
 }
 
 fn configured_source_to_content_source(
@@ -1139,27 +1400,67 @@ fn content_hash(title: &str, link: &str, plain_text: &str) -> String {
 }
 
 fn fallback_analysis(entry: &FetchedEntry, snapshot: &ArticleSnapshot) -> ArticleAnalysis {
+    fallback_analysis_from_text(&entry.title, snapshot)
+}
+
+fn fallback_analysis_from_text(title: &str, snapshot: &ArticleSnapshot) -> ArticleAnalysis {
     ArticleAnalysis {
-        title: entry.title.clone(),
+        title: title.to_string(),
         quality_score: heuristic_quality_score(snapshot),
         topic: "精选文章".to_string(),
         should_publish: true,
-        compressed_markdown: String::new(),
-        audio_script: fallback_article_audio_script(entry, snapshot),
-        key_points: Vec::new(),
+        compressed_markdown: fallback_compressed_markdown(title, snapshot),
+        audio_script: fallback_article_audio_script(title, snapshot),
+        key_points: fallback_key_points(&snapshot.plain_text),
     }
 }
 
-fn fallback_article_audio_script(entry: &FetchedEntry, snapshot: &ArticleSnapshot) -> String {
+fn fallback_compressed_markdown(title: &str, snapshot: &ArticleSnapshot) -> String {
+    let excerpt = reader_excerpt(&snapshot.plain_text, 2_400);
+    if excerpt.trim().is_empty() {
+        return format!("## 作者主张\n\n{}", title);
+    }
+
+    format!("## 作者主张\n\n{}\n\n## 原文信息压缩\n\n{}", title, excerpt)
+}
+
+fn fallback_article_audio_script(title: &str, snapshot: &ArticleSnapshot) -> String {
     let excerpt = prepare_tts_text(&snapshot.plain_text, 1_600);
     if excerpt.trim().is_empty() {
         return String::new();
     }
 
-    format!(
-        "这篇文章《{}》可以先抓住几个核心信息。{}\n\n以上是这篇文章的干货版，适合先听完再决定是否打开原文细读。",
-        entry.title, excerpt
-    )
+    format!("下面是《{}》的信息压缩版。\n\n{}", title, excerpt)
+}
+
+fn fallback_key_points(text: &str) -> Vec<String> {
+    reader_excerpt(text, 1_200)
+        .split(['。', '！', '？', '.', '!', '?'])
+        .map(str::trim)
+        .filter(|sentence| sentence.chars().filter(|ch| !ch.is_whitespace()).count() >= 18)
+        .take(5)
+        .map(|sentence| sentence.to_string())
+        .collect()
+}
+
+fn reader_excerpt(text: &str, max_chars: usize) -> String {
+    let cleaned = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if cleaned.chars().count() <= max_chars {
+        cleaned
+    } else {
+        let mut truncated = cleaned
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        truncated.push('…');
+        truncated
+    }
 }
 
 fn heuristic_quality_score(snapshot: &ArticleSnapshot) -> u8 {

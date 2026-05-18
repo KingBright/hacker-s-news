@@ -106,6 +106,7 @@ pub struct CreateFeedItemRequest {
     pub publish_time: Option<i64>,
     pub has_audio: Option<bool>,
     pub audio_url: Option<String>,
+    pub clear_audio: Option<bool>,
     pub duration_sec: Option<i64>,
     pub reading_time_min: Option<i64>,
     pub quality_score: Option<i32>,
@@ -493,6 +494,7 @@ pub async fn create_feed_item(
             .as_ref()
             .is_some_and(|url| !url.is_empty())
     });
+    let clear_audio = payload.clear_audio.unwrap_or(false);
 
     let result = sqlx::query(
         r#"
@@ -579,10 +581,10 @@ pub async fn create_feed_item(
                     content_hash = COALESCE(NULLIF(?, ''), content_hash),
                     publish_time = COALESCE(?, publish_time),
                     updated_at = ?,
-                    has_audio = CASE WHEN ? THEN 1 ELSE has_audio END,
-                    audio_url = COALESCE(NULLIF(?, ''), audio_url),
+                    has_audio = CASE WHEN ? THEN 0 WHEN ? THEN 1 ELSE has_audio END,
+                    audio_url = CASE WHEN ? THEN NULL ELSE COALESCE(NULLIF(?, ''), audio_url) END,
                     reading_time_min = COALESCE(?, reading_time_min),
-                    duration_sec = COALESCE(?, duration_sec),
+                    duration_sec = CASE WHEN ? THEN NULL ELSE COALESCE(?, duration_sec) END,
                     quality_score = COALESCE(?, quality_score),
                     tags = COALESCE(NULLIF(?, ''), tags),
                     status = COALESCE(NULLIF(?, ''), status)
@@ -598,9 +600,12 @@ pub async fn create_feed_item(
             .bind(&payload.content_hash)
             .bind(payload.publish_time)
             .bind(now)
+            .bind(clear_audio)
             .bind(has_audio)
+            .bind(clear_audio)
             .bind(&payload.audio_url)
             .bind(payload.reading_time_min)
+            .bind(clear_audio)
             .bind(payload.duration_sec)
             .bind(payload.quality_score)
             .bind(&payload.tags)
@@ -931,6 +936,7 @@ mod tests {
             publish_time: None,
             has_audio: Some(true),
             audio_url: Some("/audio/test.mp3".to_string()),
+            clear_audio: None,
             duration_sec: Some(42),
             reading_time_min: Some(3),
             quality_score: Some(8),

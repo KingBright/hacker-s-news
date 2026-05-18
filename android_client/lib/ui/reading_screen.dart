@@ -682,6 +682,8 @@ class _EmptyPanel extends StatelessWidget {
 List<Widget> _renderMarkdown(String markdown) {
   final widgets = <Widget>[];
   final bullets = <String>[];
+  var orderedBullets = false;
+  final paragraph = <String>[];
 
   void flushBullets() {
     if (bullets.isEmpty) return;
@@ -691,24 +693,40 @@ List<Widget> _renderMarkdown(String markdown) {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: bullets
+              .asMap()
+              .entries
               .map(
-                (bullet) => Padding(
+                (entry) => Padding(
                   padding: const EdgeInsets.only(bottom: 8),
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Padding(
-                        padding: EdgeInsets.only(top: 10),
-                        child: Icon(
-                          Icons.circle,
-                          size: 6,
-                          color: AppTheme.primaryGreen,
+                      SizedBox(
+                        width: 20,
+                        child: Padding(
+                          padding: EdgeInsets.only(
+                            top: orderedBullets ? 0 : 10,
+                          ),
+                          child: orderedBullets
+                              ? Text(
+                                  '${entry.key + 1}.',
+                                  style: const TextStyle(
+                                    color: AppTheme.primaryGreen,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w900,
+                                  ),
+                                )
+                              : const Icon(
+                                  Icons.circle,
+                                  size: 6,
+                                  color: AppTheme.primaryGreen,
+                                ),
                         ),
                       ),
-                      const SizedBox(width: 10),
+                      const SizedBox(width: 6),
                       Expanded(
                         child: SelectableText(
-                          bullet,
+                          _cleanMarkdownInline(entry.value),
                           style: const TextStyle(
                             color: Colors.white70,
                             height: 1.62,
@@ -727,65 +745,119 @@ List<Widget> _renderMarkdown(String markdown) {
     bullets.clear();
   }
 
+  void flushParagraph() {
+    if (paragraph.isEmpty) return;
+    final text = paragraph.join('\n').trim();
+    paragraph.clear();
+    if (text.isEmpty) return;
+    widgets.add(_readerParagraph(text));
+  }
+
+  void flushAll() {
+    flushParagraph();
+    flushBullets();
+  }
+
   for (final rawLine in markdown.split('\n')) {
     final line = rawLine.trim();
     if (line.isEmpty) {
-      flushBullets();
+      flushAll();
       continue;
     }
-    if (line.startsWith('- ')) {
-      bullets.add(line.substring(2));
+    final unordered = RegExp(r'^[-*+]\s+(.+)$').firstMatch(line);
+    if (unordered != null) {
+      flushParagraph();
+      if (bullets.isNotEmpty && orderedBullets) flushBullets();
+      orderedBullets = false;
+      bullets.add(unordered.group(1)!);
+      continue;
+    }
+    final ordered = RegExp(r'^\d+[.)]\s+(.+)$').firstMatch(line);
+    if (ordered != null) {
+      flushParagraph();
+      if (bullets.isNotEmpty && !orderedBullets) flushBullets();
+      orderedBullets = true;
+      bullets.add(ordered.group(1)!);
+      continue;
+    }
+    if (line.startsWith('### ')) {
+      flushAll();
+      widgets.add(_readerHeading(line.substring(4), 19));
+      continue;
+    }
+    if (line.startsWith('## ')) {
+      flushAll();
+      widgets.add(_readerHeading(line.substring(3), 21));
+      continue;
+    }
+    if (line.startsWith('# ')) {
+      flushAll();
+      widgets.add(_readerHeading(line.substring(2), 24));
+      continue;
+    }
+    if (line.startsWith('> ')) {
+      flushAll();
+      widgets.add(_readerQuote(line.substring(2)));
       continue;
     }
     flushBullets();
-    if (line.startsWith('## ')) {
-      widgets.add(
-        Padding(
-          padding: const EdgeInsets.only(top: 22, bottom: 8),
-          child: SelectableText(
-            line.substring(3),
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 21,
-              height: 1.18,
-              fontWeight: FontWeight.w900,
-            ),
-          ),
-        ),
-      );
-    } else if (line.startsWith('# ')) {
-      widgets.add(
-        Padding(
-          padding: const EdgeInsets.only(top: 20, bottom: 8),
-          child: SelectableText(
-            line.substring(2),
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 24,
-              height: 1.15,
-              fontWeight: FontWeight.w900,
-            ),
-          ),
-        ),
-      );
-    } else {
-      widgets.add(
-        Padding(
-          padding: const EdgeInsets.only(bottom: 15),
-          child: SelectableText(
-            line,
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 17,
-              height: 1.72,
-            ),
-          ),
-        ),
-      );
-    }
+    paragraph.add(line);
   }
-  flushBullets();
+  flushAll();
   return widgets;
+}
+
+Widget _readerHeading(String text, double fontSize) {
+  return Padding(
+    padding: const EdgeInsets.only(top: 22, bottom: 8),
+    child: SelectableText(
+      _cleanMarkdownInline(text),
+      style: TextStyle(
+        color: Colors.white,
+        fontSize: fontSize,
+        height: 1.18,
+        fontWeight: FontWeight.w900,
+      ),
+    ),
+  );
+}
+
+Widget _readerParagraph(String text) {
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 15),
+    child: SelectableText(
+      _cleanMarkdownInline(text),
+      style: const TextStyle(color: Colors.white70, fontSize: 17, height: 1.72),
+    ),
+  );
+}
+
+Widget _readerQuote(String text) {
+  return Container(
+    margin: const EdgeInsets.symmetric(vertical: 12),
+    padding: const EdgeInsets.fromLTRB(14, 10, 0, 10),
+    decoration: const BoxDecoration(
+      border: Border(left: BorderSide(color: AppTheme.primaryGreen, width: 2)),
+    ),
+    child: SelectableText(
+      _cleanMarkdownInline(text),
+      style: const TextStyle(color: Colors.white60, fontSize: 16, height: 1.62),
+    ),
+  );
+}
+
+String _cleanMarkdownInline(String text) {
+  return text
+      .replaceAllMapped(
+        RegExp(r'\[([^\]]+)\]\([^)]+\)'),
+        (match) => match.group(1) ?? '',
+      )
+      .replaceAllMapped(
+        RegExp(r'\*\*([^*]+)\*\*'),
+        (match) => match.group(1) ?? '',
+      )
+      .replaceAllMapped(RegExp(r'`([^`]+)`'), (match) => match.group(1) ?? '')
+      .trim();
 }
 
 Item _articleToAudioItem(CuratedFeedItem item) {

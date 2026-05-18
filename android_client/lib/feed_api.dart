@@ -81,10 +81,14 @@ class CuratedFeedContent {
     if (mode == ReadingMode.compressed) {
       final compressed = compressedMarkdown?.trim();
       if (compressed != null && compressed.isNotEmpty) return compressed;
+      final audio = audioScript?.trim();
+      if (audio != null && audio.isNotEmpty) return audio;
       final points = parseStringList(keyPointsJson);
       if (points.isNotEmpty) {
         return points.map((point) => '- $point').join('\n');
       }
+      final plain = plainText?.trim();
+      if (plain != null && plain.isNotEmpty) return plain;
       return '这篇文章还没有生成干货压缩。';
     }
 

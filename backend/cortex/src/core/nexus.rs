@@ -62,6 +62,7 @@ pub struct FeedItemPayload {
     pub publish_time: Option<i64>,
     pub has_audio: Option<bool>,
     pub audio_url: Option<String>,
+    pub clear_audio: Option<bool>,
     pub duration_sec: Option<i64>,
     pub reading_time_min: Option<i64>,
     pub quality_score: Option<i32>,
