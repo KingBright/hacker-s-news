@@ -463,7 +463,7 @@ export default function FeedPage() {
                     <div className="flex items-start justify-between gap-3">
                       <h3 className="line-clamp-2 text-sm font-black leading-snug">{cleanTitle(item.title)}</h3>
                       <span className={selected ? "text-primary" : "text-white/45"}>
-                        {item.has_audio ? (
+                        {item.audio_url ? (
                           <span className="material-symbols-outlined text-[18px]">headphones</span>
                         ) : (
                           <span className="material-symbols-outlined text-[18px]">article</span>

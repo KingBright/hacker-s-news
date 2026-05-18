@@ -32,6 +32,7 @@ class CuratedFeedItem {
   });
 
   factory CuratedFeedItem.fromJson(Map<String, dynamic> json) {
+    final audioUrl = json['audio_url'] as String?;
     return CuratedFeedItem(
       id: json['id'] as String,
       title: json['title'] as String? ?? 'Untitled',
@@ -39,8 +40,8 @@ class CuratedFeedItem {
       sourceName: json['source_name'] as String?,
       originalUrl: json['original_url'] as String?,
       publishTime: _asInt(json['publish_time']),
-      hasAudio: json['has_audio'] == true,
-      audioUrl: json['audio_url'] as String?,
+      hasAudio: audioUrl != null && audioUrl.isNotEmpty,
+      audioUrl: audioUrl,
       durationSec: _asInt(json['duration_sec']),
       readingTimeMin: _asInt(json['reading_time_min']),
       qualityScore: _asInt(json['quality_score']),
