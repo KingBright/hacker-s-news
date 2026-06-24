@@ -6,13 +6,12 @@ use crate::core::nexus::{ItemPayload, NexusClient};
 use crate::core::topic_registry::TopicRegistry;
 use crate::core::tts::TtsClient;
 use anyhow::Result;
-use chinese_lunisolar_calendar::LunisolarDate;
 use chrono::{Datelike, NaiveDate, Weekday};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const TTS_DRAFT_CACHE_VERSION: &str = "episode-date-context-v2";
+const TTS_DRAFT_CACHE_VERSION: &str = "episode-date-context-v3";
 
 // --- Trace Logger ---
 #[derive(Debug, serde::Serialize)]
@@ -39,21 +38,29 @@ fn build_episode_date_context(date: NaiveDate) -> EpisodeDateContext {
         weekday_label(date.weekday())
     );
 
-    let (status, guidance) = if let Some(name) = official_holiday_name(date) {
+    let official_calendar_known =
+        crate::core::holiday_calendar::official_calendar_known_for_year(date.year());
+    let (status, guidance) = if let Some(holiday) =
+        crate::core::holiday_calendar::lookup_holiday(date)
+    {
+        let certainty_note = match holiday.certainty {
+            crate::core::holiday_calendar::HolidayCertainty::Official => "官方日历",
+            crate::core::holiday_calendar::HolidayCertainty::Projected => "规则推算",
+        };
         (
-            format!("今天属于{}", name),
+            format!("今天属于{}", holiday.name),
             format!(
-                "开场可以自然融入{}的时间感，但不要把今天说成工作日，也不要编造素材外的出行、天气或活动安排",
-                name
+                "开场可以自然融入{}的时间感（{}），但不要把今天说成工作日，也不要编造素材外的出行、天气或活动安排",
+                holiday.name, certainty_note
             ),
         )
-    } else if let Some(name) = adjusted_workday_name(date) {
+    } else if let Some(name) = crate::core::holiday_calendar::lookup_adjusted_workday(date) {
         (
             format!("今天是{}", name),
             "如需提及，只能说调休工作日；不要说成普通周末，也不要硬套休息日语气".to_string(),
         )
     } else {
-        let festival_names = traditional_festival_names(date);
+        let festival_names = crate::core::holiday_calendar::traditional_festival_names(date);
         if !festival_names.is_empty() {
             let names = festival_names.join("、");
             (
@@ -64,10 +71,18 @@ fn build_episode_date_context(date: NaiveDate) -> EpisodeDateContext {
                 ),
             )
         } else if matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
-            (
-                "今天是周末".to_string(),
-                "开场可以更从容，但不要说今天是工作日，也不要硬套通勤早高峰".to_string(),
-            )
+            if official_calendar_known {
+                (
+                    "今天是周末".to_string(),
+                    "开场可以更从容，但不要说今天是工作日，也不要硬套通勤早高峰".to_string(),
+                )
+            } else {
+                (
+                    "今天按自然星期是周末，官方调休日历尚未内置".to_string(),
+                    "可以只报日期或轻轻带过周末感；不要说今天是工作日，也不要声称这是官方休息日"
+                        .to_string(),
+                )
+            }
         } else {
             (
                 "今天没有已知节假日背景".to_string(),
@@ -95,85 +110,6 @@ fn weekday_label(weekday: Weekday) -> &'static str {
         Weekday::Sat => "周六",
         Weekday::Sun => "周日",
     }
-}
-
-fn official_holiday_name(date: NaiveDate) -> Option<&'static str> {
-    if date.year() != 2026 {
-        return None;
-    }
-
-    if date_in_range(date, 2026, 1, 1, 1, 3) {
-        Some("元旦假期")
-    } else if date_in_range(date, 2026, 2, 15, 2, 23) {
-        Some("春节假期")
-    } else if date_in_range(date, 2026, 4, 4, 4, 6) {
-        Some("清明假期")
-    } else if date_in_range(date, 2026, 5, 1, 5, 5) {
-        Some("劳动节假期")
-    } else if date_in_range(date, 2026, 6, 19, 6, 21) {
-        Some("端午假期")
-    } else if date_in_range(date, 2026, 9, 25, 9, 27) {
-        Some("中秋假期")
-    } else if date_in_range(date, 2026, 10, 1, 10, 7) {
-        Some("国庆假期")
-    } else {
-        None
-    }
-}
-
-fn adjusted_workday_name(date: NaiveDate) -> Option<&'static str> {
-    let is_adjusted_workday = matches!(
-        (date.year(), date.month(), date.day()),
-        (2026, 1, 4)
-            | (2026, 2, 14)
-            | (2026, 2, 28)
-            | (2026, 5, 9)
-            | (2026, 9, 20)
-            | (2026, 10, 10)
-    );
-
-    if is_adjusted_workday {
-        Some("调休工作日")
-    } else {
-        None
-    }
-}
-
-fn traditional_festival_names(date: NaiveDate) -> Vec<&'static str> {
-    let mut names = Vec::new();
-    match (date.month(), date.day()) {
-        (1, 1) => names.push("元旦"),
-        (5, 1) => names.push("劳动节"),
-        (10, 1) => names.push("国庆节"),
-        _ => {}
-    }
-
-    if let Ok(lunar) = LunisolarDate::from_date(date) {
-        let lunar_month = lunar.to_lunar_month().to_u8();
-        let lunar_day = lunar.to_lunar_day().to_u8();
-        match (lunar_month, lunar_day) {
-            (1, 1) => names.push("春节"),
-            (1, 15) => names.push("元宵节"),
-            (5, 5) => names.push("端午节"),
-            (8, 15) => names.push("中秋节"),
-            _ => {}
-        }
-    }
-
-    names
-}
-
-fn date_in_range(
-    date: NaiveDate,
-    year: i32,
-    start_month: u32,
-    start_day: u32,
-    end_month: u32,
-    end_day: u32,
-) -> bool {
-    let start = NaiveDate::from_ymd_opt(year, start_month, start_day).unwrap();
-    let end = NaiveDate::from_ymd_opt(year, end_month, end_day).unwrap();
-    (start..=end).contains(&date)
 }
 
 pub struct TraceLogger {
@@ -2125,5 +2061,33 @@ mod tests {
         assert!(context.prompt_block.contains("周六"));
         assert!(context.prompt_block.contains("调休工作日"));
         assert_no_plain_workday_context(&context);
+    }
+
+    #[test]
+    fn date_context_projects_2027_spring_festival_window() {
+        let eve = build_episode_date_context(date(2027, 2, 5));
+        let tail = build_episode_date_context(date(2027, 2, 12));
+
+        assert!(eve.prompt_block.contains("春节假期"));
+        assert!(eve.prompt_block.contains("规则推算"));
+        assert!(tail.prompt_block.contains("春节假期"));
+    }
+
+    #[test]
+    fn date_context_projects_2028_national_mid_autumn_combined_window() {
+        let context = build_episode_date_context(date(2028, 10, 8));
+
+        assert!(context.prompt_block.contains("国庆中秋假期"));
+        assert!(context.prompt_block.contains("规则推算"));
+    }
+
+    #[test]
+    fn future_weekend_without_official_calendar_stays_neutral() {
+        let context = build_episode_date_context(date(2027, 6, 26));
+
+        assert!(context.prompt_block.contains("周六"));
+        assert!(context.prompt_block.contains("官方调休日历尚未内置"));
+        assert!(context.prompt_block.contains("不要说今天是工作日"));
+        assert!(!context.prompt_block.contains("今天是周末"));
     }
 }

@@ -1,6 +1,7 @@
 pub mod aggregator;
 pub mod config;
 pub mod content;
+pub mod holiday_calendar;
 pub mod llm;
 pub mod news;
 pub mod news_buffer;

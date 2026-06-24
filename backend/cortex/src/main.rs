@@ -305,6 +305,11 @@ async fn main() -> Result<()> {
             )
             .await;
         }
+
+        if command == "holiday-agent" {
+            return cortex::core::holiday_calendar::run_holiday_agent(args.collect::<Vec<_>>())
+                .await;
+        }
     }
 
     run_service().await
