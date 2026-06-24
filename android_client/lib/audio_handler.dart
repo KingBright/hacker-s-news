@@ -331,14 +331,13 @@ class FreshLoopAudioHandler extends BaseAudioHandler
     mediaItem.add(mediaItemTarget);
     _broadcastPlaybackState();
 
+    var sourceReady = false;
     try {
       await _player.setAudioSource(
         AudioSource.uri(audioUri),
         initialPosition: initialPosition ?? Duration.zero,
       );
-      if (playWhenReady) {
-        await _startPlayer();
-      }
+      sourceReady = true;
     } on PlayerInterruptedException catch (e) {
       debugPrint(
         "Loading item ${mediaItemTarget.id} was interrupted: ${e.message}",
@@ -353,6 +352,10 @@ class FreshLoopAudioHandler extends BaseAudioHandler
     } finally {
       _isLoadingItem = false;
       _broadcastPlaybackState();
+    }
+
+    if (sourceReady && playWhenReady) {
+      await _startPlayer();
     }
   }
 
@@ -583,7 +586,30 @@ class FreshLoopAudioHandler extends BaseAudioHandler
     _prefs = null;
   }
 
-  Future<void> _startPlayer() => _player.play();
+  Future<void> _startPlayer() async {
+    try {
+      final playFuture = _player.play();
+      unawaited(
+        playFuture.catchError((Object error, StackTrace stackTrace) {
+          if (error is PlayerInterruptedException) {
+            debugPrint("Playback start interrupted: ${error.message}");
+            return;
+          }
+          if (error is PlayerException) {
+            debugPrint("Playback failed: ${error.code} ${error.message}");
+          } else {
+            debugPrint("Playback failed: $error");
+          }
+          unawaited(_handlePlaybackFailure(error));
+        }),
+      );
+    } on PlayerInterruptedException catch (e) {
+      debugPrint("Playback start interrupted: ${e.message}");
+    } on PlayerException catch (e) {
+      debugPrint("Playback start failed: ${e.code} ${e.message}");
+      await _handlePlaybackFailure(e);
+    }
+  }
 
   Future<void> _handleItemPlaybackFailure(
     MediaItem failedItem,

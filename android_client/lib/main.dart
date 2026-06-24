@@ -241,7 +241,7 @@ class FeedProvider extends ChangeNotifier {
     isPlayable: (item) => (item.audioUrl?.trim().isNotEmpty ?? false),
     durationSecondsOf: (item) => item.durationSec?.toInt(),
     dayOrder: DayPlaylistSortOrder.descending,
-    itemOrder: DayPlaylistSortOrder.ascending,
+    itemOrder: DayPlaylistSortOrder.descending,
     playbackOrder: DayPlaylistSortOrder.ascending,
   );
 
@@ -409,10 +409,16 @@ class FeedProvider extends ChangeNotifier {
     items.retainWhere(
       (item) => seen.add(item.id) && !_playedIds.contains(item.id),
     );
-    items.sort(_compareItemsByPlaybackOrder);
+    items.sort(_compareItemsByDisplayOrder);
     if (trimToMax && items.length > maxQueueSize) {
       items.removeRange(maxQueueSize, items.length);
     }
+  }
+
+  int _compareItemsByDisplayOrder(Item a, Item b) {
+    final byTime = _queueTime(b).compareTo(_queueTime(a));
+    if (byTime != 0) return byTime;
+    return b.id.compareTo(a.id);
   }
 
   int _compareItemsByPlaybackOrder(Item a, Item b) {

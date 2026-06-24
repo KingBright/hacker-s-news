@@ -638,14 +638,7 @@ class _RadioDaySection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final playlistItems = [...group.items]
-      ..sort((left, right) {
-        final leftTime = left.publishTime ?? left.createdAt ?? 0;
-        final rightTime = right.publishTime ?? right.createdAt ?? 0;
-        final byTime = leftTime.compareTo(rightTime);
-        if (byTime != 0) return byTime;
-        return left.id.compareTo(right.id);
-      });
+    final playlistItems = group.items;
     final durationMinutes = group.totalDurationSec > 0
         ? (group.totalDurationSec / 60).ceil()
         : 0;

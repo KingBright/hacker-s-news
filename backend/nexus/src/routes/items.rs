@@ -66,10 +66,10 @@ const ITEM_COLUMNS_WITH_ALIAS: &str = r#"
     i.publish_time, i.created_at, i.rating, i.tags, i.is_deleted, i.duration_sec, i.status, i.category
 "#;
 
-const USER_QUEUE_ORDER: &str = r#"
-    ORDER BY (i.publish_time IS NULL) ASC, i.publish_time ASC,
-             (i.created_at IS NULL) ASC, i.created_at ASC,
-             i.id ASC
+const USER_VISIBLE_ORDER: &str = r#"
+    ORDER BY (i.publish_time IS NULL) ASC, i.publish_time DESC,
+             (i.created_at IS NULL) ASC, i.created_at DESC,
+             i.id DESC
 "#;
 
 /// Validate URL format (basic check)
@@ -102,7 +102,7 @@ async fn fetch_items_for_request(
                 WHERE (i.is_deleted = 0 OR i.is_deleted IS NULL)
                   AND uh.item_id IS NULL
                   AND i.category = ?
-                {USER_QUEUE_ORDER}
+                {USER_VISIBLE_ORDER}
                 LIMIT ? OFFSET ?
                 "#
             ))
@@ -121,7 +121,7 @@ async fn fetch_items_for_request(
                 LEFT JOIN user_history uh ON i.id = uh.item_id AND uh.user_id = ?
                 WHERE (i.is_deleted = 0 OR i.is_deleted IS NULL)
                   AND uh.item_id IS NULL
-                {USER_QUEUE_ORDER}
+                {USER_VISIBLE_ORDER}
                 LIMIT ? OFFSET ?
                 "#
             ))
@@ -167,6 +167,22 @@ async fn fetch_items_for_request(
     }
 }
 
+fn sort_items_newest_first(items: &mut [Item]) {
+    items.sort_by(|left, right| {
+        right
+            .publish_time
+            .unwrap_or_default()
+            .cmp(&left.publish_time.unwrap_or_default())
+            .then_with(|| {
+                right
+                    .created_at
+                    .unwrap_or_default()
+                    .cmp(&left.created_at.unwrap_or_default())
+            })
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
 pub async fn list_items(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -199,10 +215,13 @@ pub async fn list_items(
         Ok(items) => {
             let items = if let Some(user_id) = user_id {
                 let fallback_items = items.clone();
-                match personalization::personalize_radio_items(&state, user_id, items).await {
-                    Ok(items) => items,
-                    Err(_) => fallback_items,
-                }
+                let mut items =
+                    match personalization::personalize_radio_items(&state, user_id, items).await {
+                        Ok(items) => items,
+                        Err(_) => fallback_items,
+                    };
+                sort_items_newest_first(&mut items);
+                items
             } else {
                 items
             };
@@ -653,23 +672,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_queue_filters_played_before_limit_and_returns_oldest_first() {
+    async fn user_listing_filters_played_before_limit_and_returns_newest_first() {
         let pool = test_pool().await;
-        insert_item(&pool, "already-played-oldest", 100, "radio").await;
-        insert_item(&pool, "also-played", 200, "radio").await;
-        insert_item(&pool, "first-unplayed", 300, "radio").await;
-        insert_item(&pool, "second-unplayed", 400, "radio").await;
-        insert_item(&pool, "third-unplayed", 500, "radio").await;
+        insert_item(&pool, "oldest-unplayed", 100, "radio").await;
+        insert_item(&pool, "played-middle", 200, "radio").await;
+        insert_item(&pool, "middle-unplayed", 300, "radio").await;
+        insert_item(&pool, "newest-unplayed", 500, "radio").await;
+        insert_item(&pool, "played-newest", 600, "radio").await;
 
-        mark_played(&pool, "user-1", "already-played-oldest").await;
-        mark_played(&pool, "user-1", "also-played").await;
+        mark_played(&pool, "user-1", "played-middle").await;
+        mark_played(&pool, "user-1", "played-newest").await;
 
-        let items = fetch_items_for_request(&pool, Some("user-1"), None, 2, 0)
+        let items = fetch_items_for_request(&pool, Some("user-1"), None, 3, 0)
             .await
             .unwrap();
         let ids = items.into_iter().map(|item| item.id).collect::<Vec<_>>();
 
-        assert_eq!(ids, vec!["first-unplayed", "second-unplayed"]);
+        assert_eq!(
+            ids,
+            vec!["newest-unplayed", "middle-unplayed", "oldest-unplayed"]
+        );
     }
 
     #[tokio::test]
@@ -682,6 +704,32 @@ mod tests {
         let items = fetch_items_for_request(&pool, None, None, 3, 0)
             .await
             .unwrap();
+        let ids = items.into_iter().map(|item| item.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["new", "middle", "old"]);
+    }
+
+    #[test]
+    fn newest_first_sort_restores_chronology_after_personalization() {
+        let item = |id: &str, publish_time: i64| Item {
+            id: id.to_string(),
+            title: id.to_string(),
+            summary: None,
+            original_url: None,
+            cover_image_url: None,
+            audio_url: None,
+            publish_time: Some(publish_time),
+            created_at: Some(publish_time),
+            rating: None,
+            tags: None,
+            is_deleted: Some(false),
+            duration_sec: None,
+            status: Some("published".to_string()),
+            category: Some("radio".to_string()),
+        };
+        let mut items = vec![item("old", 100), item("new", 300), item("middle", 200)];
+
+        sort_items_newest_first(&mut items);
         let ids = items.into_iter().map(|item| item.id).collect::<Vec<_>>();
 
         assert_eq!(ids, vec!["new", "middle", "old"]);

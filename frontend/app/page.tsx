@@ -32,6 +32,20 @@ function formatTime(seconds: number): string {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
+function itemTimestamp(item: Item): number {
+  return item.publish_time || item.created_at || 0;
+}
+
+function compareItemsNewestFirst(a: Item, b: Item): number {
+  const byTime = itemTimestamp(b) - itemTimestamp(a);
+  return byTime !== 0 ? byTime : b.id.localeCompare(a.id);
+}
+
+function compareItemsOldestFirst(a: Item, b: Item): number {
+  const byTime = itemTimestamp(a) - itemTimestamp(b);
+  return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
+}
+
 // Animated Equalizer Component for Playing State
 const AnimatedEqualizer = ({ size = 'md', className = '' }: { size?: 'sm' | 'md' | 'lg'; className?: string }) => {
   const sizeConfig = {
@@ -338,17 +352,13 @@ export default function Home() {
     return 'thunderstorm';
   };
 
-  // Derived sorted lists
-  // Backend already filters out played items for logged-in users
+  // Display and playback intentionally use different order:
+  // browsing is newest-first, while continuous listening catches up oldest-first.
   const pendingItems = items
-    .filter(i => !playedIds.has(i.id))  // Still filter locally for client-side state updates
-    .sort((a, b) => (a.publish_time || 0) - (b.publish_time || 0)); // Old -> New
+    .filter(i => !playedIds.has(i.id))
+    .sort(compareItemsNewestFirst);
 
-  // Correction: User requested Old->New (Oldest first). 
-  // If a.time < b.time => -1 (a comes first). Correct.
-  // Wait, usually feeds are New -> Old. 
-  // User wrote: "待播放页始终按照从旧到新...". 
-  // So if I have items from 10:00 and 11:00. 10:00 should play first. 
+  const pendingPlaybackItems = [...pendingItems].sort(compareItemsOldestFirst);
 
   const playedItems = items
     .filter(i => playedIds.has(i.id))
@@ -363,7 +373,7 @@ export default function Home() {
         isPlayable: (item) => Boolean(item.audio_url),
         getDurationSec: (item) => item.duration_sec || 0,
         dayOrder: 'desc',
-        itemOrder: 'asc',
+        itemOrder: 'desc',
         playbackOrder: 'asc',
       }),
     [pendingItems],
@@ -389,7 +399,7 @@ export default function Home() {
         isPlayable: (item) => Boolean(item.audio_url),
         getDurationSec: (item) => item.duration_sec || 0,
         dayOrder: 'desc',
-        itemOrder: 'asc',
+        itemOrder: 'desc',
         playbackOrder: 'asc',
       }),
     [activeRadioQueueItems],
@@ -593,10 +603,10 @@ export default function Home() {
   }, [attemptPlayback, currentId, isPlaying, pausePlayback, selectTrack]);
 
   const playWholeFeed = useCallback(() => {
-    const firstId = pendingItems[0]?.id;
+    const firstId = pendingPlaybackItems[0]?.id;
     if (!firstId) return;
     playItem(firstId, { kind: 'feed' });
-  }, [pendingItems, playItem]);
+  }, [pendingPlaybackItems, playItem]);
 
   const playRadioDay = useCallback((dayKey: string, itemIds: string[], startId?: string) => {
     const nextId = startId && itemIds.includes(startId) ? startId : itemIds[0];
