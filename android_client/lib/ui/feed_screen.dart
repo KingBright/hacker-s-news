@@ -2,16 +2,18 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:intl/intl.dart';
+import '../day_playlist.dart';
+import '../app_shell.dart';
 import '../main.dart'; // FeedProvider and audioHandler
 import '../src/rust/models.dart';
 import 'theme.dart';
 import 'hero_card.dart';
 import 'animated_eq.dart';
+import 'focus_screen.dart';
+import 'loop_screen.dart';
 import 'morphing_player.dart';
 import 'login_modal.dart';
 import 'reading_screen.dart';
-
-enum ProductLine { radio, reading }
 
 class FeedScreen extends StatefulWidget {
   const FeedScreen({super.key});
@@ -21,10 +23,10 @@ class FeedScreen extends StatefulWidget {
 }
 
 class _FeedScreenState extends State<FeedScreen> {
-  ProductLine _productLine = ProductLine.radio;
-
   @override
   Widget build(BuildContext context) {
+    final shell = context.watch<ShellProvider>();
+    final currentTab = shell.tab;
     return Scaffold(
       body: SafeArea(
         bottom: false,
@@ -33,19 +35,22 @@ class _FeedScreenState extends State<FeedScreen> {
             Column(
               children: [
                 _buildHeader(
-                  productLine: _productLine,
-                  onChanged: (productLine) {
-                    setState(() => _productLine = productLine);
-                  },
+                  currentTab: currentTab,
+                  onChanged: context.read<ShellProvider>().selectTab,
                 ),
                 Expanded(
-                  child: _productLine == ProductLine.radio
-                      ? _RadioFeedList(buildFeedItem: _buildFeedItem)
-                      : const ReadingScreen(),
+                  child: switch (currentTab) {
+                    AppTab.radio => _RadioFeedList(
+                      buildFeedItem: _buildFeedItem,
+                    ),
+                    AppTab.reading => const ReadingScreen(),
+                    AppTab.loop => const LoopScreen(),
+                    AppTab.focus => const FocusScreen(),
+                  },
                 ),
               ],
             ),
-            if (_productLine == ProductLine.radio) const MorphingPlayer(),
+            const MorphingPlayer(),
           ],
         ),
       ),
@@ -53,8 +58,8 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   Widget _buildHeader({
-    required ProductLine productLine,
-    required ValueChanged<ProductLine> onChanged,
+    required AppTab currentTab,
+    required ValueChanged<AppTab> onChanged,
   }) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -100,6 +105,15 @@ class _FeedScreenState extends State<FeedScreen> {
                         style: TextStyle(
                           fontSize: 9,
                           color: AppTheme.textMuted,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1.0,
+                        ),
+                      ),
+                      Text(
+                        "LOOP + FOCUS",
+                        style: TextStyle(
+                          fontSize: 9,
+                          color: Colors.white38,
                           fontWeight: FontWeight.bold,
                           letterSpacing: 1.0,
                         ),
@@ -201,16 +215,32 @@ class _FeedScreenState extends State<FeedScreen> {
                   child: _ProductLineButton(
                     icon: Icons.radio,
                     label: 'Radio',
-                    selected: productLine == ProductLine.radio,
-                    onTap: () => onChanged(ProductLine.radio),
+                    selected: currentTab == AppTab.radio,
+                    onTap: () => onChanged(AppTab.radio),
                   ),
                 ),
                 Expanded(
                   child: _ProductLineButton(
                     icon: Icons.menu_book,
                     label: 'Reading',
-                    selected: productLine == ProductLine.reading,
-                    onTap: () => onChanged(ProductLine.reading),
+                    selected: currentTab == AppTab.reading,
+                    onTap: () => onChanged(AppTab.reading),
+                  ),
+                ),
+                Expanded(
+                  child: _ProductLineButton(
+                    icon: Icons.format_quote,
+                    label: 'Loop',
+                    selected: currentTab == AppTab.loop,
+                    onTap: () => onChanged(AppTab.loop),
+                  ),
+                ),
+                Expanded(
+                  child: _ProductLineButton(
+                    icon: Icons.adjust,
+                    label: 'Focus',
+                    selected: currentTab == AppTab.focus,
+                    onTap: () => onChanged(AppTab.focus),
                   ),
                 ),
               ],
@@ -221,7 +251,11 @@ class _FeedScreenState extends State<FeedScreen> {
     );
   }
 
-  Widget _buildFeedItem(BuildContext context, Item item, int index) {
+  Widget _buildFeedItem(
+    BuildContext context,
+    Item item, {
+    required List<Item> playlistItems,
+  }) {
     return StreamBuilder<MediaItem?>(
       stream: audioHandler.mediaItem,
       builder: (context, mediaSnapshot) {
@@ -250,12 +284,15 @@ class _FeedScreenState extends State<FeedScreen> {
             final durationStr = item.durationSec != null
                 ? "${(item.durationSec! / 60).floor()}:${(item.durationSec! % 60).floor().toString().padLeft(2, '0')}"
                 : "Brief";
+            final shell = context.read<ShellProvider>();
 
             return GestureDetector(
               onTap: () {
                 if (!isActive) {
-                  audioHandler.skipToQueueItem(index);
-                  audioHandler.play();
+                  context.read<FeedProvider>().playDay(
+                    playlistItems,
+                    startItemId: item.id,
+                  );
                 } else {
                   playing ? audioHandler.pause() : audioHandler.play();
                 }
@@ -386,17 +423,56 @@ class _FeedScreenState extends State<FeedScreen> {
                     ),
                     // Action Buttons
                     const SizedBox(width: 8),
-                    Container(
-                      width: 40,
-                      height: 40,
-                      decoration: BoxDecoration(
-                        color: playing ? AppTheme.primaryGreen : Colors.black26,
-                        shape: BoxShape.circle,
-                      ),
-                      child: Icon(
-                        playing ? Icons.pause : Icons.play_arrow,
-                        color: playing ? Colors.black : Colors.white,
-                      ),
+                    Column(
+                      children: [
+                        Container(
+                          width: 40,
+                          height: 40,
+                          decoration: BoxDecoration(
+                            color: playing
+                                ? AppTheme.primaryGreen
+                                : Colors.black26,
+                            shape: BoxShape.circle,
+                          ),
+                          child: Icon(
+                            playing ? Icons.pause : Icons.play_arrow,
+                            color: playing ? Colors.black : Colors.white,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        InkWell(
+                          onTap: () {
+                            shell.openLoopWithDraft(
+                              LoopComposeDraft(
+                                title: title,
+                                references: [
+                                  LoopDraftReference(
+                                    sourceType: 'radio_item',
+                                    sourceId: item.id,
+                                    sourceUrl: item.originalUrl,
+                                    title: title,
+                                    quoteText: item.summary,
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                          borderRadius: BorderRadius.circular(999),
+                          child: Container(
+                            width: 32,
+                            height: 32,
+                            decoration: const BoxDecoration(
+                              color: Colors.black26,
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(
+                              Icons.format_quote,
+                              color: Colors.white70,
+                              size: 18,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),
@@ -424,22 +500,49 @@ class _ProductLineButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return TextButton.icon(
+    final foreground = selected ? Colors.black : Colors.white70;
+    return TextButton(
       onPressed: onTap,
-      icon: Icon(icon, size: 17),
-      label: Text(label),
       style: TextButton.styleFrom(
         backgroundColor: selected ? AppTheme.primaryGreen : Colors.transparent,
-        foregroundColor: selected ? Colors.black : Colors.white70,
+        foregroundColor: foreground,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-        textStyle: const TextStyle(fontWeight: FontWeight.w900),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+        minimumSize: const Size(0, 54),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16, color: foreground),
+          const SizedBox(height: 4),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(
+              label,
+              maxLines: 1,
+              softWrap: false,
+              style: TextStyle(
+                color: foreground,
+                fontSize: 11.5,
+                height: 1,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 0,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
 class _RadioFeedList extends StatelessWidget {
-  final Widget Function(BuildContext context, Item item, int index)
+  final Widget Function(
+    BuildContext context,
+    Item item, {
+    required List<Item> playlistItems,
+  })
   buildFeedItem;
 
   const _RadioFeedList({required this.buildFeedItem});
@@ -452,39 +555,68 @@ class _RadioFeedList extends StatelessWidget {
           color: AppTheme.primaryGreen,
           backgroundColor: AppTheme.surfaceHighlight,
           onRefresh: () async {
-            provider.page = 1;
-            provider.items.clear();
-            await provider.fetchItems();
+            provider.refresh();
           },
-          child: ListView.builder(
+          child: ListView(
             padding: const EdgeInsets.only(bottom: 120),
-            itemCount: provider.items.length + 2,
-            itemBuilder: (context, index) {
-              if (index == 0) {
-                return HeroCard(
-                  unreadCount: provider.items.length,
-                  onRefresh: () {
-                    provider.page = 1;
-                    provider.items.clear();
-                    provider.fetchItems();
-                  },
-                  isLoading: provider.isLoading && provider.items.isEmpty,
-                );
-              }
-
-              final itemIndex = index - 1;
-              if (itemIndex == provider.items.length) {
-                if (provider.isLoading) {
-                  return const Center(
-                    child: Padding(
-                      padding: EdgeInsets.all(16.0),
-                      child: CircularProgressIndicator(
-                        color: AppTheme.primaryGreen,
+            children: [
+              HeroCard(
+                unreadCount: provider.items.length,
+                onRefresh: provider.refresh,
+                isLoading: provider.isLoading && provider.items.isEmpty,
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '按天处理',
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w900,
+                        ),
                       ),
                     ),
-                  );
-                }
-                return Padding(
+                    if (provider.items.isNotEmpty)
+                      TextButton.icon(
+                        onPressed: () => provider.playWholeQueue(),
+                        style: TextButton.styleFrom(
+                          foregroundColor: AppTheme.primaryGreen,
+                        ),
+                        icon: const Icon(Icons.play_circle_fill_rounded),
+                        label: const Text('全部播放'),
+                      ),
+                  ],
+                ),
+              ),
+              if (provider.dayGroups.isEmpty && !provider.isLoading)
+                const Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Center(
+                    child: Text(
+                      '暂无待处理内容',
+                      style: TextStyle(color: Colors.white54),
+                    ),
+                  ),
+                )
+              else
+                ...provider.dayGroups.map(
+                  (group) => _RadioDaySection(
+                    group: group,
+                    buildFeedItem: buildFeedItem,
+                  ),
+                ),
+              if (provider.isLoading)
+                const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(16.0),
+                    child: CircularProgressIndicator(
+                      color: AppTheme.primaryGreen,
+                    ),
+                  ),
+                )
+              else
+                Padding(
                   padding: const EdgeInsets.all(16.0),
                   child: TextButton(
                     onPressed: provider.fetchItems,
@@ -493,15 +625,100 @@ class _RadioFeedList extends StatelessWidget {
                     ),
                     child: const Text('Load More'),
                   ),
-                );
-              }
-
-              final item = provider.items[itemIndex];
-              return buildFeedItem(context, item, itemIndex);
-            },
+                ),
+            ],
           ),
         );
       },
+    );
+  }
+}
+
+class _RadioDaySection extends StatelessWidget {
+  final DayPlaylistGroup<Item> group;
+  final Widget Function(
+    BuildContext context,
+    Item item, {
+    required List<Item> playlistItems,
+  })
+  buildFeedItem;
+
+  const _RadioDaySection({required this.group, required this.buildFeedItem});
+
+  @override
+  Widget build(BuildContext context) {
+    final playlistItems = [...group.items]
+      ..sort((left, right) {
+        final leftTime = left.publishTime ?? left.createdAt ?? 0;
+        final rightTime = right.publishTime ?? right.createdAt ?? 0;
+        final byTime = leftTime.compareTo(rightTime);
+        if (byTime != 0) return byTime;
+        return left.id.compareTo(right.id);
+      });
+    final durationMinutes = group.totalDurationSec > 0
+        ? (group.totalDurationSec / 60).ceil()
+        : 0;
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      padding: const EdgeInsets.fromLTRB(14, 14, 14, 8),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.03),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      group.title,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      '${group.items.length} 条内容 · ${group.playableCount} 段可播${durationMinutes > 0 ? ' · $durationMinutes min' : ''}',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.white54,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (group.playableCount > 0)
+                TextButton.icon(
+                  onPressed: () {
+                    context.read<FeedProvider>().playDay(playlistItems);
+                  },
+                  style: TextButton.styleFrom(
+                    foregroundColor: Colors.black,
+                    backgroundColor: AppTheme.primaryGreen,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                  icon: const Icon(Icons.play_arrow_rounded),
+                  label: const Text('播放当天'),
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ...playlistItems.map(
+            (item) =>
+                buildFeedItem(context, item, playlistItems: playlistItems),
+          ),
+        ],
+      ),
     );
   }
 }

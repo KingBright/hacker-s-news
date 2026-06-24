@@ -149,7 +149,13 @@ model = "llama3"
 api_url = "http://localhost:11434"
 
 [tts]
-engine = "voxcpm"
+engine = "voxcpm_metal"
+device = "metal"
+keep_engine_loaded = false
+memory_pressure_relief = true
+process_isolation = true
+worker_memory_limit_mb = 24576
+worker_idle_timeout_secs = 1200
 
 rss_feeds = ["https://news.ycombinator.com/rss"]
 
@@ -170,6 +176,14 @@ weekly_digest_enabled = true
 weekly_digest_schedule_times = ["18:00"]
 weekly_digest_min_items = 3
 weekly_digest_max_items = 12
+
+[loop_preferences]
+enabled = true
+schedule_times = ["09:00", "21:00"]
+max_posts_per_cycle = 20
+# Set this to a FreshLoop user id to personalize Reading and weekly digests.
+# personalization_user_id = "USER_ID"
+profile_context_max_chars = 3200
 
 [[curated_feed.feeds]]
 name = "Karpathy Blog"
@@ -252,5 +266,46 @@ tags = ["AI", "Programming"]
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    if let Some(command) = args.next() {
+        if command == "tts-worker" {
+            let input_path = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("tts-worker missing input path"))?;
+            let output_path = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("tts-worker missing output path"))?;
+            let response_path = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("tts-worker missing response path"))?;
+            let progress_path = args.next();
+            return cortex::core::tts::run_tts_worker(
+                std::path::Path::new(&input_path),
+                std::path::Path::new(&output_path),
+                std::path::Path::new(&response_path),
+                progress_path.as_deref().map(std::path::Path::new),
+            )
+            .await;
+        }
+
+        if command == "tts-asr-loop-synthesize" {
+            let config_path = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("tts-asr-loop-synthesize missing config path"))?;
+            let output_dir = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("tts-asr-loop-synthesize missing output dir"))?;
+            let text_path = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("tts-asr-loop-synthesize missing text path"))?;
+            return cortex::core::tts::run_tts_asr_loop_synthesize(
+                std::path::Path::new(&config_path),
+                std::path::Path::new(&output_dir),
+                std::path::Path::new(&text_path),
+            )
+            .await;
+        }
+    }
+
     run_service().await
 }

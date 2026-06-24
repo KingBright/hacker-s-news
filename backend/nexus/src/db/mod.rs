@@ -140,6 +140,35 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
             created_at INTEGER,
             status TEXT DEFAULT 'published'
         );
+        CREATE TABLE IF NOT EXISTS loop_posts (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            post_type TEXT NOT NULL,
+            feedback_mode TEXT DEFAULT 'balance',
+            title TEXT,
+            body TEXT NOT NULL,
+            visibility TEXT NOT NULL DEFAULT 'private',
+            source_ref TEXT,
+            memory_entry_id TEXT,
+            preference_status TEXT DEFAULT 'pending',
+            preference_extracted_at INTEGER,
+            preference_error TEXT,
+            created_at INTEGER,
+            updated_at INTEGER,
+            status TEXT DEFAULT 'published'
+        );
+        CREATE TABLE IF NOT EXISTS loop_post_references (
+            id TEXT PRIMARY KEY,
+            post_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_id TEXT,
+            source_url TEXT,
+            title TEXT,
+            quote_text TEXT,
+            start_ms INTEGER,
+            end_ms INTEGER,
+            created_at INTEGER
+        );
         "#,
     )
     .execute(&pool)
@@ -200,6 +229,16 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
     )
     .execute(&pool)
     .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_items_publish_queue ON items(publish_time ASC, created_at ASC, id ASC)",
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_user_history_user_item ON user_history(user_id, item_id)",
+    )
+    .execute(&pool)
+    .await;
 
     let _ = sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_feed_items_original_url ON feed_items(original_url) WHERE original_url IS NOT NULL AND original_url != ''"
@@ -223,6 +262,39 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
     .await;
     let _ = sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_digests_unique_range ON weekly_digests(week_start, week_end)"
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_loop_posts_user_time ON loop_posts(user_id, created_at DESC)"
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_loop_posts_status ON loop_posts(status, created_at DESC)",
+    )
+    .execute(&pool)
+    .await;
+    let _ =
+        sqlx::query("ALTER TABLE loop_posts ADD COLUMN preference_status TEXT DEFAULT 'pending'")
+            .execute(&pool)
+            .await;
+    let _ = sqlx::query("ALTER TABLE loop_posts ADD COLUMN preference_extracted_at INTEGER")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE loop_posts ADD COLUMN preference_error TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE loop_posts ADD COLUMN feedback_mode TEXT DEFAULT 'balance'")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_loop_post_references_post ON loop_post_references(post_id)",
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_loop_posts_preference_status ON loop_posts(preference_status, created_at ASC)"
     )
     .execute(&pool)
     .await;

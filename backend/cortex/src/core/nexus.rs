@@ -93,6 +93,67 @@ pub struct FeedItemPushResult {
     pub status: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LoopPostReferencePayload {
+    pub id: String,
+    pub post_id: String,
+    pub source_type: String,
+    pub source_id: Option<String>,
+    pub source_url: Option<String>,
+    pub title: Option<String>,
+    pub quote_text: Option<String>,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
+    pub created_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LoopPostPayload {
+    pub id: String,
+    pub user_id: String,
+    pub post_type: String,
+    pub feedback_mode: Option<String>,
+    pub title: Option<String>,
+    pub body: String,
+    pub visibility: String,
+    pub source_ref: Option<String>,
+    pub memory_entry_id: Option<String>,
+    pub preference_status: Option<String>,
+    pub preference_extracted_at: Option<i64>,
+    pub preference_error: Option<String>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub status: Option<String>,
+    pub references: Vec<LoopPostReferencePayload>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MemoryEntryPayload {
+    pub user_id: String,
+    pub content: String,
+    pub memory_type: Option<String>,
+    pub strength: Option<f32>,
+    pub source_ref: Option<String>,
+    pub metadata: Option<std::collections::HashMap<String, String>>,
+    pub provenance: Option<String>,
+    pub confidence: Option<f32>,
+    pub is_static: Option<bool>,
+    pub forget_after: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct UserProfilePayload {
+    pub static_facts: Vec<String>,
+    pub dynamic_context: Vec<String>,
+    pub preference_signals: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MemoryProfilePayload {
+    pub profile: UserProfilePayload,
+    pub prompt_context: String,
+}
+
 impl NexusClient {
     pub fn new(config: NexusConfig) -> Self {
         let client = Self::build_client();
@@ -503,6 +564,156 @@ impl NexusClient {
 
         if !res.status().is_success() {
             return Err(anyhow!("Failed to fetch weekly digests: {}", res.status()));
+        }
+
+        Ok(res.json().await?)
+    }
+
+    pub async fn fetch_pending_loop_posts(&self, limit: u32) -> Result<Vec<LoopPostPayload>> {
+        let limit = limit.clamp(1, 100);
+        let url = format!(
+            "{}/api/internal/loop/posts/pending-preferences?limit={}",
+            self.config.api_url, limit
+        );
+        let auth_key = self.config.auth_key.clone();
+
+        let res = self
+            .request_with_retry(|client| {
+                let url = url.clone();
+                let auth_key = auth_key.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("X-NEXUS-KEY", &auth_key)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to fetch pending loop posts: {} - {}",
+                status,
+                text
+            ));
+        }
+
+        Ok(res.json().await?)
+    }
+
+    pub async fn push_memory_entry(&self, entry: MemoryEntryPayload) -> Result<String> {
+        let url = format!("{}/api/internal/memory/entries", self.config.api_url);
+        let auth_key = self.config.auth_key.clone();
+        let entry_json = serde_json::to_value(&entry)?;
+
+        let res = self
+            .request_with_retry(|client| {
+                let url = url.clone();
+                let auth_key = auth_key.clone();
+                let entry_json = entry_json.clone();
+                async move {
+                    client
+                        .post(&url)
+                        .header("X-NEXUS-KEY", &auth_key)
+                        .json(&entry_json)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to push memory entry: {} - {}",
+                status,
+                text
+            ));
+        }
+
+        let json: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
+        Ok(json["id"].as_str().unwrap_or("unknown").to_string())
+    }
+
+    pub async fn mark_loop_post_preference_result(
+        &self,
+        post_id: &str,
+        status: &str,
+        error: Option<String>,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/internal/loop/posts/{}/preference-result",
+            self.config.api_url, post_id
+        );
+        let auth_key = self.config.auth_key.clone();
+        let payload = serde_json::json!({
+            "status": status,
+            "error": error,
+        });
+
+        let res = self
+            .request_with_retry(|client| {
+                let url = url.clone();
+                let auth_key = auth_key.clone();
+                let payload = payload.clone();
+                async move {
+                    client
+                        .post(&url)
+                        .header("X-NEXUS-KEY", &auth_key)
+                        .json(&payload)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        if !res.status().is_success() {
+            let status_code = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to mark loop post preference result: {} - {}",
+                status_code,
+                text
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub async fn fetch_memory_profile(&self, user_id: &str) -> Result<MemoryProfilePayload> {
+        let encoded_user_id = urlencoding::encode(user_id);
+        let url = format!(
+            "{}/api/internal/memory/profile/{}",
+            self.config.api_url, encoded_user_id
+        );
+        let auth_key = self.config.auth_key.clone();
+
+        let res = self
+            .request_with_retry(|client| {
+                let url = url.clone();
+                let auth_key = auth_key.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("X-NEXUS-KEY", &auth_key)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to fetch memory profile: {} - {}",
+                status,
+                text
+            ));
         }
 
         Ok(res.json().await?)

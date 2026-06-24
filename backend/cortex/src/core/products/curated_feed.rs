@@ -100,6 +100,12 @@ struct WeeklyDigestCandidate {
 }
 
 #[derive(Debug, Clone)]
+struct PersonalizationContext {
+    user_id: String,
+    prompt_context: String,
+}
+
+#[derive(Debug, Clone)]
 enum ProcessEntryOutcome {
     Published {
         item_id: String,
@@ -189,6 +195,7 @@ impl CuratedFeedPipeline {
         let article_audio_max_items = feed_config
             .article_audio_max_items_per_cycle
             .unwrap_or(DEFAULT_ARTICLE_AUDIO_MAX_ITEMS_PER_CYCLE);
+        let personalization_context = self.personalization_context().await;
         let mut audio_items_used = 0usize;
         let mut scheduled_audio_item_ids = HashSet::new();
 
@@ -255,7 +262,14 @@ impl CuratedFeedPipeline {
         for (source, entry) in candidates {
             let allow_audio = article_audio_enabled && audio_items_used < article_audio_max_items;
             match self
-                .process_entry(&source, entry, min_quality_score, allow_audio, now)
+                .process_entry(
+                    &source,
+                    entry,
+                    min_quality_score,
+                    allow_audio,
+                    now,
+                    personalization_context.as_ref(),
+                )
                 .await
             {
                 Ok(ProcessEntryOutcome::Published {
@@ -300,6 +314,51 @@ impl CuratedFeedPipeline {
         );
 
         Ok(stats)
+    }
+
+    async fn personalization_context(&self) -> Option<PersonalizationContext> {
+        let preference_config = self.config.loop_preferences.as_ref()?;
+        if !preference_config.enabled {
+            return None;
+        }
+
+        let user_id = preference_config
+            .personalization_user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let max_chars = preference_config
+            .profile_context_max_chars
+            .unwrap_or(3_200)
+            .clamp(400, 12_000);
+
+        match self.nexus.fetch_memory_profile(user_id).await {
+            Ok(profile) => {
+                let prompt_context = truncate_chars(profile.prompt_context.trim(), max_chars);
+                if prompt_context.is_empty() {
+                    return None;
+                }
+                let user_hash = personalization_user_hash(user_id);
+                log::info!(
+                    "[CuratedFeed] loaded personalization profile user_hash={} ({} chars)",
+                    user_hash,
+                    prompt_context.chars().count()
+                );
+                Some(PersonalizationContext {
+                    user_id: user_id.to_string(),
+                    prompt_context,
+                })
+            }
+            Err(e) => {
+                let user_hash = personalization_user_hash(user_id);
+                log::warn!(
+                    "[CuratedFeed] failed to load personalization profile user_hash={}: {}",
+                    user_hash,
+                    e
+                );
+                None
+            }
+        }
     }
 
     async fn filter_existing_candidates(
@@ -395,6 +454,7 @@ impl CuratedFeedPipeline {
         min_quality_score: u8,
         allow_audio: bool,
         now: DateTime<FixedOffset>,
+        personalization_context: Option<&PersonalizationContext>,
     ) -> Result<ProcessEntryOutcome> {
         let snapshot = build_article_snapshot(&entry);
         if snapshot.plain_text.chars().count() < 80 {
@@ -402,7 +462,10 @@ impl CuratedFeedPipeline {
             return Ok(ProcessEntryOutcome::Skipped);
         }
 
-        let analysis = match self.analyze_article(source, &entry, &snapshot).await {
+        let analysis = match self
+            .analyze_article(source, &entry, &snapshot, personalization_context)
+            .await
+        {
             Ok(analysis) => analysis,
             Err(e) => {
                 log::warn!(
@@ -797,6 +860,7 @@ impl CuratedFeedPipeline {
                     &item.title,
                     item.original_url.as_deref().unwrap_or_default(),
                     &repair_context,
+                    None,
                 )
                 .await
             {
@@ -869,14 +933,21 @@ impl CuratedFeedPipeline {
         source: &ContentSource,
         entry: &FetchedEntry,
         snapshot: &ArticleSnapshot,
+        personalization_context: Option<&PersonalizationContext>,
     ) -> Result<ArticleAnalysis> {
         let context = snapshot
             .plain_text
             .chars()
             .take(ARTICLE_CONTEXT_LIMIT)
             .collect::<String>();
-        self.analyze_article_text(&source.name, &entry.title, &entry.link, &context)
-            .await
+        self.analyze_article_text(
+            &source.name,
+            &entry.title,
+            &entry.link,
+            &context,
+            personalization_context.map(|ctx| ctx.prompt_context.as_str()),
+        )
+        .await
     }
 
     async fn analyze_article_text(
@@ -885,19 +956,14 @@ impl CuratedFeedPipeline {
         title: &str,
         url: &str,
         context: &str,
+        personalization_context: Option<&str>,
     ) -> Result<ArticleAnalysis> {
-        let prompt = format!(
-            "你是 FreshLoop 精选阅读频道的信息压缩编辑。请判断这篇订阅文章是否进入每日精选，并生成忠实于作者原意的中文压缩稿和单独收听稿。\n\n\
-来源: {}\n标题: {}\nURL: {}\n正文:\n{}\n\n\
-要求:\n\
-1. quality_score 用 0-10 评分，重点看原创性、信息密度、长期价值、技术/思想含量。\n\
-2. should_publish 只有在值得读时才为 true。\n\
-3. compressed_markdown 必须是信息压缩，不是评论。只还原作者的主张、论证、事实、例子和结论，不写 FreshLoop 的评价，不写“适合谁读”，不写“值得/不值得”，不替作者扩展观点。\n\
-4. compressed_markdown 用中文 Markdown，建议结构为：作者主张、论证脉络、关键事实与例子、原文结论。若原文没有某类信息，可省略对应小节。\n\
-5. audio_script 是给耳朵听的信息压缩版，不朗读原文，不保留 Markdown 符号；保持作者观点顺序，口语自然，2-4 分钟。\n\
-6. key_points 给出 3-7 条作者在文中表达的关键观点或事实。\n\
-7. 只能使用正文信息，不要编造正文外的信息，不要加入你的判断。",
-            source_name, title, url, context
+        let prompt = build_article_analysis_prompt(
+            source_name,
+            title,
+            url,
+            context,
+            personalization_context,
         );
 
         self.llm
@@ -981,13 +1047,19 @@ impl CuratedFeedPipeline {
         });
         candidates.truncate(max_items);
         candidates.sort_by_key(|item| item.publish_time);
+        let personalization_context = self.personalization_context().await;
 
         let included_ids = candidates
             .iter()
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
         let draft = self
-            .load_or_generate_weekly_draft(week_start, week_end, &candidates)
+            .load_or_generate_weekly_draft(
+                week_start,
+                week_end,
+                &candidates,
+                personalization_context.as_ref(),
+            )
             .await?;
 
         let themes_json = serde_json::to_string(&draft.themes).ok();
@@ -1065,7 +1137,11 @@ impl CuratedFeedPipeline {
                 }
             });
         }
-        let _ = fs::remove_file(weekly_draft_cache_path(week_start, week_end));
+        let _ = fs::remove_file(weekly_draft_cache_path(
+            week_start,
+            week_end,
+            personalization_context.as_ref(),
+        ));
 
         Ok(WeeklyDigestRunStats {
             considered_items,
@@ -1129,8 +1205,9 @@ impl CuratedFeedPipeline {
         week_start: i64,
         week_end: i64,
         candidates: &[WeeklyDigestCandidate],
+        personalization_context: Option<&PersonalizationContext>,
     ) -> Result<WeeklyDigestDraft> {
-        let cache_path = weekly_draft_cache_path(week_start, week_end);
+        let cache_path = weekly_draft_cache_path(week_start, week_end, personalization_context);
         if let Ok(bytes) = fs::read(&cache_path) {
             if let Ok(draft) = serde_json::from_slice::<WeeklyDigestDraft>(&bytes) {
                 log::info!(
@@ -1141,7 +1218,10 @@ impl CuratedFeedPipeline {
             }
         }
 
-        let draft = match self.generate_weekly_digest_draft(candidates).await {
+        let mut draft = match self
+            .generate_weekly_digest_draft(candidates, personalization_context)
+            .await
+        {
             Ok(analysis) => WeeklyDigestDraft {
                 title: analysis.title,
                 digest_markdown: analysis.digest_markdown,
@@ -1157,6 +1237,10 @@ impl CuratedFeedPipeline {
             }
         };
 
+        draft.title = draft.title.trim().to_string();
+        draft.digest_markdown = normalize_article_markdown(&draft.digest_markdown);
+        draft.audio_script = normalize_audio_script_text(&draft.audio_script);
+
         if let Some(parent) = cache_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -1170,18 +1254,12 @@ impl CuratedFeedPipeline {
     async fn generate_weekly_digest_draft(
         &self,
         candidates: &[WeeklyDigestCandidate],
+        personalization_context: Option<&PersonalizationContext>,
     ) -> Result<WeeklyDigestAnalysis> {
         let context = build_weekly_digest_context(candidates, WEEKLY_DIGEST_CONTEXT_LIMIT);
-        let prompt = format!(
-            "你是 FreshLoop 精选订阅频道的周报主编。请基于本周精选文章生成一份中文周汇总，并写出适合语音收听的播客脚本。\n\n\
-本周素材:\n{}\n\n\
-要求:\n\
-1. title 要像一个周报音频标题，短而有信息量。\n\
-2. digest_markdown 面向阅读，结构为：本周主线、重要文章、交叉趋势、下周值得关注。\n\
-3. audio_script 面向收听，语气自然，3-6 分钟，避免逐条机械报标题。\n\
-4. themes 给出 3-6 个本周主题词。\n\
-5. 只能使用素材中的事实，不要编造外部信息。",
-            context
+        let prompt = build_weekly_digest_prompt(
+            &context,
+            personalization_context.map(|ctx| ctx.prompt_context.as_str()),
         );
 
         self.llm
@@ -1202,9 +1280,7 @@ async fn generate_audio_file_with(
         anyhow::bail!("empty TTS text");
     }
 
-    let wav_bytes = tts.speak(&tts_text).await?;
-    let duration = wav_duration_sec(&wav_bytes)?;
-    let mp3_bytes = tts.convert_to_mp3(&wav_bytes).await?;
+    let (mp3_bytes, duration) = tts.speak_mp3(&tts_text).await?;
     let file_name = format!("{}_{}.mp3", file_prefix, Uuid::new_v4());
     let url = nexus.upload_audio(mp3_bytes, &file_name).await?;
     Ok((url, duration))
@@ -1221,6 +1297,435 @@ fn build_article_audio_text(
         "这里是 FreshLoop 精选订阅。今天听一篇来自{}的干货版，标题是《{}》。\n\n{}",
         source, title, audio_script
     )
+}
+
+fn build_article_analysis_prompt(
+    source_name: &str,
+    title: &str,
+    url: &str,
+    context: &str,
+    personalization_context: Option<&str>,
+) -> String {
+    let personalization_block = personalization_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                "用户偏好上下文:\n{}\n\n\
+个性化使用规则:\n\
+- 用这些偏好调整 should_publish 和 quality_score，优先保留用户明确关注、正在研究、反复正向评价的主题。\n\
+- 对用户明确排除、反复负面评价、低信号来源或泛泛炒作内容，要更严格降权或不发布。\n\
+- 个性化只影响选择、优先级和主题标签；不要因为用户偏好改写作者观点。\n\
+- compressed_markdown、audio_script 和 key_points 必须仍然忠实于正文，只能呈现作者在文中表达的信息。\n\n",
+                value
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        "你是 FreshLoop 精选阅读频道的信息压缩编辑。请判断这篇订阅文章是否进入每日精选，并生成忠实于作者原意的中文压缩稿和单独收听稿。\n\n\
+来源: {}\n标题: {}\nURL: {}\n正文:\n{}\n\n\
+{}\
+要求:\n\
+1. quality_score 用 0-10 评分，重点看原创性、信息密度、长期价值、技术/思想含量；如果有用户偏好上下文，还要评估它和用户当前偏好的贴合度。\n\
+2. should_publish 只有在值得读、且没有明显命中用户排除偏好时才为 true。\n\
+3. compressed_markdown 必须是信息压缩，不是评论。只还原作者的主张、论证、事实、例子和结论，不写 FreshLoop 的评价，不写“适合谁读”，不写“值得/不值得”，不替作者扩展观点。\n\
+4. compressed_markdown 用中文 Markdown，建议结构为：作者主张、论证脉络、关键事实与例子、原文结论。若原文没有某类信息，可省略对应小节。\n\
+5. 不要使用 LaTeX、$...$、$$...$$ 或反斜杠数学命令。若必须保留公式，请改写成普通文本，例如 `M = E - e sin E`。\n\
+6. audio_script 是给耳朵听的信息压缩版，不朗读原文，不保留 Markdown 符号；保持作者观点顺序，口语自然，2-4 分钟。\n\
+7. key_points 给出 3-7 条作者在文中表达的关键观点或事实。\n\
+8. 只能使用正文信息，不要编造正文外的信息，不要加入你的判断。",
+        source_name, title, url, context, personalization_block
+    )
+}
+
+fn build_weekly_digest_prompt(context: &str, personalization_context: Option<&str>) -> String {
+    let personalization_block = personalization_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                "用户偏好上下文:\n{}\n\n\
+个性化使用规则:\n\
+- 用这些偏好决定周报的主线、强调顺序、下周值得关注的方向和音频叙事角度。\n\
+- 优先连接用户持续关注的主题、项目、工具、竞品和明确表达过的判断标准。\n\
+- 不要为了迎合偏好添加素材之外的事实，也不要改写任一文章作者的观点。\n\
+- 如果素材和用户偏好冲突，可以降低强调，但仍必须如实呈现被纳入素材的事实。\n\n",
+                value
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        "你是 FreshLoop 精选订阅频道的周报主编。请基于本周精选文章生成一份中文周汇总，并写出适合语音收听的播客脚本。\n\n\
+本周素材:\n{}\n\n\
+{}\
+要求:\n\
+1. title 要像一个周报音频标题，短而有信息量。\n\
+2. digest_markdown 面向阅读，结构为：本周主线、重要文章、交叉趋势、下周值得关注。\n\
+3. 不要使用 LaTeX、$...$、$$...$$ 或反斜杠数学命令。若必须提到公式，请改写成普通文本。\n\
+4. audio_script 面向收听，语气自然，3-6 分钟，避免逐条机械报标题。\n\
+5. themes 给出 3-6 个本周主题词。\n\
+6. 只能使用素材中的事实，不要编造外部信息。",
+        context, personalization_block
+    )
+}
+
+#[derive(Clone, Copy)]
+enum MathTextMode {
+    Markdown,
+    Plain,
+}
+
+fn normalize_math_for_markdown(text: &str) -> String {
+    normalize_math_fragments(text, MathTextMode::Markdown)
+}
+
+fn normalize_math_for_plain_text(text: &str) -> String {
+    normalize_math_fragments(text, MathTextMode::Plain)
+}
+
+fn remove_orphan_dollar_markers(text: &str) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut cleaned = String::with_capacity(text.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index] == '$' {
+            let mut end = index + 1;
+            let mut digit_count = 0usize;
+            while end < chars.len() && digit_count < 2 && chars[end].is_ascii_digit() {
+                end += 1;
+                digit_count += 1;
+            }
+
+            if digit_count > 0 {
+                let next = chars.get(end).copied();
+                let next_is_money =
+                    next.is_some_and(|ch| ch.is_ascii_digit() || ch == ',' || ch == '.');
+                if !next_is_money {
+                    let previous = cleaned.chars().last();
+                    let previous_is_inline =
+                        previous.is_some_and(|ch| !ch.is_whitespace() && ch != '$');
+                    let previous_is_boundary = previous
+                        .map(|ch| !ch.is_alphanumeric() && ch != '$')
+                        .unwrap_or(true);
+                    let mut next_significant = end;
+                    while chars
+                        .get(next_significant)
+                        .is_some_and(|ch| ch.is_whitespace())
+                    {
+                        next_significant += 1;
+                    }
+                    let followed_by_terminal = chars
+                        .get(next_significant)
+                        .map(|ch| is_terminal_after_dollar_marker(*ch))
+                        .unwrap_or(true);
+
+                    if previous_is_inline || (previous_is_boundary && followed_by_terminal) {
+                        index = end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        cleaned.push(chars[index]);
+        index += 1;
+    }
+
+    cleaned
+}
+
+fn is_terminal_after_dollar_marker(ch: char) -> bool {
+    matches!(
+        ch,
+        ')' | ']'
+            | '}'
+            | '。'
+            | '！'
+            | '？'
+            | '；'
+            | '，'
+            | '、'
+            | ','
+            | '.'
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+    )
+}
+
+fn normalize_math_fragments(text: &str, mode: MathTextMode) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(text.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index] == '`' {
+            let mut end = index + 1;
+            while end < chars.len() && chars[end] != '`' {
+                end += 1;
+            }
+            if end < chars.len() {
+                normalized.extend(chars[index..=end].iter());
+                index = end + 1;
+                continue;
+            }
+        }
+
+        if chars[index] == '$' {
+            let is_block = chars.get(index + 1) == Some(&'$');
+            let offset = if is_block { 2 } else { 1 };
+            let start = index + offset;
+            if let Some(end) = find_matching_dollar(&chars, start, is_block) {
+                let fragment = chars[start..end].iter().collect::<String>();
+                if is_block || looks_like_math_fragment(&fragment) {
+                    let cleaned = cleanup_latex_expression(&fragment);
+                    if !cleaned.is_empty() {
+                        match mode {
+                            MathTextMode::Markdown => {
+                                normalized.push('`');
+                                normalized.push_str(&cleaned);
+                                normalized.push('`');
+                            }
+                            MathTextMode::Plain => normalized.push_str(&cleaned),
+                        }
+                        index = end + offset;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        normalized.push(chars[index]);
+        index += 1;
+    }
+
+    normalized
+}
+
+fn find_matching_dollar(chars: &[char], start: usize, is_block: bool) -> Option<usize> {
+    let mut index = start;
+    while index < chars.len() {
+        if chars[index] == '\\' {
+            index += 2;
+            continue;
+        }
+        if chars[index] == '$' {
+            if is_block {
+                if chars.get(index + 1) == Some(&'$') {
+                    return Some(index);
+                }
+            } else {
+                return Some(index);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn looks_like_math_fragment(fragment: &str) -> bool {
+    let trimmed = fragment.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('\\')
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains('^')
+        || trimmed.contains('_')
+    {
+        return true;
+    }
+    if trimmed.chars().all(|ch| ch.is_ascii_alphanumeric()) && trimmed.len() <= 4 {
+        return true;
+    }
+    trimmed
+        .chars()
+        .any(|ch| matches!(ch, '=' | '<' | '>' | '≤' | '≥' | '≈' | '≲' | '≳'))
+}
+
+fn cleanup_latex_expression(fragment: &str) -> String {
+    let mut normalized = replace_latex_structures(fragment.trim());
+    for (from, to) in [
+        ("\\left", ""),
+        ("\\right", ""),
+        ("\\,", " "),
+        ("\\;", " "),
+        ("\\:", " "),
+        ("\\!", ""),
+        ("\\cdot", "·"),
+        ("\\times", "×"),
+        ("\\approx", "≈"),
+        ("\\lesssim", "≲"),
+        ("\\gtrsim", "≳"),
+        ("\\leq", "≤"),
+        ("\\le", "≤"),
+        ("\\geq", "≥"),
+        ("\\ge", "≥"),
+        ("\\neq", "≠"),
+        ("\\sim", "~"),
+        ("\\pi", "π"),
+        ("\\alpha", "α"),
+        ("\\beta", "β"),
+        ("\\gamma", "γ"),
+        ("\\delta", "δ"),
+        ("\\theta", "θ"),
+        ("\\lambda", "λ"),
+        ("\\mu", "μ"),
+        ("\\sigma", "σ"),
+        ("\\phi", "φ"),
+        ("\\omega", "ω"),
+        ("\\sin", "sin"),
+        ("\\cos", "cos"),
+        ("\\tan", "tan"),
+        ("\\log", "log"),
+        ("\\ln", "ln"),
+        ("\\exp", "exp"),
+        ("\\min", "min"),
+        ("\\max", "max"),
+    ] {
+        normalized = normalized.replace(from, to);
+    }
+
+    let chars = normalized.chars().collect::<Vec<_>>();
+    let mut cleaned = String::with_capacity(normalized.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if matches_command(&chars, index, "\\operatorname")
+            || matches_command(&chars, index, "\\text")
+            || matches_command(&chars, index, "\\mathrm")
+            || matches_command(&chars, index, "\\mathbb")
+            || matches_command(&chars, index, "\\mathbf")
+            || matches_command(&chars, index, "\\mathcal")
+        {
+            let command_len = command_length_at(&chars, index);
+            if let Some((group, next_index)) = parse_braced_group(&chars, index + command_len) {
+                cleaned.push_str(&cleanup_latex_expression(&group));
+                index = next_index;
+                continue;
+            }
+        }
+
+        if chars[index] == '\\' {
+            let mut next = index + 1;
+            while next < chars.len() && chars[next].is_ascii_alphabetic() {
+                next += 1;
+            }
+            if next > index + 1 {
+                cleaned.extend(chars[index + 1..next].iter());
+                index = next;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+
+        match chars[index] {
+            '{' => cleaned.push('('),
+            '}' => cleaned.push(')'),
+            _ => cleaned.push(chars[index]),
+        }
+        index += 1;
+    }
+
+    cleaned
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+fn replace_latex_structures(fragment: &str) -> String {
+    let chars = fragment.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(fragment.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if matches_command(&chars, index, "\\frac") {
+            let start = index + "\\frac".chars().count();
+            if let Some((numerator, next_index)) = parse_braced_group(&chars, start) {
+                if let Some((denominator, final_index)) = parse_braced_group(&chars, next_index) {
+                    normalized.push_str(&cleanup_latex_expression(&numerator));
+                    normalized.push_str(" / ");
+                    normalized.push_str(&cleanup_latex_expression(&denominator));
+                    index = final_index;
+                    continue;
+                }
+            }
+        }
+
+        if matches_command(&chars, index, "\\sqrt") {
+            let start = index + "\\sqrt".chars().count();
+            if let Some((body, next_index)) = parse_braced_group(&chars, start) {
+                normalized.push_str("sqrt(");
+                normalized.push_str(&cleanup_latex_expression(&body));
+                normalized.push(')');
+                index = next_index;
+                continue;
+            }
+        }
+
+        normalized.push(chars[index]);
+        index += 1;
+    }
+
+    normalized
+}
+
+fn parse_braced_group(chars: &[char], start: usize) -> Option<(String, usize)> {
+    if chars.get(start) != Some(&'{') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut index = start;
+    let mut group = String::new();
+
+    while index < chars.len() {
+        let ch = chars[index];
+        match ch {
+            '{' => {
+                depth += 1;
+                if depth > 1 {
+                    group.push(ch);
+                }
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((group, index + 1));
+                }
+                group.push(ch);
+            }
+            _ => group.push(ch),
+        }
+        index += 1;
+    }
+
+    None
+}
+
+fn matches_command(chars: &[char], start: usize, command: &str) -> bool {
+    let command_chars = command.chars().collect::<Vec<_>>();
+    chars.get(start..start + command_chars.len()) == Some(command_chars.as_slice())
+}
+
+fn command_length_at(chars: &[char], start: usize) -> usize {
+    let mut index = start;
+    if chars.get(index) == Some(&'\\') {
+        index += 1;
+    }
+    while chars.get(index).is_some_and(|ch| ch.is_ascii_alphabetic()) {
+        index += 1;
+    }
+    index - start
 }
 
 fn finalized_article_compressed_markdown(
@@ -1242,12 +1747,12 @@ fn finalized_article_audio_script(
     generated: &str,
     compressed_markdown: &str,
 ) -> String {
-    let generated = prepare_tts_text(generated, ARTICLE_AUDIO_CHAR_LIMIT);
+    let generated = normalize_audio_script_text(generated);
     if generated.chars().filter(|ch| !ch.is_whitespace()).count() >= 80 {
         return generated;
     }
 
-    let compressed = prepare_tts_text(compressed_markdown, ARTICLE_AUDIO_CHAR_LIMIT);
+    let compressed = normalize_audio_script_text(compressed_markdown);
     if compressed.chars().filter(|ch| !ch.is_whitespace()).count() >= 80 {
         return format!("下面是《{}》的信息压缩版。\n\n{}", title, compressed);
     }
@@ -1256,7 +1761,18 @@ fn finalized_article_audio_script(
 }
 
 fn normalize_article_markdown(markdown: &str) -> String {
-    markdown
+    remove_orphan_dollar_markers(&normalize_math_for_markdown(markdown))
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\n\n\n", "\n\n")
+        .trim()
+        .to_string()
+}
+
+fn normalize_audio_script_text(text: &str) -> String {
+    remove_orphan_dollar_markers(&normalize_math_for_plain_text(text))
         .lines()
         .map(str::trim_end)
         .collect::<Vec<_>>()
@@ -1443,6 +1959,14 @@ fn fallback_key_points(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    text.chars().take(max_chars).collect()
+}
+
 fn reader_excerpt(text: &str, max_chars: usize) -> String {
     let cleaned = text
         .lines()
@@ -1584,21 +2108,10 @@ fn fallback_weekly_digest(candidates: &[WeeklyDigestCandidate]) -> WeeklyDigestD
 }
 
 fn prepare_tts_text(text: &str, max_chars: usize) -> String {
-    let mut cleaned = text
-        .replace("```", "")
-        .replace('#', "")
-        .replace('*', "")
-        .replace('`', "")
-        .replace('[', "")
-        .replace(']', "")
-        .replace('(', " ")
-        .replace(')', " ");
-    cleaned = cleaned
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let cleaned = tts::normalize_for_tts(
+        &normalize_audio_script_text(text),
+        tts::NormalizeOptions::default(),
+    );
 
     if cleaned.chars().count() <= max_chars {
         cleaned
@@ -1610,12 +2123,6 @@ fn prepare_tts_text(text: &str, max_chars: usize) -> String {
         truncated.push_str("……本段先到这里。");
         truncated
     }
-}
-
-fn wav_duration_sec(wav_bytes: &[u8]) -> Result<i64> {
-    let cursor = std::io::Cursor::new(wav_bytes);
-    let reader = hound::WavReader::new(cursor)?;
-    Ok((reader.duration() as f64 / reader.spec().sample_rate as f64).ceil() as i64)
 }
 
 fn rolling_week_bounds(now: DateTime<FixedOffset>) -> (i64, i64) {
@@ -1640,11 +2147,32 @@ fn rolling_week_bounds(now: DateTime<FixedOffset>) -> (i64, i64) {
     (start.timestamp(), end.timestamp())
 }
 
-fn weekly_draft_cache_path(week_start: i64, week_end: i64) -> PathBuf {
+fn weekly_draft_cache_path(
+    week_start: i64,
+    week_end: i64,
+    personalization_context: Option<&PersonalizationContext>,
+) -> PathBuf {
+    let file_name = match personalization_context {
+        Some(context) => {
+            let user_hash = personalization_user_hash(&context.user_id);
+            format!("weekly_{}_{}_user_{}.json", week_start, week_end, user_hash)
+        }
+        None => format!("weekly_{}_{}.json", week_start, week_end),
+    };
+
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".freshloop/cache/curated_feed")
-        .join(format!("weekly_{}_{}.json", week_start, week_end))
+        .join(file_name)
+}
+
+fn personalization_user_hash(user_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(user_id.as_bytes());
+    hex::encode(hasher.finalize())
+        .chars()
+        .take(12)
+        .collect::<String>()
 }
 
 fn is_recent_enough(pub_date: Option<&str>, now: DateTime<FixedOffset>, max_age_days: i64) -> bool {
@@ -1709,5 +2237,93 @@ mod tests {
         assert!(!prepared.contains('#'));
         assert!(!prepared.contains('*'));
         assert!(prepared.contains("Point"));
+    }
+
+    #[test]
+    fn article_prompt_uses_personalization_without_changing_author_meaning() {
+        let prompt = build_article_analysis_prompt(
+            "Source",
+            "Title",
+            "https://example.com/article",
+            "正文内容",
+            Some("[PREFERENCE SIGNALS]\n用户喜欢 AI Agent 架构，讨厌泛泛 AI 炒作。"),
+        );
+
+        assert!(prompt.contains("用户偏好上下文"));
+        assert!(prompt.contains("AI Agent 架构"));
+        assert!(prompt.contains("should_publish"));
+        assert!(prompt.contains("quality_score"));
+        assert!(prompt.contains("不要因为用户偏好改写作者观点"));
+        assert!(prompt.contains("只能使用正文信息"));
+        assert!(prompt.contains("不要使用 LaTeX"));
+    }
+
+    #[test]
+    fn weekly_prompt_uses_personalization_with_fact_boundary() {
+        let prompt = build_weekly_digest_prompt(
+            "Article 1\nTitle: Memory Systems\nContent: factual material",
+            Some("[PREFERENCE SIGNALS]\n用户持续关注记忆系统和个人 feed。"),
+        );
+
+        assert!(prompt.contains("用户偏好上下文"));
+        assert!(prompt.contains("个人 feed"));
+        assert!(prompt.contains("周报的主线"));
+        assert!(prompt.contains("不要为了迎合偏好添加素材之外的事实"));
+        assert!(prompt.contains("只能使用素材中的事实"));
+        assert!(prompt.contains("不要使用 LaTeX"));
+    }
+
+    #[test]
+    fn weekly_cache_path_is_scoped_for_personalized_drafts() {
+        let plain = weekly_draft_cache_path(100, 200, None);
+        let personalized = weekly_draft_cache_path(
+            100,
+            200,
+            Some(&PersonalizationContext {
+                user_id: "user@example.com".to_string(),
+                prompt_context: "prefers memory systems".to_string(),
+            }),
+        );
+
+        assert_ne!(plain, personalized);
+        let filename = personalized
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(filename.contains("_user_"));
+        assert!(!filename.contains("user@example.com"));
+    }
+
+    #[test]
+    fn normalizes_math_markup_for_markdown_and_audio() {
+        let markdown = "解法：$M = E - e \\sin E$，极限 $e \\lesssim 0.6627$，并满足 $x e^{\\sqrt{1+x^2}} = 1$。";
+        let normalized_markdown = normalize_article_markdown(markdown);
+        assert!(normalized_markdown.contains("`M = E - e sin E`"));
+        assert!(normalized_markdown.contains("`e ≲ 0.6627`"));
+        assert!(normalized_markdown.contains("`x e^(sqrt(1+x^2)) = 1`"));
+        assert!(!normalized_markdown.contains('$'));
+        assert!(!normalized_markdown.contains("\\sin"));
+
+        let audio = normalize_audio_script_text(markdown);
+        assert!(audio.contains("M = E - e sin E"));
+        assert!(audio.contains("e ≲ 0.6627"));
+        assert!(!audio.contains('`'));
+        assert!(!audio.contains('$'));
+    }
+
+    #[test]
+    fn removes_orphan_capture_markers_but_keeps_money() {
+        let text = "这里$1有残片，括号（$2）。价格 $148,337、$1.99 和 $1 per month 保留。";
+        let markdown = normalize_article_markdown(text);
+        let audio = normalize_audio_script_text(text);
+
+        for normalized in [markdown, audio] {
+            assert!(normalized.contains("这里有残片"));
+            assert!(normalized.contains("括号（）。"));
+            assert!(normalized.contains("$148,337"));
+            assert!(normalized.contains("$1.99"));
+            assert!(normalized.contains("$1 per month"));
+            assert!(!normalized.contains("这里$1"));
+        }
     }
 }

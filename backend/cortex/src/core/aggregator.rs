@@ -7,7 +7,6 @@ use crate::core::topic_registry::TopicRegistry;
 use crate::core::tts::TtsClient;
 use anyhow::Result;
 use chinese_lunisolar_calendar::LunisolarDate;
-use regex::Regex;
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -970,107 +969,18 @@ impl NewsAggregator {
         let host_prompt = host_val.and_then(|h| h.prompt_text.clone());
 
         // Create Channel for Concurrent TTS Pipeline
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(10);
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(10);
         let tts_client = self.tts.clone();
         let host_voice_clone = host_voice.clone();
         let host_prompt_clone = host_prompt.clone();
 
-        let tts_task: tokio::task::JoinHandle<Result<Vec<u8>, String>> = tokio::spawn(async move {
-            let mut all_samples: Vec<i16> = Vec::new();
-            let mut sample_rate = 24000;
-            let mut failed_chunks: Vec<usize> = Vec::new();
-
-            let mut chunk_idx = 0;
-            while let Some(chunk_text) = rx.recv().await {
-                chunk_idx += 1;
-                // Avoid synthesizing completely empty text or SKIP strings
-                let tts_text = clean_for_tts(&chunk_text);
-                if tts_text.trim().is_empty() || tts_text.trim().contains("SKIP") {
-                    continue;
-                }
-                log::info!(
-                    "[TTS Pipeline] Generating audio for chunk {} ({} chars)",
-                    chunk_idx,
-                    tts_text.chars().count()
-                );
-
-                let result = if let Some(voice) = &host_voice_clone {
-                    tts_client
-                        .speak_with_voice(&tts_text, voice, host_prompt_clone.as_deref())
-                        .await
-                } else {
-                    tts_client.speak(&tts_text).await
-                };
-
-                match result {
-                    Ok(wav_bytes) => {
-                        let cursor = std::io::Cursor::new(wav_bytes);
-                        if let Ok(mut reader) = hound::WavReader::new(cursor) {
-                            sample_rate = reader.spec().sample_rate;
-                            let new_samples: Vec<i16> =
-                                reader.samples::<i16>().filter_map(Result::ok).collect();
-
-                            // Crossfade: 50ms overlap between chunks for seamless audio
-                            if all_samples.is_empty() {
-                                all_samples.extend(new_samples);
-                            } else {
-                                let crossfade_duration = 0.05; // 50ms
-                                let crossfade_len =
-                                    (sample_rate as f64 * crossfade_duration) as usize;
-                                let overlap =
-                                    crossfade_len.min(all_samples.len()).min(new_samples.len());
-
-                                let start_idx = all_samples.len() - overlap;
-                                for i in 0..overlap {
-                                    let fade_out = 1.0 - (i as f32 / overlap as f32);
-                                    let fade_in = i as f32 / overlap as f32;
-                                    let old_val = all_samples[start_idx + i] as f32;
-                                    let new_val = new_samples[i] as f32;
-                                    all_samples[start_idx + i] =
-                                        (old_val * fade_out + new_val * fade_in) as i16;
-                                }
-                                // Append the non-overlapping remainder
-                                if overlap < new_samples.len() {
-                                    all_samples.extend_from_slice(&new_samples[overlap..]);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("[TTS Pipeline] FAILED for chunk {}: {}", chunk_idx, e);
-                        failed_chunks.push(chunk_idx);
-                    }
-                }
-            }
-
-            // If any chunk failed, report error so the episode is retried
-            if !failed_chunks.is_empty() {
-                return Err(format!(
-                    "TTS generation failed for chunks: {:?}",
-                    failed_chunks
-                ));
-            }
-
-            if all_samples.is_empty() {
-                return Err("TTS pipeline produced no audio samples".to_string());
-            }
-
-            let mut out_cursor = std::io::Cursor::new(Vec::new());
-            let spec = hound::WavSpec {
-                channels: 1,
-                sample_rate,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            };
-            if let Ok(mut writer) = hound::WavWriter::new(&mut out_cursor, spec) {
-                for sample in all_samples {
-                    let _ = writer.write_sample(sample);
-                }
-                let _ = writer.finalize();
-            }
-
-            Ok(out_cursor.into_inner())
-        });
+        let tts_task: tokio::task::JoinHandle<Result<(Vec<u8>, i64), String>> =
+            tokio::spawn(async move {
+                tts_client
+                    .speak_mp3_from_chunks(rx, host_voice_clone, host_prompt_clone, clean_for_tts)
+                    .await
+                    .map_err(|e| e.to_string())
+            });
 
         // -- TTS DRAFT CACHE PRE-CHECK --
         use std::hash::Hasher;
@@ -1265,8 +1175,8 @@ impl NewsAggregator {
         }
 
         // 6. TTS Generation — Await the parallel pipeline result
-        let wav_audio_bytes = match tts_task.await {
-            Ok(Ok(bytes)) => bytes,
+        let (mp3_audio_bytes, duration) = match tts_task.await {
+            Ok(Ok(result)) => result,
             Ok(Err(tts_err)) => {
                 // TTS pipeline reported failure — propagate to trigger Peek-Ack retry
                 let msg = format!("Parallel TTS pipeline error: {}", tts_err);
@@ -1282,30 +1192,13 @@ impl NewsAggregator {
             }
         };
 
-        // 7. Calculate Duration (Use WAV for accuracy) & Convert to MP3
-        let mut duration = 0;
-        let final_audio = if !wav_audio_bytes.is_empty() {
-            let cursor = std::io::Cursor::new(&wav_audio_bytes);
-            if let Ok(reader) = hound::WavReader::new(cursor) {
-                duration = (reader.duration() as f64 / reader.spec().sample_rate as f64) as i64;
-            }
-
-            // CONVERT TO MP3
+        // 7. MP3 bytes are produced directly by the streaming TTS pipeline.
+        let final_audio = if !mp3_audio_bytes.is_empty() {
             logger.lock().await.log(
                 "Audio Processing",
-                &format!("WAV generated ({}s). Converting to MP3 (128k)...", duration),
+                &format!("MP3 generated directly from streamed PCM ({}s).", duration),
             );
-            match self.tts.convert_to_mp3(&wav_audio_bytes).await {
-                Ok(mp3_bytes) => Some(mp3_bytes),
-                Err(e) => {
-                    logger.lock().await.log(
-                        "Audio Processing Error",
-                        &format!("MP3 Conversion failed: {}", e),
-                    );
-                    log::error!("MP3 Conversion failed: {}. Falling back to WAV.", e);
-                    Some(wav_audio_bytes)
-                }
-            }
+            Some(mp3_audio_bytes)
         } else {
             None
         };
@@ -1991,18 +1884,7 @@ struct BroadcastItem {
 }
 
 fn clean_for_tts(input: &str) -> String {
-    let mut cleaned = input.to_string();
-    cleaned = cleaned.replace("**", "").replace("*", "").replace("#", "");
-    let re_link = Regex::new(r"\[.*?\]\(.*?\)").unwrap();
-    cleaned = re_link.replace_all(&cleaned, "").to_string();
-
-    // Remove source citations in parentheses
-    let re_source_en = Regex::new(r"(?i)[（(]\s*source[:：]\s*.*?[）)]").unwrap();
-    let re_source_cn = Regex::new(r"(?i)[（(]\s*来源[:：]\s*.*?[）)]").unwrap();
-    cleaned = re_source_en.replace_all(&cleaned, "").to_string();
-    cleaned = re_source_cn.replace_all(&cleaned, "").to_string();
-
-    cleaned
+    tts::normalize_for_tts(input, tts::NormalizeOptions::default())
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

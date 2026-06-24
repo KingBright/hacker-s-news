@@ -8,6 +8,7 @@ use crate::core::llm::LlmClient;
 use crate::core::news_buffer::{NewsBuffer, PendingNewsItem};
 use crate::core::nexus::NexusClient;
 use crate::core::products::curated_feed::CuratedFeedPipeline;
+use crate::core::products::loop_preferences::LoopPreferencePipeline;
 use crate::core::topic_registry::TopicRegistry;
 use crate::core::tts::TtsClient;
 use anyhow::Result;
@@ -418,6 +419,11 @@ pub async fn run_news_loop(
         tts.clone(),
         nexus.clone(),
     ));
+    let loop_preference_pipeline = Arc::new(LoopPreferencePipeline::new(
+        config.clone(),
+        llm.clone(),
+        nexus.clone(),
+    ));
 
     // Migration / Startup Maintenance
     let _ = aggregator
@@ -685,6 +691,51 @@ pub async fn run_news_loop(
         }
     }
 
+    if loop_preference_pipeline.is_enabled() {
+        let loop_preference_times = config
+            .loop_preferences
+            .as_ref()
+            .and_then(|prefs| prefs.schedule_times.clone())
+            .unwrap_or_else(|| vec!["09:00".to_string(), "21:00".to_string()]);
+
+        for time_str in loop_preference_times {
+            if let Some(cron_str) = local_time_to_utc_cron(&time_str, config.timezone_offset) {
+                log::info!(
+                    "Adding Loop preference extraction job: {} (Local) -> {} (UTC Cron)",
+                    time_str,
+                    cron_str
+                );
+                let pipeline = loop_preference_pipeline.clone();
+                let job = Job::new_async(cron_str.as_str(), move |_uuid, _l| {
+                    let pipeline = pipeline.clone();
+                    Box::pin(async move {
+                        match pipeline.run_once().await {
+                            Ok(stats) => log::info!(
+                                "Scheduled Loop preference extraction completed: considered={}, processed={}, skipped={}, failed={}, signals={}",
+                                stats.considered_posts,
+                                stats.processed_posts,
+                                stats.skipped_posts,
+                                stats.failed_posts,
+                                stats.written_signals
+                            ),
+                            Err(e) => log::error!(
+                                "Scheduled Loop preference extraction failed: {}",
+                                e
+                            ),
+                        }
+                    })
+                })
+                .expect("Failed to create Loop preference extraction job");
+                sched
+                    .add(job)
+                    .await
+                    .expect("Failed to add Loop preference extraction job");
+            } else {
+                log::warn!("Invalid Loop preference schedule time '{}'", time_str);
+            }
+        }
+    }
+
     // 3. Maintenance job (every minute)
     let m_aggregator = aggregator.clone();
     let maintenance_job = Job::new_async("0 * * * * *", move |_uuid, _l| {
@@ -728,6 +779,7 @@ pub async fn run_news_loop(
         buffer: buffer.clone(),
         registry: registry.clone(),
         curated_pipeline: curated_pipeline.clone(),
+        loop_preference_pipeline: loop_preference_pipeline.clone(),
         get_now: Box::new(get_now),
         running: tokio::sync::Mutex::new(false),
         api_key,
@@ -737,6 +789,10 @@ pub async fn run_news_loop(
         .route("/api/trigger", post(handle_trigger))
         .route("/api/trigger/feed", post(handle_feed_trigger))
         .route("/api/trigger/feed/weekly", post(handle_feed_weekly_trigger))
+        .route(
+            "/api/trigger/loop/preferences",
+            post(handle_loop_preferences_trigger),
+        )
         .route("/api/status", get(handle_status))
         .route("/api/memory", get(handle_memory))
         .route("/api/health/nexus", get(handle_nexus_health))
@@ -761,6 +817,7 @@ struct TriggerState {
     buffer: Arc<tokio::sync::Mutex<NewsBuffer>>,
     registry: Arc<TopicRegistry>,
     curated_pipeline: Arc<CuratedFeedPipeline>,
+    loop_preference_pipeline: Arc<LoopPreferencePipeline>,
     get_now: Box<dyn Fn() -> chrono::DateTime<chrono::FixedOffset> + Send + Sync>,
     running: tokio::sync::Mutex<bool>,
     api_key: Option<String>,
@@ -1040,6 +1097,52 @@ async fn handle_feed_weekly_trigger(
     .into_response()
 }
 
+async fn handle_loop_preferences_trigger(
+    State(state): State<Arc<TriggerState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+
+    {
+        let mut running = state.running.lock().await;
+        if *running {
+            return Json(TriggerResponse {
+                success: false,
+                message: "A cycle is already running. Please wait.".to_string(),
+            })
+            .into_response();
+        }
+        *running = true;
+    }
+
+    let pipeline = state.loop_preference_pipeline.clone();
+    let state_clone = state.clone();
+
+    tokio::spawn(async move {
+        let result = pipeline.run_once().await;
+        match &result {
+            Ok(stats) => log::info!(
+                "[Trigger API] Loop preference extraction completed: considered={}, processed={}, skipped={}, failed={}, signals={}",
+                stats.considered_posts,
+                stats.processed_posts,
+                stats.skipped_posts,
+                stats.failed_posts,
+                stats.written_signals
+            ),
+            Err(e) => log::error!("[Trigger API] Loop preference extraction failed: {}", e),
+        }
+        *state_clone.running.lock().await = false;
+    });
+
+    Json(TriggerResponse {
+        success: true,
+        message: "Loop preference extraction triggered. Running in background.".to_string(),
+    })
+    .into_response()
+}
+
 async fn handle_status(
     State(state): State<Arc<TriggerState>>,
     headers: HeaderMap,
@@ -1062,6 +1165,7 @@ async fn handle_status(
         "pending_clusters": total_clusters,
         "curated_feed_enabled": state.curated_pipeline.is_enabled(),
         "curated_weekly_digest_enabled": state.config.curated_feed.as_ref().and_then(|feed| feed.weekly_digest_enabled).unwrap_or(true),
+        "loop_preferences_enabled": state.loop_preference_pipeline.is_enabled(),
         "categories": category_stats.iter().map(|(k, (count, oldest))| {
             serde_json::json!({ "name": k, "clusters": count, "oldest_ts": oldest })
         }).collect::<Vec<_>>(),

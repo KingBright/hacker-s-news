@@ -3,9 +3,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import Image from "next/image";
-import Link from "next/link";
+import { FreshLoopNav } from "../../components/FreshLoopNav";
+import { focusBucketLabel, saveLoopDraft, type WhyRecommended } from "../../src/loop";
+import { buildDayPlaylists } from "../../src/day-playlists";
 
 type ReadingMode = "original" | "compressed";
+type DocumentVariant = ReadingMode | "weekly";
+
+type MarkdownBlock =
+  | { type: "heading"; level: 1 | 2 | 3; text: string }
+  | { type: "paragraph"; text: string }
+  | { type: "list"; ordered: boolean; items: string[] }
+  | { type: "quote"; text: string }
+  | { type: "code"; code: string; language?: string }
+  | { type: "image"; src: string; alt: string }
+  | { type: "rule" };
 
 interface FeedItem {
   id: string;
@@ -103,6 +115,152 @@ function contentForMode(content: FeedItemContent | null, mode: ReadingMode) {
   return content.reader_markdown || content.plain_text || "";
 }
 
+function decodeHtmlEntities(text: string) {
+  return text
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
+}
+
+function stripUnsupportedHtml(text: string) {
+  return decodeHtmlEntities(
+    text
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>/gi, "\n\n")
+      .replace(/<[^>]+>/g, " "),
+  );
+}
+
+function removeOrphanDollarMarkers(text: string) {
+  let cleaned = "";
+  let index = 0;
+
+  while (index < text.length) {
+    if (text[index] === "$") {
+      let end = index + 1;
+      let digitCount = 0;
+      while (end < text.length && digitCount < 2 && /[0-9]/.test(text[end])) {
+        end += 1;
+        digitCount += 1;
+      }
+
+      if (digitCount > 0) {
+        const next = text[end];
+        const nextIsMoney = Boolean(next && /[0-9,.]/.test(next));
+        if (!nextIsMoney) {
+          const previous = cleaned.at(-1);
+          const previousIsInline = Boolean(previous && !/\s/.test(previous) && previous !== "$");
+          const previousIsBoundary = !previous || (!/[A-Za-z0-9_]/.test(previous) && previous !== "$");
+          let nextSignificant = end;
+          while (nextSignificant < text.length && /\s/.test(text[nextSignificant])) {
+            nextSignificant += 1;
+          }
+          const followedByTerminal =
+            nextSignificant >= text.length || /[)\]}。！？；，、,.;:!?]/.test(text[nextSignificant]);
+
+          if (previousIsInline || (previousIsBoundary && followedByTerminal)) {
+            index = end;
+            continue;
+          }
+        }
+      }
+    }
+
+    cleaned += text[index];
+    index += 1;
+  }
+
+  return cleaned.replace(/[ \t]{2,}/g, " ");
+}
+
+function tightenTypography(text: string) {
+  return removeOrphanDollarMarkers(text)
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .replace(/\s*([，。！？：；、])/g, "$1")
+    .replace(/([（【《“‘])\s+/g, "$1")
+    .replace(/\s+([）】》”’])/g, "$1")
+    .replace(/([\u3400-\u9fff])\s+([\u3400-\u9fff])/g, "$1$2")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function normalizeParagraphText(text: string) {
+  return tightenTypography(stripUnsupportedHtml(text));
+}
+
+function looksLikeCollapsedOriginal(text: string) {
+  const trimmed = text.trim();
+  if (trimmed.length < 900) return false;
+  if (/\n\n/.test(trimmed)) return false;
+  return !/(^|\n)\s*(#{1,3}\s|[-*+]\s|\d+[.)]\s|>\s|```|!\[|<img\b)/m.test(trimmed);
+}
+
+function splitIntoReaderParagraphs(text: string, variant: DocumentVariant) {
+  const normalized = normalizeParagraphText(text);
+  if (variant !== "original" || normalized.length < 460) {
+    return [normalized];
+  }
+
+  const sentences = normalized
+    .split(/(?<=[。！？!?])\s+|(?<=\.)\s+(?=[A-Z0-9"'([{])/)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+
+  if (sentences.length < 3) {
+    return [normalized];
+  }
+
+  const chunks: string[] = [];
+  let buffer: string[] = [];
+  let charCount = 0;
+
+  for (const sentence of sentences) {
+    buffer.push(sentence);
+    charCount += sentence.length;
+    if (charCount >= 260 || buffer.length >= 3) {
+      chunks.push(normalizeParagraphText(buffer.join(" ")));
+      buffer = [];
+      charCount = 0;
+    }
+  }
+
+  if (buffer.length > 0) {
+    chunks.push(normalizeParagraphText(buffer.join(" ")));
+  }
+
+  return chunks.length > 0 ? chunks : [normalized];
+}
+
+function parseHtmlImageTag(line: string) {
+  const tagMatch = line.match(/<img\b[^>]*>/i);
+  if (!tagMatch) return null;
+  const tag = tagMatch[0];
+  const src = tag.match(/\bsrc=["']([^"']+)["']/i)?.[1];
+  if (!src) return null;
+  const alt = tag.match(/\balt=["']([^"']*)["']/i)?.[1] || "";
+  return { src, alt: decodeHtmlEntities(alt) };
+}
+
+function parseMarkdownImage(line: string) {
+  const match = line.trim().match(/^!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)$/);
+  if (!match) return null;
+  return { src: match[2], alt: decodeHtmlEntities(match[1]) };
+}
+
+function normalizeMarkdownSource(markdown: string, variant: DocumentVariant) {
+  let normalized = markdown.replace(/\r\n/g, "\n").trim();
+  normalized = normalized.replace(/<br\s*\/?>/gi, "\n");
+  if (variant === "original" && looksLikeCollapsedOriginal(normalized)) {
+    normalized = splitIntoReaderParagraphs(normalized, "original").join("\n\n");
+  }
+  return normalized;
+}
+
 function renderInlineMarkdown(text: string): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g;
@@ -114,13 +272,13 @@ function renderInlineMarkdown(text: string): ReactNode[] {
     const token = match[0];
     if (token.startsWith("**")) {
       nodes.push(
-        <strong key={`strong-${match.index}`} className="font-black text-white/90">
+        <strong key={`strong-${match.index}`} className="font-black text-white">
           {token.slice(2, -2)}
         </strong>,
       );
     } else if (token.startsWith("`")) {
       nodes.push(
-        <code key={`code-${match.index}`} className="rounded bg-white/10 px-1.5 py-0.5 text-[0.92em] text-[#bff6d2]">
+        <code key={`code-${match.index}`} className="reader-inline-code">
           {token.slice(1, -1)}
         </code>,
       );
@@ -143,41 +301,34 @@ function renderInlineMarkdown(text: string): ReactNode[] {
   return nodes;
 }
 
-function renderMarkdown(markdown: string) {
-  const lines = markdown.split("\n");
-  const nodes: ReactNode[] = [];
+function parseMarkdownBlocks(markdown: string, variant: DocumentVariant): MarkdownBlock[] {
+  const blocks: MarkdownBlock[] = [];
+  const lines = normalizeMarkdownSource(markdown, variant).split("\n");
   let list: string[] = [];
-  let listKind: "ul" | "ol" = "ul";
+  let listOrdered = false;
   let paragraph: string[] = [];
+  let inCodeBlock = false;
+  let codeLines: string[] = [];
+  let codeLanguage = "";
 
   const flushList = () => {
     if (list.length === 0) return;
-    const items = list;
-    const kind = listKind;
+    blocks.push({
+      type: "list",
+      ordered: listOrdered,
+      items: list.map((item) => normalizeParagraphText(item)).filter(Boolean),
+    });
     list = [];
-    const className = "my-5 space-y-2 pl-5 text-[15px] leading-7 text-white/76";
-    const children = items.map((item, index) => (
-      <li key={`${item}-${index}`} className={kind === "ul" ? "list-disc pl-1" : "list-decimal pl-1"}>
-        {renderInlineMarkdown(item)}
-      </li>
-    ));
-    nodes.push(kind === "ul" ? (
-      <ul key={`list-${nodes.length}`} className={className}>{children}</ul>
-    ) : (
-      <ol key={`list-${nodes.length}`} className={className}>{children}</ol>
-    ));
   };
 
   const flushParagraph = () => {
     if (paragraph.length === 0) return;
-    const text = paragraph.join("\n").trim();
+    const text = normalizeParagraphText(paragraph.join(" "));
     paragraph = [];
     if (!text) return;
-    nodes.push(
-      <p key={`p-${nodes.length}`} className="my-5 whitespace-pre-line text-[16px] leading-8 text-white/76">
-        {renderInlineMarkdown(text)}
-      </p>,
-    );
+    for (const chunk of splitIntoReaderParagraphs(text, variant)) {
+      blocks.push({ type: "paragraph", text: chunk });
+    }
   };
 
   const flushAll = () => {
@@ -185,69 +336,203 @@ function renderMarkdown(markdown: string) {
     flushList();
   };
 
-  lines.forEach((line, index) => {
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
     const text = line.trim();
+
+    if (inCodeBlock) {
+      if (text.startsWith("```")) {
+        blocks.push({
+          type: "code",
+          code: codeLines.join("\n").replace(/\n+$/g, ""),
+          language: codeLanguage || undefined,
+        });
+        inCodeBlock = false;
+        codeLines = [];
+        codeLanguage = "";
+      } else {
+        codeLines.push(rawLine.replace(/\t/g, "  "));
+      }
+      continue;
+    }
+
+    const codeFence = text.match(/^```([\w-]+)?\s*$/);
+    if (codeFence) {
+      flushAll();
+      inCodeBlock = true;
+      codeLanguage = codeFence[1] || "";
+      continue;
+    }
+
     if (!text) {
       flushAll();
-      return;
+      continue;
     }
+
+    if (/^(-{3,}|_{3,}|\*{3,})$/.test(text)) {
+      flushAll();
+      blocks.push({ type: "rule" });
+      continue;
+    }
+
+    const image = parseMarkdownImage(text) || parseHtmlImageTag(text);
+    if (image) {
+      flushAll();
+      blocks.push({ type: "image", ...image });
+      continue;
+    }
+
     if (text.startsWith("### ")) {
       flushAll();
-      nodes.push(
-        <h3 key={index} className="mt-8 text-lg font-black leading-tight text-white">
-          {renderInlineMarkdown(text.slice(4))}
-        </h3>,
-      );
-      return;
+      blocks.push({ type: "heading", level: 3, text: normalizeParagraphText(text.slice(4)) });
+      continue;
     }
     if (text.startsWith("## ")) {
       flushAll();
-      nodes.push(
-        <h2 key={index} className="mt-9 text-xl font-black leading-tight text-white">
-          {renderInlineMarkdown(text.slice(3))}
-        </h2>,
-      );
-      return;
+      blocks.push({ type: "heading", level: 2, text: normalizeParagraphText(text.slice(3)) });
+      continue;
     }
     if (text.startsWith("# ")) {
       flushAll();
-      nodes.push(
-        <h1 key={index} className="mt-8 text-2xl font-black leading-tight text-white">
-          {renderInlineMarkdown(text.slice(2))}
-        </h1>,
-      );
-      return;
-    }
-    if (/^[-*+]\s+/.test(text)) {
-      flushParagraph();
-      if (list.length > 0 && listKind !== "ul") flushList();
-      listKind = "ul";
-      list.push(text.slice(2));
-      return;
-    }
-    const ordered = /^(\d+)[.)]\s+(.+)$/.exec(text);
-    if (ordered) {
-      flushParagraph();
-      if (list.length > 0 && listKind !== "ol") flushList();
-      listKind = "ol";
-      list.push(ordered[2]);
-      return;
+      blocks.push({ type: "heading", level: 1, text: normalizeParagraphText(text.slice(2)) });
+      continue;
     }
     if (text.startsWith("> ")) {
       flushAll();
-      nodes.push(
-        <blockquote key={index} className="my-6 border-l-2 border-primary/60 pl-4 text-[15px] leading-7 text-white/68">
-          {renderInlineMarkdown(text.slice(2))}
-        </blockquote>,
-      );
-      return;
+      blocks.push({ type: "quote", text: normalizeParagraphText(text.slice(2)) });
+      continue;
     }
+
+    const unordered = text.match(/^[-*+]\s+(.+)$/);
+    if (unordered) {
+      flushParagraph();
+      if (list.length > 0 && listOrdered) flushList();
+      listOrdered = false;
+      list.push(unordered[1]);
+      continue;
+    }
+
+    const ordered = text.match(/^\d+[.)]\s+(.+)$/);
+    if (ordered) {
+      flushParagraph();
+      if (list.length > 0 && !listOrdered) flushList();
+      listOrdered = true;
+      list.push(ordered[1]);
+      continue;
+    }
+
     flushList();
     paragraph.push(text);
-  });
+  }
+
+  if (inCodeBlock && codeLines.length > 0) {
+    blocks.push({
+      type: "code",
+      code: codeLines.join("\n").replace(/\n+$/g, ""),
+      language: codeLanguage || undefined,
+    });
+  }
 
   flushAll();
-  return nodes;
+  return blocks.filter((block) => block.type !== "list" || block.items.length > 0);
+}
+
+function renderDocument(blocks: MarkdownBlock[], variant: DocumentVariant) {
+  return (
+    <article className={`reader-doc ${variant === "original" ? "reader-doc-original" : "reader-doc-compressed"}`}>
+      {blocks.map((block, index) => {
+        if (block.type === "heading") {
+          const Tag = `h${Math.min(block.level, 3)}` as "h1" | "h2" | "h3";
+          return (
+            <Tag key={`heading-${index}`} className="reader-block reader-heading" data-level={block.level}>
+              {renderInlineMarkdown(block.text)}
+            </Tag>
+          );
+        }
+
+        if (block.type === "paragraph") {
+          return (
+            <p key={`paragraph-${index}`} className="reader-block reader-paragraph">
+              {renderInlineMarkdown(block.text)}
+            </p>
+          );
+        }
+
+        if (block.type === "quote") {
+          return (
+            <blockquote key={`quote-${index}`} className="reader-block reader-quote">
+              {renderInlineMarkdown(block.text)}
+            </blockquote>
+          );
+        }
+
+        if (block.type === "code") {
+          return (
+            <pre key={`code-${index}`} className="reader-block reader-code">
+              <code>{block.code}</code>
+            </pre>
+          );
+        }
+
+        if (block.type === "image") {
+          return (
+            <figure key={`image-${index}`} className="reader-block reader-image">
+              <div className="reader-image-frame">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={block.src} alt={block.alt || ""} loading="lazy" />
+              </div>
+              {block.alt ? <figcaption className="reader-caption">{block.alt}</figcaption> : null}
+            </figure>
+          );
+        }
+
+        if (block.type === "rule") {
+          return <div key={`rule-${index}`} className="reader-block reader-divider" />;
+        }
+
+        return (
+          <div key={`list-${index}`} className="reader-block reader-list">
+            {block.items.map((item, itemIndex) => (
+              <div key={`item-${index}-${itemIndex}`} className="reader-list-item">
+                <div className="reader-list-marker">{block.ordered ? `${itemIndex + 1}.` : "•"}</div>
+                <div className="reader-list-content">{renderInlineMarkdown(item)}</div>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+    </article>
+  );
+}
+
+function WhyBalanceStrip({ why }: { why: WhyRecommended }) {
+  const segments = [
+    { label: "近期", value: why.balance.active_pct, className: "bg-primary" },
+    { label: "长期", value: why.balance.stable_pct, className: "bg-[#93c8a8]" },
+    { label: "探索", value: why.balance.explore_pct, className: "bg-white/45" },
+  ];
+
+  return (
+    <div className="mt-3">
+      <div className="flex h-1.5 overflow-hidden rounded-full bg-white/10">
+        {segments.map((segment) => (
+          <div
+            key={segment.label}
+            className={segment.className}
+            style={{ width: `${segment.value}%` }}
+            title={`${segment.label} ${segment.value}%`}
+          />
+        ))}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] font-semibold text-white/42">
+        {segments.map((segment) => (
+          <span key={segment.label}>
+            <span className="text-white/70">{segment.value}%</span> {segment.label}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 export default function FeedPage() {
@@ -263,6 +548,12 @@ export default function FeedPage() {
   const [activeAudioId, setActiveAudioId] = useState<string | null>(null);
   const [isAudioPlaying, setIsAudioPlaying] = useState(false);
   const [audioTitle, setAudioTitle] = useState("");
+  const [audioQueueIds, setAudioQueueIds] = useState<string[]>([]);
+  const [audioQueueLabel, setAudioQueueLabel] = useState("");
+  const [audioProgress, setAudioProgress] = useState(0);
+  const [audioDuration, setAudioDuration] = useState(0);
+  const [why, setWhy] = useState<WhyRecommended | null>(null);
+  const [whyLoading, setWhyLoading] = useState(false);
 
   const readerRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -285,6 +576,46 @@ export default function FeedPage() {
   );
 
   const readingText = useMemo(() => contentForMode(content, mode), [content, mode]);
+  const weeklyBlocks = useMemo(() => parseMarkdownBlocks(weeklyText, "weekly"), [weeklyText]);
+  const readingBlocks = useMemo(() => parseMarkdownBlocks(readingText, mode), [readingText, mode]);
+  const articleDayGroups = useMemo(
+    () =>
+      buildDayPlaylists<FeedItem>({
+        items,
+        getId: (item) => item.id,
+        getTimestampMs: (item) => ((item.publish_time || 0) * 1000),
+        isPlayable: (item) => Boolean(item.audio_url),
+        getDurationSec: (item) => item.duration_sec || 0,
+        dayOrder: "desc",
+        itemOrder: "desc",
+        playbackOrder: "asc",
+      }),
+    [items],
+  );
+
+  const articleAudioById = useMemo(() => {
+    const next = new Map<string, FeedItem>();
+    for (const item of items) {
+      if (item.audio_url) next.set(item.id, item);
+    }
+    return next;
+  }, [items]);
+
+  const weeklyAudioById = useMemo(() => {
+    const next = new Map<string, WeeklyDigest>();
+    for (const weekly of weeklies) {
+      if (weekly.audio_url) next.set(weekly.id, weekly);
+    }
+    return next;
+  }, [weeklies]);
+
+  const selectedDayGroup = useMemo(
+    () =>
+      selectedItem
+        ? articleDayGroups.find((group) => group.itemIds.includes(selectedItem.id)) || null
+        : null,
+    [articleDayGroups, selectedItem],
+  );
 
   useEffect(() => {
     const storedUser = localStorage.getItem("freshloop_user");
@@ -299,8 +630,9 @@ export default function FeedPage() {
   const loadFeed = useCallback(async () => {
     setLoading(true);
     try {
+      const headers = user ? { "x-user-id": user.id } : undefined;
       const [itemsRes, weekliesRes] = await Promise.all([
-        fetch("/api/feed/items?product_line=curated_feed&limit=40"),
+        fetch("/api/feed/items?product_line=curated_feed&limit=40", { headers }),
         fetch("/api/feed/weeklies"),
       ]);
       const nextItems: FeedItem[] = itemsRes.ok ? await itemsRes.json() : [];
@@ -311,7 +643,7 @@ export default function FeedPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [user]);
 
   useEffect(() => {
     void loadFeed();
@@ -338,6 +670,31 @@ export default function FeedPage() {
       cancelled = true;
     };
   }, [selectedId, selectedWeeklyId]);
+
+  useEffect(() => {
+    if (!selectedItem || !user) {
+      setWhy(null);
+      setWhyLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setWhyLoading(true);
+    fetch(`/api/feed/items/${selectedItem.id}/why`, {
+      headers: { "x-user-id": user.id },
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: WhyRecommended | null) => {
+        if (!cancelled) setWhy(data);
+      })
+      .finally(() => {
+        if (!cancelled) setWhyLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedItem, user]);
 
   useEffect(() => {
     if (!selectedId || selectedWeeklyId || !readingText || !readerRef.current) return;
@@ -375,28 +732,112 @@ export default function FeedPage() {
     }, 800);
   }, [mode, selectedId, selectedWeeklyId, user]);
 
-  const playAudio = useCallback((id: string, title: string, url?: string | null) => {
-    if (!url || !audioRef.current) return;
+  const stopAudioQueue = useCallback((reset = true) => {
     const audio = audioRef.current;
+    if (!audio) return;
+    audio.pause();
+    setIsAudioPlaying(false);
+    if (!reset) return;
+    setActiveAudioId(null);
+    setAudioTitle("");
+    setAudioQueueIds([]);
+    setAudioQueueLabel("");
+    setAudioProgress(0);
+    setAudioDuration(0);
+  }, []);
 
-    if (activeAudioId === id && !audio.paused) {
-      audio.pause();
+  const playQueueFromId = useCallback(async (queueIds: string[], startId: string, label: string) => {
+    const audio = audioRef.current;
+    const article = articleAudioById.get(startId);
+    const weekly = weeklyAudioById.get(startId);
+    const url = article?.audio_url || weekly?.audio_url;
+    const title = article ? cleanTitle(article.title) : weekly?.title || "";
+
+    if (!audio || !url) return;
+
+    setAudioQueueIds(queueIds);
+    setAudioQueueLabel(label);
+    setActiveAudioId(startId);
+    setAudioTitle(title);
+    setAudioProgress(0);
+    setAudioDuration(article?.duration_sec || weekly?.duration_sec || 0);
+    audio.src = url;
+    audio.load();
+
+    try {
+      await audio.play();
+      setIsAudioPlaying(true);
+    } catch {
       setIsAudioPlaying(false);
+    }
+  }, [articleAudioById, weeklyAudioById]);
+
+  const toggleAudioPlayback = useCallback(async (id: string, queueIds: string[], label: string) => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    if (activeAudioId === id) {
+      if (audio.paused) {
+        try {
+          await audio.play();
+          setIsAudioPlaying(true);
+        } catch {
+          setIsAudioPlaying(false);
+        }
+      } else {
+        audio.pause();
+        setIsAudioPlaying(false);
+      }
       return;
     }
 
-    if (activeAudioId !== id) {
-      audio.src = url;
-      audio.load();
-      setActiveAudioId(id);
-      setAudioTitle(title);
-    }
+    await playQueueFromId(queueIds, id, label);
+  }, [activeAudioId, playQueueFromId]);
 
-    audio
-      .play()
-      .then(() => setIsAudioPlaying(true))
-      .catch(() => setIsAudioPlaying(false));
-  }, [activeAudioId]);
+  const playArticleDay = useCallback(
+    async (dayTitle: string, queueIds: string[], startId?: string) => {
+      const playableQueue = queueIds.filter((id) => articleAudioById.has(id));
+      const targetId = startId && playableQueue.includes(startId) ? startId : playableQueue[0];
+      if (!targetId) return;
+      await playQueueFromId(playableQueue, targetId, `${dayTitle} · 阅读日播放列表`);
+    },
+    [articleAudioById, playQueueFromId],
+  );
+
+  const playNextAudio = useCallback(async () => {
+    if (!activeAudioId) return;
+    const currentIndex = audioQueueIds.indexOf(activeAudioId);
+    const nextId = currentIndex >= 0 ? audioQueueIds[currentIndex + 1] : null;
+    if (!nextId) {
+      stopAudioQueue();
+      return;
+    }
+    await playQueueFromId(audioQueueIds, nextId, audioQueueLabel);
+  }, [activeAudioId, audioQueueIds, audioQueueLabel, playQueueFromId, stopAudioQueue]);
+
+  const playPreviousAudio = useCallback(async () => {
+    if (!activeAudioId) return;
+    const currentIndex = audioQueueIds.indexOf(activeAudioId);
+    if (currentIndex <= 0) return;
+    await playQueueFromId(audioQueueIds, audioQueueIds[currentIndex - 1], audioQueueLabel);
+  }, [activeAudioId, audioQueueIds, audioQueueLabel, playQueueFromId]);
+
+  const sendToLoop = useCallback((item: FeedItem) => {
+    saveLoopDraft({
+      feedbackMode: "balance",
+      title: cleanTitle(item.title),
+      references: [
+        {
+          sourceType: "article",
+          sourceId: item.id,
+          sourceUrl: item.original_url,
+          title: cleanTitle(item.title),
+          quoteText: item.subtitle || undefined,
+        },
+      ],
+    });
+    window.location.href = "/loop";
+  }, []);
 
   return (
     <div className="relative min-h-screen overflow-x-hidden bg-background-dark text-white font-display">
@@ -404,12 +845,16 @@ export default function FeedPage() {
         ref={audioRef}
         onPause={() => setIsAudioPlaying(false)}
         onPlaying={() => setIsAudioPlaying(true)}
-        onEnded={() => setIsAudioPlaying(false)}
+        onTimeUpdate={() => setAudioProgress(audioRef.current?.currentTime || 0)}
+        onLoadedMetadata={() => setAudioDuration(audioRef.current?.duration || 0)}
+        onEnded={() => {
+          void playNextAudio();
+        }}
         className="hidden"
       />
 
       <header className="sticky top-0 z-30 border-b border-white/5 bg-background-dark/95 px-4 pb-4 pt-12 backdrop-blur-md">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3">
+        <div className="mx-auto flex max-w-6xl flex-col gap-4 md:flex-row md:items-center md:justify-between">
           <div className="flex items-center gap-3">
             <Image src="/logo.png" alt="FreshLoop" width={40} height={40} className="rounded-xl shadow-lg ring-1 ring-white/10" />
             <div>
@@ -419,14 +864,9 @@ export default function FeedPage() {
               </div>
             </div>
           </div>
-          <nav className="flex rounded-lg bg-white/5 p-1 ring-1 ring-white/10">
-            <Link href="/" className="rounded-md px-3 py-2 text-sm font-bold text-white/60 hover:bg-white/10 hover:text-white">
-              Radio
-            </Link>
-            <Link href="/feed" className="rounded-md bg-primary px-3 py-2 text-sm font-bold text-black">
-              Reading
-            </Link>
-          </nav>
+          <div className="w-full md:max-w-md">
+            <FreshLoopNav />
+          </div>
         </div>
       </header>
 
@@ -444,46 +884,68 @@ export default function FeedPage() {
               </button>
             </div>
             <div className="mt-4 space-y-2">
-              {items.map((item) => {
-                const selected = item.id === selectedId;
-                return (
-                  <button
-                    key={item.id}
-                    onClick={() => {
-                      restoredProgressKey.current = null;
-                      setSelectedWeeklyId(null);
-                      setSelectedId(item.id);
-                    }}
-                    className={`w-full rounded-lg border p-3 text-left transition ${
-                      selected
-                        ? "border-primary bg-primary/10 text-white"
-                        : "border-white/5 bg-black/20 text-white hover:border-primary/50"
-                    }`}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <h3 className="line-clamp-2 text-sm font-black leading-snug">{cleanTitle(item.title)}</h3>
-                      <span className={selected ? "text-primary" : "text-white/45"}>
-                        {item.audio_url ? (
-                          <span className="material-symbols-outlined text-[18px]">headphones</span>
-                        ) : (
-                          <span className="material-symbols-outlined text-[18px]">article</span>
-                        )}
-                      </span>
+              {articleDayGroups.map((group) => (
+                <div key={group.key} className="rounded-xl border border-white/6 bg-black/15 p-3">
+                  <div className="mb-3 flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-black text-white">{group.title}</div>
+                      <div className="mt-1 text-[11px] text-white/45">
+                        {group.items.length} 篇 · {group.playableCount} 段可播
+                      </div>
                     </div>
-                    <div className={`mt-3 flex items-center gap-2 text-xs ${selected ? "text-[#93c8a8]" : "text-white/45"}`}>
-                      <span>{formatDate(item.publish_time)}</span>
-                      <span>·</span>
-                      <span>{item.reading_time_min || 1} min read</span>
-                      {item.quality_score ? (
-                        <>
-                          <span>·</span>
-                          <span>{item.quality_score}/10</span>
-                        </>
-                      ) : null}
-                    </div>
-                  </button>
-                );
-              })}
+                    {group.playbackIds.length > 0 ? (
+                      <button
+                        onClick={() => void playArticleDay(group.title, group.playbackIds)}
+                        className="rounded-full bg-white/10 px-3 py-1.5 text-[11px] font-bold text-white hover:bg-white/15"
+                      >
+                        播放当天
+                      </button>
+                    ) : null}
+                  </div>
+                  <div className="space-y-2">
+                    {group.items.map((item) => {
+                      const selected = item.id === selectedId;
+                      return (
+                        <button
+                          key={item.id}
+                          onClick={() => {
+                            restoredProgressKey.current = null;
+                            setSelectedWeeklyId(null);
+                            setSelectedId(item.id);
+                          }}
+                          className={`w-full rounded-lg border p-3 text-left transition ${
+                            selected
+                              ? "border-primary bg-primary/10 text-white"
+                              : "border-white/5 bg-black/20 text-white hover:border-primary/50"
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <h3 className="line-clamp-2 text-sm font-black leading-snug">{cleanTitle(item.title)}</h3>
+                            <span className={selected ? "text-primary" : "text-white/45"}>
+                              {item.audio_url ? (
+                                <span className="material-symbols-outlined text-[18px]">headphones</span>
+                              ) : (
+                                <span className="material-symbols-outlined text-[18px]">article</span>
+                              )}
+                            </span>
+                          </div>
+                          <div className={`mt-3 flex items-center gap-2 text-xs ${selected ? "text-[#93c8a8]" : "text-white/45"}`}>
+                            <span>{formatDate(item.publish_time)}</span>
+                            <span>·</span>
+                            <span>{item.reading_time_min || 1} min read</span>
+                            {item.quality_score ? (
+                              <>
+                                <span>·</span>
+                                <span>{item.quality_score}/10</span>
+                              </>
+                            ) : null}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
               {items.length === 0 && !loading ? (
                 <div className="rounded-lg border border-dashed border-white/10 p-6 text-center text-sm text-white/45">
                   暂无精选文章
@@ -524,7 +986,7 @@ export default function FeedPage() {
                       <button
                         onClick={(event) => {
                           event.stopPropagation();
-                          playAudio(weekly.id, weekly.title, weekly.audio_url);
+                          void toggleAudioPlayback(weekly.id, [weekly.id], "Weekly Brief");
                         }}
                         className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary text-black"
                         title="Play weekly audio"
@@ -573,7 +1035,7 @@ export default function FeedPage() {
                   </h1>
                   {selectedWeekly.audio_url ? (
                     <button
-                      onClick={() => playAudio(selectedWeekly.id, selectedWeekly.title, selectedWeekly.audio_url)}
+                      onClick={() => void toggleAudioPlayback(selectedWeekly.id, [selectedWeekly.id], "Weekly Brief")}
                       className="flex h-11 shrink-0 items-center justify-center gap-2 rounded-full bg-primary px-4 text-sm font-black text-black hover:bg-primary/90"
                     >
                       <span className="material-symbols-outlined text-[21px]">
@@ -587,7 +1049,16 @@ export default function FeedPage() {
 
               <div className="min-h-0 flex-1 overflow-y-auto px-5 py-6 md:px-10">
                 {weeklyText ? (
-                  <article className="mx-auto max-w-3xl pb-24">{renderMarkdown(weeklyText)}</article>
+                  <div className="mx-auto max-w-4xl pb-24">
+                    <div className="rounded-[28px] border border-white/7 bg-[linear-gradient(180deg,rgba(15,31,24,0.95),rgba(10,17,14,0.98))] px-5 py-6 shadow-[0_28px_90px_rgba(0,0,0,0.28)] md:px-8 md:py-8">
+                      <div className="mb-5 flex flex-wrap items-center gap-2 text-[11px] font-black uppercase tracking-[0.18em] text-[#93c8a8]">
+                        <span>Weekly Brief</span>
+                        <span>·</span>
+                        <span>交叉主题梳理</span>
+                      </div>
+                      {renderDocument(weeklyBlocks, "weekly")}
+                    </div>
+                  </div>
                 ) : (
                   <div className="mx-auto max-w-2xl rounded-lg border border-dashed border-white/10 p-10 text-center text-white/45">
                     周汇总文稿还在生成中
@@ -615,7 +1086,7 @@ export default function FeedPage() {
                   </h1>
                   {selectedItem.audio_url ? (
                     <button
-                      onClick={() => playAudio(selectedItem.id, selectedItem.title, selectedItem.audio_url)}
+                      onClick={() => void toggleAudioPlayback(selectedItem.id, [selectedItem.id], "单篇收听")}
                       className="flex h-11 shrink-0 items-center justify-center gap-2 rounded-full bg-primary px-4 text-sm font-black text-black hover:bg-primary/90"
                     >
                       <span className="material-symbols-outlined text-[21px]">
@@ -624,9 +1095,33 @@ export default function FeedPage() {
                       {formatDuration(selectedItem.duration_sec)}
                     </button>
                   ) : null}
+                  {selectedDayGroup && selectedDayGroup.playbackIds.length > 1 ? (
+                    <button
+                      onClick={() => void playArticleDay(selectedDayGroup.title, selectedDayGroup.playbackIds, selectedItem.id)}
+                      className="flex h-11 shrink-0 items-center justify-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 text-sm font-black text-white hover:border-primary/40 hover:text-primary"
+                    >
+                      <span className="material-symbols-outlined text-[21px]">queue_music</span>
+                      播放{selectedDayGroup.shortTitle}
+                    </button>
+                  ) : null}
                 </div>
                 {selectedItem.subtitle ? (
                   <p className="mt-3 max-w-2xl text-sm leading-6 text-white/50">{selectedItem.subtitle}</p>
+                ) : null}
+                {why ? (
+                  <div className="mt-4 rounded-2xl border border-primary/20 bg-primary/8 p-4">
+                    <div className="flex flex-wrap items-center gap-2 text-xs font-black uppercase tracking-[0.18em] text-primary">
+                      <span>Why</span>
+                      <span>{focusBucketLabel(why.bucket)}</span>
+                      <span>{why.score}</span>
+                    </div>
+                    <WhyBalanceStrip why={why} />
+                    <div className="mt-3 space-y-2 text-sm leading-7 text-white/68">
+                      {why.reasons.map((reason) => (
+                        <div key={reason}>{reason}</div>
+                      ))}
+                    </div>
+                  </div>
                 ) : null}
                 <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
                   <div className="flex rounded-lg bg-black/25 p-1 ring-1 ring-white/10">
@@ -653,17 +1148,32 @@ export default function FeedPage() {
                       干货压缩
                     </button>
                   </div>
-                  {selectedItem.original_url ? (
-                    <a
-                      href={selectedItem.original_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="flex h-10 items-center gap-2 rounded-full bg-white/5 px-3 text-sm font-bold text-white/65 ring-1 ring-white/10 hover:text-white"
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      onClick={() => sendToLoop(selectedItem)}
+                      className="flex h-10 items-center gap-2 rounded-full bg-primary px-3 text-sm font-black text-black hover:bg-primary/90"
                     >
-                      <span className="material-symbols-outlined text-[18px]">open_in_new</span>
-                      Source
-                    </a>
-                  ) : null}
+                      <span className="material-symbols-outlined text-[18px]">format_quote</span>
+                      Loop
+                    </button>
+                    {selectedItem.original_url ? (
+                      <a
+                        href={selectedItem.original_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="flex h-10 items-center gap-2 rounded-full bg-white/5 px-3 text-sm font-bold text-white/65 ring-1 ring-white/10 hover:text-white"
+                      >
+                        <span className="material-symbols-outlined text-[18px]">open_in_new</span>
+                        Source
+                      </a>
+                    ) : null}
+                    {whyLoading ? (
+                      <div className="flex h-10 items-center gap-2 rounded-full bg-white/5 px-3 text-sm font-bold text-white/45 ring-1 ring-white/10">
+                        <div className="size-4 rounded-full border-2 border-white/20 border-t-primary animate-spin" />
+                        Why
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               </div>
 
@@ -677,7 +1187,39 @@ export default function FeedPage() {
                     <div className="size-7 rounded-full border-2 border-white/20 border-t-primary animate-spin" />
                   </div>
                 ) : readingText ? (
-                  <article className="mx-auto max-w-3xl pb-24">{renderMarkdown(readingText)}</article>
+                  <div className="mx-auto max-w-4xl pb-24">
+                    <div
+                      className={`rounded-[28px] border px-5 py-6 shadow-[0_28px_90px_rgba(0,0,0,0.26)] md:px-8 md:py-8 ${
+                        mode === "original"
+                          ? "border-white/8 bg-[linear-gradient(180deg,rgba(25,35,29,0.98),rgba(14,20,17,0.98))]"
+                          : "border-primary/10 bg-[linear-gradient(180deg,rgba(13,21,17,0.98),rgba(9,14,11,0.98))]"
+                      }`}
+                    >
+                      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex flex-wrap items-center gap-2 text-[11px] font-black uppercase tracking-[0.18em] text-[#93c8a8]">
+                          <span>{mode === "original" ? "原文整理版" : "干货压缩"}</span>
+                          {selectedItem.source_name ? (
+                            <>
+                              <span>·</span>
+                              <span>{selectedItem.source_name}</span>
+                            </>
+                          ) : null}
+                        </div>
+                        {selectedItem.original_url ? (
+                          <a
+                            href={selectedItem.original_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex h-9 items-center gap-2 rounded-full bg-white/6 px-3 text-sm font-bold text-white/72 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-white"
+                          >
+                            <span className="material-symbols-outlined text-[17px]">open_in_new</span>
+                            原文链接
+                          </a>
+                        ) : null}
+                      </div>
+                      {renderDocument(readingBlocks, mode)}
+                    </div>
+                  </div>
                 ) : (
                   <div className="mx-auto max-w-2xl rounded-lg border border-dashed border-white/10 p-10 text-center text-white/45">
                     内容还在生成中
@@ -695,26 +1237,55 @@ export default function FeedPage() {
 
       {activeAudioId ? (
         <div className="fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-[#1e1e1e]/95 px-4 py-3 backdrop-blur">
-          <div className="mx-auto flex max-w-6xl items-center justify-between gap-3">
-            <div className="min-w-0">
-              <div className="truncate text-sm font-black text-white">{audioTitle}</div>
-              <div className="mt-1 text-xs font-medium text-[#93c8a8]">FreshLoop Listening</div>
+          <div className="mx-auto max-w-6xl">
+            <div className="mb-3 h-1.5 overflow-hidden rounded-full bg-white/10">
+              <div
+                className="h-full rounded-full bg-primary transition-all"
+                style={{ width: `${audioDuration > 0 ? Math.min((audioProgress / audioDuration) * 100, 100) : 0}%` }}
+              />
             </div>
-            <button
-              onClick={() => {
-                if (!audioRef.current) return;
-                if (audioRef.current.paused) {
-                  void audioRef.current.play();
-                } else {
-                  audioRef.current.pause();
-                }
-              }}
-              className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-black"
-            >
-              <span className="material-symbols-outlined filled text-[28px]">
-                {isAudioPlaying ? "pause" : "play_arrow"}
-              </span>
-            </button>
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="truncate text-sm font-black text-white">{audioTitle}</div>
+                <div className="mt-1 text-xs font-medium text-[#93c8a8]">
+                  {audioQueueLabel || "FreshLoop Listening"}
+                </div>
+                <div className="mt-1 text-[11px] text-white/35">
+                  {formatDuration(Math.floor(audioProgress))} / {formatDuration(Math.floor(audioDuration))}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => void playPreviousAudio()}
+                  disabled={audioQueueIds.indexOf(activeAudioId) <= 0}
+                  className="flex size-10 shrink-0 items-center justify-center rounded-full bg-white/8 text-white transition disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  <span className="material-symbols-outlined text-[22px]">skip_previous</span>
+                </button>
+                <button
+                  onClick={() => {
+                    if (!audioRef.current) return;
+                    if (audioRef.current.paused) {
+                      void audioRef.current.play();
+                    } else {
+                      audioRef.current.pause();
+                    }
+                  }}
+                  className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-black"
+                >
+                  <span className="material-symbols-outlined filled text-[28px]">
+                    {isAudioPlaying ? "pause" : "play_arrow"}
+                  </span>
+                </button>
+                <button
+                  onClick={() => void playNextAudio()}
+                  disabled={audioQueueIds.indexOf(activeAudioId) < 0 || audioQueueIds.indexOf(activeAudioId) >= audioQueueIds.length - 1}
+                  className="flex size-10 shrink-0 items-center justify-center rounded-full bg-white/8 text-white transition disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  <span className="material-symbols-outlined text-[22px]">skip_next</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       ) : null}

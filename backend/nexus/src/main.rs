@@ -6,12 +6,14 @@ use axum::{
     Router,
 };
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::fs;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod db;
+mod personalization;
 mod routes;
 
 use db::DbPool;
@@ -21,6 +23,7 @@ pub struct AppState {
     pub db: DbPool,
     pub api_key: String,
     pub audio_dir: String,
+    pub memory_store: Arc<loop_memory::RedbMemoryStore>,
 }
 
 fn build_cors_layer() -> CorsLayer {
@@ -71,6 +74,14 @@ async fn main() {
         .init();
 
     let db_pool = db::init_db().await.expect("Failed to initialize DB");
+    let memory_db_path = std::env::var("MEMORY_DB_PATH").unwrap_or_else(|_| {
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{}/.freshloop/data/loop_memory.redb", home_dir)
+    });
+    let memory_store = Arc::new(
+        loop_memory::RedbMemoryStore::new(&memory_db_path)
+            .expect("Failed to initialize memory store"),
+    );
 
     // Ensure audio directory exists
     let audio_dir = std::env::var("AUDIO_DIR").unwrap_or_else(|_| "audio".to_string());
@@ -84,18 +95,26 @@ async fn main() {
         db: db_pool,
         api_key,
         audio_dir: audio_dir.clone(),
+        memory_store,
     };
 
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "dist/frontend".to_string());
     let static_index = format!("{}/index.html", static_dir);
     let admin_index = format!("{}/admin.html", static_dir);
     let feed_index = format!("{}/feed.html", static_dir);
+    let loop_index = format!("{}/loop.html", static_dir);
+    let focus_index = format!("{}/focus.html", static_dir);
 
     let app = Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/items", get(routes::items::list_items))
+        .route("/api/items/{id}/why", get(routes::items::get_item_why))
         .route("/api/feed/items", get(routes::feed::list_feed_items))
         .route("/api/feed/items/{id}", get(routes::feed::get_feed_item))
+        .route(
+            "/api/feed/items/{id}/why",
+            get(routes::feed::get_feed_item_why),
+        )
         .route(
             "/api/feed/items/{id}/content",
             get(routes::feed::get_feed_item_content),
@@ -109,6 +128,30 @@ async fn main() {
             "/api/feed/weeklies/{id}",
             get(routes::feed::get_weekly_digest),
         )
+        .route(
+            "/api/memory/entries",
+            get(routes::memory::list_memory_entries).post(routes::memory::create_memory_entry),
+        )
+        .route(
+            "/api/memory/entries/{id}",
+            axum::routing::delete(routes::memory::delete_memory_entry),
+        )
+        .route("/api/memory/search", get(routes::memory::search_memory))
+        .route(
+            "/api/memory/profile",
+            get(routes::memory::get_memory_profile),
+        )
+        .route("/api/focus", get(routes::memory::get_focus_summary))
+        .route(
+            "/api/loop/posts",
+            get(routes::loops::list_loop_posts).post(routes::loops::create_loop_post),
+        )
+        .route(
+            "/api/loop/posts/{id}",
+            get(routes::loops::get_loop_post)
+                .patch(routes::loops::update_loop_post)
+                .delete(routes::loops::delete_loop_post),
+        )
         .route("/api/internal/items", post(routes::items::create_item))
         .route(
             "/api/internal/feed/items",
@@ -117,6 +160,22 @@ async fn main() {
         .route(
             "/api/internal/feed/weeklies",
             post(routes::feed::create_weekly_digest),
+        )
+        .route(
+            "/api/internal/loop/posts/pending-preferences",
+            get(routes::loops::list_pending_loop_posts_internal),
+        )
+        .route(
+            "/api/internal/loop/posts/{id}/preference-result",
+            post(routes::loops::update_loop_post_preference_result_internal),
+        )
+        .route(
+            "/api/internal/memory/entries",
+            post(routes::memory::create_memory_entry_internal),
+        )
+        .route(
+            "/api/internal/memory/profile/{user_id}",
+            get(routes::memory::get_memory_profile_internal),
         )
         .route(
             "/api/internal/items/multipart",
@@ -189,6 +248,51 @@ async fn main() {
             "/feed/",
             get(move || async move {
                 match tokio::fs::read_to_string(&feed_index).await {
+                    Ok(html) => axum::response::Html(html).into_response(),
+                    Err(_) => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        )
+        .route(
+            "/loop",
+            get({
+                let loop_index = loop_index.clone();
+                move || async move {
+                    match tokio::fs::read_to_string(&loop_index).await {
+                        Ok(html) => axum::response::Html(html).into_response(),
+                        Err(_) => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        )
+        .route(
+            "/loop/",
+            get({
+                let loop_index = loop_index.clone();
+                move || async move {
+                    match tokio::fs::read_to_string(&loop_index).await {
+                        Ok(html) => axum::response::Html(html).into_response(),
+                        Err(_) => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        )
+        .route(
+            "/focus",
+            get({
+                let focus_index = focus_index.clone();
+                move || async move {
+                    match tokio::fs::read_to_string(&focus_index).await {
+                        Ok(html) => axum::response::Html(html).into_response(),
+                        Err(_) => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        )
+        .route(
+            "/focus/",
+            get(move || async move {
+                match tokio::fs::read_to_string(&focus_index).await {
                     Ok(html) => axum::response::Html(html).into_response(),
                     Err(_) => StatusCode::NOT_FOUND.into_response(),
                 }

@@ -20,6 +20,15 @@ What it does:
   `android_client/`.
 - Copies `android_client/build/app/outputs/flutter-apk/app-release.apk` to
   `frontend/public/android-app.apk`.
+- Regenerates `frontend/public/version.json` from
+  `android_client/pubspec.yaml`.
+- Builds and uploads the frontend so the new APK and `version.json` are
+  published together.
+
+In-app update detection only triggers when the remote `build_number` in
+`version.json` is higher than the installed Android app's build number. If you
+expect clients to receive an update notification, make sure the Android version
+was bumped before deployment.
 
 Current script note: after the Android block, `deploy.sh` still performs the
 remote directory preparation step. That is harmless for a normal deploy path,
@@ -81,6 +90,61 @@ curl http://localhost:3721/api/status
 ```
 
 If `CORTEX_API_KEY` is configured, include it as `X-CORTEX-KEY` or bearer auth.
+
+TTS resource policy for the local Cortex service:
+
+- The 2026-05 memory incident was caused by the old Cortex TTS policy using
+  Metal for VoxCPM inside the long-running LaunchAgent. Candle 0.10.2's Metal
+  backend pools intermediate `private_buffers`; in VoxCPM's dynamic-shape
+  generation path that pool can grow without being returned to the OS during
+  process lifetime.
+- Keep `[tts].keep_engine_loaded = false` unless the machine is dedicated to
+  batch audio generation. Cortex is a long-running LaunchAgent, so loaded TTS
+  models must be released after synthesis.
+- Keep `[tts].memory_pressure_relief = true` on macOS so the process asks the
+  allocator to return dirty pages after unloading the model.
+- Keep `[tts].process_isolation = true` for VoxCPM in the local LaunchAgent.
+  VoxCPM/Candle can retain large native or Metal buffer pools across repeated
+  chunks; running synthesis in a short-lived `cortex tts-worker` process gives
+  the OS a hard cleanup boundary after each audio job.
+- Keep `[tts].worker_memory_limit_mb` below the amount that would make the Mac
+  unusable. The default local config uses `24576` MB; the parent Cortex process
+  kills the worker if it crosses that limit.
+- `[tts].worker_idle_timeout_secs` is an idle-progress timeout, not a total
+  generation timeout. Long audio jobs may run past it as long as each chunk keeps
+  updating worker progress.
+- Radio production uses VoxCPM with Metal acceleration in the isolated worker:
+  `engine = "voxcpm_metal"`, `device = "metal"`,
+  `process_isolation = true`. Do not run Metal VoxCPM in the long-running parent
+  Cortex process. Experimental non-VoxCPM engines such as Qwen3, Magic-TTS, and
+  MOSS require `FRESHLOOP_ALLOW_EXPERIMENTAL_TTS=1`; do not set it in the
+  LaunchAgent.
+- Metal requests fail fast if the runtime cannot create a Metal device. Do not
+  allow a silent CPU fallback for Radio TTS; it hides the real runtime problem
+  and can stall audio production for hours.
+- The isolated worker must split long LLM output into TTS-safe chunks before
+  VoxCPM sees it. It also re-splits incoming worker requests so old draft caches
+  cannot reintroduce 1000+ character chunks.
+- Worker progress is heartbeat-based. The parent should kill a worker only when
+  there is no progress heartbeat for `[tts].worker_idle_timeout_secs`, not when a
+  legitimate long synthesis exceeds a wall-clock duration.
+- `./scripts/install_local_service.sh` runs a deployment-blocking ASR closed-loop
+  check before replacing the installed Cortex binary. The check synthesizes a
+  long Chinese news-style script into per-chunk WAV files, transcribes every
+  chunk, and fails deployment if any chunk has low pinyin similarity or if the
+  later chunks degrade materially versus the first half. It also compares ASR
+  text with the configured voice prompt and fails prompt-leakage cases where the
+  model starts repeating the reference audio text. Reports are written under
+  `/tmp/freshloop-tts-asr-loop/`.
+- VoxCPM prompt-cache generation must keep `max_len` bounded by input text
+  length. Otherwise short text chunks can run against the full configured audio
+  limit and make generation look hung even with hardware acceleration.
+- If Activity Monitor shows Cortex footprint in the tens of GB, inspect with:
+
+```bash
+PID="$(pgrep -f '^/Users/jinliang/.freshloop/bin/cortex$' | head -n1)"
+vmmap -summary "$PID" | sed -n '1,120p'
+```
 
 ## Feed API Verification
 

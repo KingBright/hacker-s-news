@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import Image from 'next/image';
-import Link from 'next/link';
 import { Item } from '../src/types';
+import { FreshLoopNav } from '../components/FreshLoopNav';
+import { saveLoopDraft } from '../src/loop';
+import { buildDayPlaylists } from '../src/day-playlists';
 
 const SPEED_OPTIONS: number[] = [1.0, 1.25, 1.5, 1.75, 2.0];
 
@@ -12,6 +14,10 @@ interface SourceApiItem {
   source_title?: string | null;
   source_summary?: string | null;
 }
+
+type RadioPlaybackContext =
+  | { kind: 'feed' }
+  | { kind: 'day'; dayKey: string; itemIds: string[] };
 
 type NavigatorWithAudioSession = Navigator & {
   audioSession?: {
@@ -87,6 +93,7 @@ export default function Home() {
   // Playback Speed State
   const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
   const [showSpeedPicker, setShowSpeedPicker] = useState(false);
+  const [radioPlaybackContext, setRadioPlaybackContext] = useState<RadioPlaybackContext>({ kind: 'feed' });
 
   // Capture Logs
   useEffect(() => {
@@ -250,6 +257,24 @@ export default function Home() {
     setPlayedIds(new Set()); // Clear history view
   };
 
+  const sendToLoop = useCallback((item: Item) => {
+    const cleanTitle = item.title.replace(/^【.*?】/, '').trim();
+    saveLoopDraft({
+      feedbackMode: 'balance',
+      title: cleanTitle,
+      references: [
+        {
+          sourceType: 'radio_item',
+          sourceId: item.id,
+          sourceUrl: item.original_url,
+          title: cleanTitle,
+          quoteText: item.summary?.slice(0, 220) || undefined,
+        },
+      ],
+    });
+    window.location.href = '/loop';
+  }, []);
+
 
 
   // Audio ref
@@ -317,7 +342,7 @@ export default function Home() {
   // Backend already filters out played items for logged-in users
   const pendingItems = items
     .filter(i => !playedIds.has(i.id))  // Still filter locally for client-side state updates
-    .sort((a, b) => (user ? (a.publish_time || 0) - (b.publish_time || 0) : (b.publish_time || 0) - (a.publish_time || 0))); // Old -> New
+    .sort((a, b) => (a.publish_time || 0) - (b.publish_time || 0)); // Old -> New
 
   // Correction: User requested Old->New (Oldest first). 
   // If a.time < b.time => -1 (a comes first). Correct.
@@ -328,6 +353,47 @@ export default function Home() {
   const playedItems = items
     .filter(i => playedIds.has(i.id))
     .sort((a, b) => (b.publish_time || 0) - (a.publish_time || 0)); // New -> Old (History)
+
+  const radioDayGroups = useMemo(
+    () =>
+      buildDayPlaylists<Item>({
+        items: pendingItems,
+        getId: (item) => item.id,
+        getTimestampMs: (item) => ((item.publish_time || item.created_at || 0) * 1000),
+        isPlayable: (item) => Boolean(item.audio_url),
+        getDurationSec: (item) => item.duration_sec || 0,
+        dayOrder: 'desc',
+        itemOrder: 'asc',
+        playbackOrder: 'asc',
+      }),
+    [pendingItems],
+  );
+
+  const activeRadioQueueItems = useMemo(() => {
+    if (radioPlaybackContext.kind === 'day') {
+      const itemMap = new Map(items.map((item) => [item.id, item]));
+      return radioPlaybackContext.itemIds
+        .filter((id) => !playedIds.has(id))
+        .map((id) => itemMap.get(id))
+        .filter((item): item is Item => Boolean(item));
+    }
+    return pendingItems;
+  }, [items, pendingItems, playedIds, radioPlaybackContext]);
+
+  const activeRadioQueueGroups = useMemo(
+    () =>
+      buildDayPlaylists<Item>({
+        items: activeRadioQueueItems,
+        getId: (item) => item.id,
+        getTimestampMs: (item) => ((item.publish_time || item.created_at || 0) * 1000),
+        isPlayable: (item) => Boolean(item.audio_url),
+        getDurationSec: (item) => item.duration_sec || 0,
+        dayOrder: 'desc',
+        itemOrder: 'asc',
+        playbackOrder: 'asc',
+      }),
+    [activeRadioQueueItems],
+  );
 
   // Fetch Items (Raw Data)
   // Use request ID to prevent race conditions
@@ -509,7 +575,7 @@ export default function Home() {
     setIsPlaying(autoplay);
   }, []);
 
-  const playItem = useCallback((id: string) => {
+  const playItem = useCallback((id: string, context: RadioPlaybackContext = { kind: 'feed' }) => {
     if (currentId === id) {
       if (isPlaying) {
         pausePlayback();
@@ -522,8 +588,21 @@ export default function Home() {
       return;
     }
 
+    setRadioPlaybackContext(context);
     selectTrack(id, true);
   }, [attemptPlayback, currentId, isPlaying, pausePlayback, selectTrack]);
+
+  const playWholeFeed = useCallback(() => {
+    const firstId = pendingItems[0]?.id;
+    if (!firstId) return;
+    playItem(firstId, { kind: 'feed' });
+  }, [pendingItems, playItem]);
+
+  const playRadioDay = useCallback((dayKey: string, itemIds: string[], startId?: string) => {
+    const nextId = startId && itemIds.includes(startId) ? startId : itemIds[0];
+    if (!nextId) return;
+    playItem(nextId, { kind: 'day', dayKey, itemIds });
+  }, [playItem]);
 
   const checkForMore = useCallback(async (): Promise<Item[]> => {
     console.log("[AutoPlay] Checking server for more content...");
@@ -573,6 +652,28 @@ export default function Home() {
   const playNext = useCallback(async () => {
     console.log("[AutoPlay] playNext triggered for", currentId);
 
+    if (radioPlaybackContext.kind === 'day') {
+      const queueIds = radioPlaybackContext.itemIds;
+      const currentIndex = currentId ? queueIds.indexOf(currentId) : -1;
+
+      if (currentId) {
+        markAsPlayed(currentId);
+      }
+
+      const nextId = queueIds
+        .slice(currentIndex + 1)
+        .find((id) => id !== currentId && !playedIds.has(id));
+
+      if (nextId) {
+        selectTrack(nextId, true);
+        return;
+      }
+
+      setRadioPlaybackContext({ kind: 'feed' });
+      pausePlayback();
+      return;
+    }
+
     const sortedPending = items
       .filter(i => !playedIds.has(i.id))
       .sort((a, b) => (a.publish_time || 0) - (b.publish_time || 0));
@@ -603,9 +704,18 @@ export default function Home() {
 
     console.log("[AutoPlay] No new content from server. Stop.");
     pausePlayback();
-  }, [checkForMore, currentId, items, markAsPlayed, pausePlayback, playedIds, selectTrack]);
+  }, [checkForMore, currentId, items, markAsPlayed, pausePlayback, playedIds, radioPlaybackContext, selectTrack]);
 
   const playPrev = useCallback(() => {
+    if (radioPlaybackContext.kind === 'day') {
+      const queueIds = radioPlaybackContext.itemIds;
+      const currentIndex = currentId ? queueIds.indexOf(currentId) : -1;
+      if (currentIndex > 0) {
+        selectTrack(queueIds[currentIndex - 1], true);
+      }
+      return;
+    }
+
     const chronologicalItems = [...items].sort((a, b) => (a.publish_time || 0) - (b.publish_time || 0));
     const currentIndex = currentId ? chronologicalItems.findIndex(item => item.id === currentId) : -1;
 
@@ -621,7 +731,7 @@ export default function Home() {
     if (!currentId && historyCandidates.length > 0) {
       selectTrack(historyCandidates[0].id, true);
     }
-  }, [currentId, items, playedIds, selectTrack]);
+  }, [currentId, items, playedIds, radioPlaybackContext, selectTrack]);
 
   const togglePlay = useCallback(() => {
     if (isPlaying) {
@@ -879,7 +989,7 @@ export default function Home() {
 
   const currentItem = items.find(i => i.id === currentId);
   const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
-  const unreadCount = items.filter(i => !playedIds.has(i.id)).length;
+  const unreadCount = pendingItems.length;
 
   return (
     <div className="relative flex min-h-screen w-full flex-col overflow-x-hidden max-w-md mx-auto shadow-2xl pb-32 bg-background-dark text-white font-display">
@@ -956,14 +1066,7 @@ export default function Home() {
             </button>
           </div>
         </div>
-        <nav className="mt-4 grid grid-cols-2 gap-2 rounded-lg bg-white/5 p-1 ring-1 ring-white/10">
-          <Link href="/" className="rounded-md bg-primary px-3 py-2 text-center text-sm font-bold text-black">
-            Radio
-          </Link>
-          <Link href="/feed" className="rounded-md px-3 py-2 text-center text-sm font-bold text-white/70 hover:bg-white/10 hover:text-white">
-            Reading
-          </Link>
-        </nav>
+        <FreshLoopNav />
       </header>
 
       <LoginModal
@@ -997,6 +1100,14 @@ export default function Home() {
                   <span className="text-lg font-bold text-white leading-tight">Fresh stories</span>
                   <span className="text-sm font-medium text-white/70">Tailored for you</span>
                 </div>
+                {pendingItems.length > 0 && (
+                  <button
+                    onClick={playWholeFeed}
+                    className="h-10 rounded-full bg-primary px-4 text-sm font-bold text-black transition-colors hover:bg-primary/90"
+                  >
+                    全部播放
+                  </button>
+                )}
                 <button
                   onClick={() => {
                     setPage(1);
@@ -1018,81 +1129,123 @@ export default function Home() {
         <section className="flex flex-col gap-4">
           <div className="flex items-center justify-between px-1">
             <h3 className="text-xl font-bold text-white">Your Feed</h3>
+            <span className="text-xs font-bold uppercase tracking-[0.18em] text-[#93c8a8]">
+              {radioDayGroups.length} Days
+            </span>
           </div>
 
           <div className="flex flex-col gap-3">
-            {/* Main Feed: Pending Items (Old -> New) */}
-            {pendingItems.map((item) => {
-              const isActive = currentId === item.id;
-              // ... (Use same display logic)
-              let category = item.category || 'News';
-              let displayTitle = item.title;
-              if (!item.category) {
-                const match = item.title.match(/^【(.*?)】/);
-                if (match) category = match[1];
-              }
-              displayTitle = displayTitle.replace(/^【.*?】/, '').trim();
-              const dateRegex = /[-–—]\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}.*?$|\s*\(.*?\d{1,2}:\d{2}.*?\)$/i;
-              displayTitle = displayTitle.replace(dateRegex, '').trim();
-              const dateObj = item.publish_time ? new Date(item.publish_time * 1000) : new Date();
-              const dateStr = dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-              const timeStr = dateObj.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+            {radioDayGroups.map((group) => {
+              const dayMinutes = group.totalDurationSec > 0 ? Math.ceil(group.totalDurationSec / 60) : 0;
+              const isActiveDay = radioPlaybackContext.kind === 'day' && radioPlaybackContext.dayKey === group.key;
 
               return (
-                <div
-                  key={item.id}
-                  onClick={() => item.audio_url && playItem(item.id)}
-                  className={`
-                      group flex items-center gap-4 bg-surface-dark p-4 rounded-2xl ring-1 shadow-sm hover:shadow-md transition-all cursor-pointer active:scale-[0.99]
-                      ${isActive ? 'ring-primary' : 'ring-white/5 hover:ring-primary/50'}
-                    `}
-                >
-                  <div className="relative shrink-0">
-                    <div className={`flex flex-col items-center justify-center rounded-xl size-14 shadow-inner leading-none ${isActive ? 'bg-primary text-black' : 'bg-[#244732] text-white'}`}>
-                      {isActive && isPlaying ? (
-                        <AnimatedEqualizer size="lg" />
-                      ) : (
-                        <span className="material-symbols-outlined text-[28px]">graphic_eq</span>
-                      )}
+                <section key={group.key} className="rounded-[28px] border border-white/6 bg-white/[0.03] p-4 shadow-[0_14px_40px_rgba(0,0,0,0.18)]">
+                  <div className="mb-4 flex items-start justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h4 className="text-lg font-black text-white">{group.title}</h4>
+                        {isActiveDay && <span className="rounded-full bg-primary/15 px-2 py-1 text-[10px] font-black uppercase tracking-[0.16em] text-primary">Active</span>}
+                      </div>
+                      <p className="mt-2 text-xs text-white/55">
+                        {group.items.length} 条内容 · {group.playableCount} 段可播{dayMinutes > 0 ? ` · ${dayMinutes} min` : ''}
+                      </p>
                     </div>
-                    <div className="absolute -top-1.5 -left-1.5 bg-black/80 backdrop-blur-sm text-white/70 text-[9px] uppercase font-bold px-1.5 py-0.5 rounded-md shadow-sm ring-1 ring-white/10 tracking-wider">
-                      {category.substring(0, 4)}
-                    </div>
+                    {group.playbackIds.length > 0 && (
+                      <button
+                        onClick={() => playRadioDay(group.key, group.playbackIds)}
+                        className="rounded-full bg-primary px-4 py-2 text-sm font-bold text-black transition-colors hover:bg-primary/90"
+                      >
+                        播放当天
+                      </button>
+                    )}
                   </div>
-                  <div className="flex flex-col justify-center grow min-w-0">
-                    <h4 className={`text-base font-bold leading-tight truncate ${isActive ? 'text-primary' : 'text-white'}`}>
-                      {displayTitle}
-                    </h4>
-                    <p className="text-[#93c8a8] text-xs mt-1 flex items-center gap-3 whitespace-nowrap">
-                      <span className="flex items-center opacity-80">
-                        <span className="material-symbols-outlined icon-tiny">schedule</span>
-                        {dateStr} {timeStr}
-                      </span>
-                      <span className="flex items-center">
-                        <span className="material-symbols-outlined icon-tiny">timer</span>
-                        {item.duration_sec ? formatTime(item.duration_sec) : 'Brief'}
-                      </span>
-                    </p>
+
+                  <div className="flex flex-col gap-3">
+                    {group.items.map((item) => {
+                      const isActive = currentId === item.id;
+                      let category = item.category || 'News';
+                      let displayTitle = item.title;
+                      if (!item.category) {
+                        const match = item.title.match(/^【(.*?)】/);
+                        if (match) category = match[1];
+                      }
+                      displayTitle = displayTitle.replace(/^【.*?】/, '').trim();
+                      const dateRegex = /[-–—]\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}.*?$|\s*\(.*?\d{1,2}:\d{2}.*?\)$/i;
+                      displayTitle = displayTitle.replace(dateRegex, '').trim();
+                      const dateObj = item.publish_time ? new Date(item.publish_time * 1000) : new Date();
+                      const dateStr = dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                      const timeStr = dateObj.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+
+                      return (
+                        <div
+                          key={item.id}
+                          onClick={() => item.audio_url && playRadioDay(group.key, group.playbackIds, item.id)}
+                          className={`
+                              group flex items-center gap-4 bg-surface-dark p-4 rounded-2xl ring-1 shadow-sm hover:shadow-md transition-all cursor-pointer active:scale-[0.99]
+                              ${isActive ? 'ring-primary' : 'ring-white/5 hover:ring-primary/50'}
+                            `}
+                        >
+                          <div className="relative shrink-0">
+                            <div className={`flex flex-col items-center justify-center rounded-xl size-14 shadow-inner leading-none ${isActive ? 'bg-primary text-black' : 'bg-[#244732] text-white'}`}>
+                              {isActive && isPlaying ? (
+                                <AnimatedEqualizer size="lg" />
+                              ) : (
+                                <span className="material-symbols-outlined text-[28px]">graphic_eq</span>
+                              )}
+                            </div>
+                            <div className="absolute -top-1.5 -left-1.5 bg-black/80 backdrop-blur-sm text-white/70 text-[9px] uppercase font-bold px-1.5 py-0.5 rounded-md shadow-sm ring-1 ring-white/10 tracking-wider">
+                              {category.substring(0, 4)}
+                            </div>
+                          </div>
+                          <div className="flex flex-col justify-center grow min-w-0">
+                            <h4 className={`text-base font-bold leading-tight truncate ${isActive ? 'text-primary' : 'text-white'}`}>
+                              {displayTitle}
+                            </h4>
+                            <p className="text-[#93c8a8] text-xs mt-1 flex items-center gap-3 whitespace-nowrap">
+                              <span className="flex items-center opacity-80">
+                                <span className="material-symbols-outlined icon-tiny">schedule</span>
+                                {dateStr} {timeStr}
+                              </span>
+                              <span className="flex items-center">
+                                <span className="material-symbols-outlined icon-tiny">timer</span>
+                                {item.duration_sec ? formatTime(item.duration_sec) : 'Brief'}
+                              </span>
+                            </p>
+                          </div>
+                          <div className="flex flex-col items-center gap-2 shrink-0">
+                            <button className={`flex items-center justify-center size-10 rounded-full transition-colors ${isActive && isPlaying ? 'bg-primary text-black' : 'bg-black/20 text-white group-hover:bg-primary group-hover:text-black'}`}>
+                              <span className="material-symbols-outlined filled text-[24px]">
+                                {isActive && isPlaying ? 'pause' : 'play_arrow'}
+                              </span>
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setTranscriptItemId(item.id);
+                                setShowTranscript(true);
+                              }}
+                              className="flex items-center justify-center size-8 rounded-full bg-black/20 text-white/60 hover:text-white hover:bg-black/30 transition-colors"
+                              title="查看文稿"
+                            >
+                              <span className="material-symbols-outlined text-[18px]">article</span>
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                sendToLoop(item);
+                              }}
+                              className="flex items-center justify-center size-8 rounded-full bg-black/20 text-white/60 hover:text-white hover:bg-black/30 transition-colors"
+                              title="写进 Loop"
+                            >
+                              <span className="material-symbols-outlined text-[18px]">format_quote</span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
-                  <div className="flex flex-col items-center gap-2 shrink-0">
-                    <button className={`flex items-center justify-center size-10 rounded-full transition-colors ${isActive && isPlaying ? 'bg-primary text-black' : 'bg-black/20 text-white group-hover:bg-primary group-hover:text-black'}`}>
-                      <span className="material-symbols-outlined filled text-[24px]">
-                        {isActive && isPlaying ? 'pause' : 'play_arrow'}
-                      </span>
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setTranscriptItemId(item.id);
-                        setShowTranscript(true);
-                      }}
-                      className="flex items-center justify-center size-8 rounded-full bg-black/20 text-white/60 hover:text-white hover:bg-black/30 transition-colors"
-                      title="查看文稿"
-                    >
-                      <span className="material-symbols-outlined text-[18px]">article</span>
-                    </button>
-                  </div>
-                </div>
+                </section>
               );
             })}
 
@@ -1239,29 +1392,51 @@ export default function Home() {
                       ) : (
                         // Playlist Content
                         <div className="space-y-4">
-                          {pendingItems.length > 0 ? (
-                            <div className="space-y-1">
-                              {pendingItems.map(item => {
-                                const isActive = currentId === item.id;
-                                const dateObj = item.publish_time ? new Date(item.publish_time * 1000) : new Date();
-                                const dateStr = dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                                const timeStr = dateObj.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
-                                return (
-                                  <div key={item.id} onClick={() => playItem(item.id)}
-                                    className={`flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-colors ${isActive ? 'bg-primary/10' : 'hover:bg-white/5'}`}>
-                                    <div className={`flex items-center justify-center size-10 rounded-lg shrink-0 ${isActive ? 'bg-primary text-black' : 'bg-white/5 text-white/40'}`}>
-                                      {isActive && isPlaying ? <AnimatedEqualizer size="sm" /> : <span className="material-symbols-outlined text-xl">graphic_eq</span>}
-                                    </div>
-                                    <div className="min-w-0 grow">
-                                      <h4 className={`text-sm font-bold truncate ${isActive ? 'text-primary' : 'text-white'}`}>{item.title}</h4>
-                                      <div className="flex items-center gap-3 text-[10px] text-white/30 mt-0.5 whitespace-nowrap">
-                                        <span className="flex items-center"><span className="material-symbols-outlined icon-tiny">schedule</span>{dateStr} {timeStr}</span>
-                                        <span className="flex items-center"><span className="material-symbols-outlined icon-tiny">timer</span>{item.duration_sec ? formatTime(item.duration_sec) : '--:--'}</span>
+                          {activeRadioQueueGroups.length > 0 ? (
+                            <div className="space-y-4">
+                              {activeRadioQueueGroups.map(group => (
+                                <div key={group.key} className="rounded-2xl border border-white/6 bg-white/[0.03] p-3">
+                                  <div className="mb-2 flex items-center justify-between gap-3">
+                                    <div>
+                                      <div className="text-sm font-black text-white">{group.title}</div>
+                                      <div className="mt-1 text-[11px] text-white/40">
+                                        {group.items.length} 条 · {group.playableCount} 段可播
                                       </div>
                                     </div>
+                                    {group.playbackIds.length > 0 && (
+                                      <button
+                                        onClick={() => playRadioDay(group.key, group.playbackIds)}
+                                        className="rounded-full bg-white/10 px-3 py-1.5 text-[11px] font-bold text-white hover:bg-white/15"
+                                      >
+                                        播放当天
+                                      </button>
+                                    )}
                                   </div>
-                                )
-                              })}
+                                  <div className="space-y-1">
+                                    {group.items.map(item => {
+                                      const isActive = currentId === item.id;
+                                      const dateObj = item.publish_time ? new Date(item.publish_time * 1000) : new Date();
+                                      const dateStr = dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                                      const timeStr = dateObj.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+                                      return (
+                                        <div key={item.id} onClick={() => playRadioDay(group.key, group.playbackIds, item.id)}
+                                          className={`flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-colors ${isActive ? 'bg-primary/10' : 'hover:bg-white/5'}`}>
+                                          <div className={`flex items-center justify-center size-10 rounded-lg shrink-0 ${isActive ? 'bg-primary text-black' : 'bg-white/5 text-white/40'}`}>
+                                            {isActive && isPlaying ? <AnimatedEqualizer size="sm" /> : <span className="material-symbols-outlined text-xl">graphic_eq</span>}
+                                          </div>
+                                          <div className="min-w-0 grow">
+                                            <h4 className={`text-sm font-bold truncate ${isActive ? 'text-primary' : 'text-white'}`}>{item.title}</h4>
+                                            <div className="flex items-center gap-3 text-[10px] text-white/30 mt-0.5 whitespace-nowrap">
+                                              <span className="flex items-center"><span className="material-symbols-outlined icon-tiny">schedule</span>{dateStr} {timeStr}</span>
+                                              <span className="flex items-center"><span className="material-symbols-outlined icon-tiny">timer</span>{item.duration_sec ? formatTime(item.duration_sec) : '--:--'}</span>
+                                            </div>
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              ))}
                             </div>
                           ) : <div className="text-center py-4 text-white/30">队列为空</div>}
 

@@ -146,11 +146,18 @@ class CuratedFeedApi {
   CuratedFeedApi({required this.baseUrl, http.Client? client})
     : _client = client ?? http.Client();
 
-  Future<List<CuratedFeedItem>> fetchItems({int limit = 40}) async {
+  Future<List<CuratedFeedItem>> fetchItems({
+    int limit = 40,
+    String? userId,
+  }) async {
     final uri = Uri.parse(
       '$baseUrl/api/feed/items?product_line=curated_feed&item_type=article&limit=$limit',
     );
-    final response = await _client.get(uri);
+    final headers = <String, String>{};
+    if (userId != null && userId.isNotEmpty) {
+      headers['x-user-id'] = userId;
+    }
+    final response = await _client.get(uri, headers: headers);
     _ensureSuccess(response);
     final data = jsonDecode(response.body);
     if (data is! List) return [];

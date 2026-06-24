@@ -8,13 +8,28 @@ aha = { path = "../aha" }
 qwen3-tts = { path = "../qwen3-tts-rs", features = ["hub"] }
 anyhow = "1.0"
 candle-core = "0.10.2"
+candle-nn = "0.10.2"
+candle-transformers = "0.10.2"
 hound = "3.5"
 async-trait = "0.1"
 regex = "1.10"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
 log = "0.4"
+pinyin = "0.10"
+jieba-rs = "0.6"
+memmap2 = "0.9"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "download-binaries", "std", "ndarray", "tracing", "api-19", "tls-native"] }
+tokenizers = "0.22"
+rand = "0.8"
+libloading = "0.8"
+
+
+
+[build-dependencies]
+cc = "1.0"
 
 [features]
-metal = ["aha/metal", "qwen3-tts/metal"]
-cuda = ["aha/cuda", "qwen3-tts/cuda"]
+metal = ["aha/metal", "qwen3-tts/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["aha/cuda", "qwen3-tts/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]

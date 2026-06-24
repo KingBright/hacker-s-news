@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "nexus",
-    "cortex"
+    "cortex",
+    "loop_memory"
 ]
 resolver = "2"
 
@@ -9,4 +10,3 @@ resolver = "2"
 lto = "fat"
 opt-level = 3
 codegen-units = 1
-

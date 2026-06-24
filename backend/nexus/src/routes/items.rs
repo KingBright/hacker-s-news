@@ -1,6 +1,6 @@
-use crate::AppState;
+use crate::{db::DbPool, personalization, AppState};
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
@@ -16,7 +16,7 @@ const MAX_URL_LENGTH: usize = 2048;
 const MIN_LIMIT: i64 = 1;
 const MAX_LIMIT: i64 = 100;
 
-#[derive(Debug, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Item {
     pub id: String,
     pub title: String,
@@ -61,6 +61,17 @@ pub struct Pagination {
     pub category: Option<String>,
 }
 
+const ITEM_COLUMNS_WITH_ALIAS: &str = r#"
+    i.id, i.title, i.summary, i.original_url, i.cover_image_url, i.audio_url,
+    i.publish_time, i.created_at, i.rating, i.tags, i.is_deleted, i.duration_sec, i.status, i.category
+"#;
+
+const USER_QUEUE_ORDER: &str = r#"
+    ORDER BY (i.publish_time IS NULL) ASC, i.publish_time ASC,
+             (i.created_at IS NULL) ASC, i.created_at ASC,
+             i.id ASC
+"#;
+
 /// Validate URL format (basic check)
 fn is_valid_url(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
@@ -74,6 +85,88 @@ fn sanitize_pagination(page: Option<i64>, limit: Option<i64>) -> (i64, i64) {
     (limit, offset)
 }
 
+async fn fetch_items_for_request(
+    db: &DbPool,
+    user_id: Option<&str>,
+    category_filter: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Item>, sqlx::Error> {
+    match (user_id, category_filter) {
+        (Some(uid), Some(cat)) => {
+            sqlx::query_as::<_, Item>(&format!(
+                r#"
+                SELECT {ITEM_COLUMNS_WITH_ALIAS}
+                FROM items i
+                LEFT JOIN user_history uh ON i.id = uh.item_id AND uh.user_id = ?
+                WHERE (i.is_deleted = 0 OR i.is_deleted IS NULL)
+                  AND uh.item_id IS NULL
+                  AND i.category = ?
+                {USER_QUEUE_ORDER}
+                LIMIT ? OFFSET ?
+                "#
+            ))
+            .bind(uid)
+            .bind(cat)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(db)
+            .await
+        }
+        (Some(uid), None) => {
+            sqlx::query_as::<_, Item>(&format!(
+                r#"
+                SELECT {ITEM_COLUMNS_WITH_ALIAS}
+                FROM items i
+                LEFT JOIN user_history uh ON i.id = uh.item_id AND uh.user_id = ?
+                WHERE (i.is_deleted = 0 OR i.is_deleted IS NULL)
+                  AND uh.item_id IS NULL
+                {USER_QUEUE_ORDER}
+                LIMIT ? OFFSET ?
+                "#
+            ))
+            .bind(uid)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(db)
+            .await
+        }
+        (None, Some(cat)) => {
+            sqlx::query_as::<_, Item>(
+                r#"
+                SELECT id, title, summary, original_url, cover_image_url, audio_url,
+                       publish_time, created_at, rating, tags, is_deleted, duration_sec, status, category
+                FROM items
+                WHERE (is_deleted = 0 OR is_deleted IS NULL) AND category = ?
+                ORDER BY publish_time DESC, created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                "#,
+            )
+            .bind(cat)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(db)
+            .await
+        }
+        (None, None) => {
+            sqlx::query_as::<_, Item>(
+                r#"
+                SELECT id, title, summary, original_url, cover_image_url, audio_url,
+                       publish_time, created_at, rating, tags, is_deleted, duration_sec, status, category
+                FROM items
+                WHERE is_deleted = 0 OR is_deleted IS NULL
+                ORDER BY publish_time DESC, created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                "#,
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(db)
+            .await
+        }
+    }
+}
+
 pub async fn list_items(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -84,68 +177,82 @@ pub async fn list_items(
 
     // Extract user_id from header for filtering listened items
     let user_id = headers.get("x-user-id").and_then(|v| v.to_str().ok());
-
-    let items = match (user_id, category_filter) {
-        (Some(uid), Some(cat)) => {
-            sqlx::query_as::<_, Item>(
-                r#"
-                SELECT i.id, i.title, i.summary, i.original_url, i.cover_image_url, i.audio_url,
-                       i.publish_time, i.created_at, i.rating, i.tags, i.is_deleted, i.duration_sec, i.status, i.category
-                FROM items i
-                LEFT JOIN user_history uh ON i.id = uh.item_id AND uh.user_id = ?
-                WHERE (i.is_deleted = 0 OR i.is_deleted IS NULL) AND uh.item_id IS NULL AND i.category = ?
-                ORDER BY i.publish_time DESC
-                LIMIT ? OFFSET ?
-                "#,
-            )
-            .bind(uid)
-            .bind(cat)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&state.db)
-            .await
-        }
-        (Some(uid), None) => {
-            sqlx::query_as::<_, Item>(
-                r#"
-                SELECT i.id, i.title, i.summary, i.original_url, i.cover_image_url, i.audio_url,
-                       i.publish_time, i.created_at, i.rating, i.tags, i.is_deleted, i.duration_sec, i.status, i.category
-                FROM items i
-                LEFT JOIN user_history uh ON i.id = uh.item_id AND uh.user_id = ?
-                WHERE (i.is_deleted = 0 OR i.is_deleted IS NULL) AND uh.item_id IS NULL
-                ORDER BY i.publish_time DESC
-                LIMIT ? OFFSET ?
-                "#,
-            )
-            .bind(uid)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&state.db)
-            .await
-        }
-        (None, Some(cat)) => {
-            sqlx::query_as::<_, Item>(
-                "SELECT id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at, rating, tags, is_deleted, duration_sec, status, category FROM items WHERE (is_deleted = 0 OR is_deleted IS NULL) AND category = ? ORDER BY publish_time DESC LIMIT ? OFFSET ?",
-            )
-            .bind(cat)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&state.db)
-            .await
-        }
-        (None, None) => {
-            sqlx::query_as::<_, Item>(
-                "SELECT id, title, summary, original_url, cover_image_url, audio_url, publish_time, created_at, rating, tags, is_deleted, duration_sec, status, category FROM items WHERE is_deleted = 0 OR is_deleted IS NULL ORDER BY publish_time DESC LIMIT ? OFFSET ?",
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&state.db)
-            .await
-        }
+    let (query_limit, query_offset) = if user_id.is_some() {
+        (
+            personalization::recommended_candidate_limit(limit, offset),
+            0,
+        )
+    } else {
+        (limit, offset)
     };
 
+    let items = fetch_items_for_request(
+        &state.db,
+        user_id,
+        category_filter,
+        query_limit,
+        query_offset,
+    )
+    .await;
+
     match items {
-        Ok(items) => Json(items).into_response(),
+        Ok(items) => {
+            let items = if let Some(user_id) = user_id {
+                let fallback_items = items.clone();
+                match personalization::personalize_radio_items(&state, user_id, items).await {
+                    Ok(items) => items,
+                    Err(_) => fallback_items,
+                }
+            } else {
+                items
+            };
+            let items = if user_id.is_some() {
+                items
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect::<Vec<_>>()
+            } else {
+                items
+            };
+            Json(items).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub async fn get_item_why(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = headers
+        .get("x-user-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    let result = sqlx::query_as::<_, Item>(
+        r#"
+        SELECT id, title, summary, original_url, cover_image_url, audio_url,
+               publish_time, created_at, rating, tags, is_deleted, duration_sec, status, category
+        FROM items
+        WHERE id = ?
+        "#,
+    )
+    .bind(&id)
+    .fetch_optional(&state.db)
+    .await;
+
+    match result {
+        Ok(Some(item)) => match personalization::explain_radio_item(&state, user_id, &item).await {
+            Ok(response) => Json(response).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -290,7 +397,6 @@ pub async fn create_item(
                     }
                 }
             }
-
             Json(json!({ "id": id, "status": "created" })).into_response()
         }
         Err(e) => {
@@ -467,5 +573,117 @@ pub async fn create_item_multipart(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn test_pool() -> DbPool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        sqlx::query(
+            r#"
+            CREATE TABLE items (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                summary TEXT,
+                original_url TEXT UNIQUE,
+                cover_image_url TEXT,
+                audio_url TEXT,
+                publish_time INTEGER,
+                created_at INTEGER,
+                rating INTEGER,
+                tags TEXT,
+                is_deleted BOOLEAN DEFAULT 0,
+                duration_sec INTEGER,
+                status TEXT DEFAULT 'published',
+                category TEXT
+            );
+            CREATE TABLE user_history (
+                user_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                played_at INTEGER,
+                PRIMARY KEY (user_id, item_id)
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        pool
+    }
+
+    async fn insert_item(pool: &DbPool, id: &str, publish_time: i64, category: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO items (
+                id, title, summary, original_url, cover_image_url, audio_url,
+                publish_time, created_at, rating, tags, is_deleted, duration_sec, status, category
+            )
+            VALUES (?, ?, NULL, ?, NULL, NULL, ?, ?, NULL, NULL, 0, NULL, 'published', ?)
+            "#,
+        )
+        .bind(id)
+        .bind(format!("item {id}"))
+        .bind(format!("https://example.com/{id}"))
+        .bind(publish_time)
+        .bind(publish_time)
+        .bind(category)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn mark_played(pool: &DbPool, user_id: &str, item_id: &str) {
+        sqlx::query("INSERT INTO user_history (user_id, item_id, played_at) VALUES (?, ?, ?)")
+            .bind(user_id)
+            .bind(item_id)
+            .bind(999_i64)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_queue_filters_played_before_limit_and_returns_oldest_first() {
+        let pool = test_pool().await;
+        insert_item(&pool, "already-played-oldest", 100, "radio").await;
+        insert_item(&pool, "also-played", 200, "radio").await;
+        insert_item(&pool, "first-unplayed", 300, "radio").await;
+        insert_item(&pool, "second-unplayed", 400, "radio").await;
+        insert_item(&pool, "third-unplayed", 500, "radio").await;
+
+        mark_played(&pool, "user-1", "already-played-oldest").await;
+        mark_played(&pool, "user-1", "also-played").await;
+
+        let items = fetch_items_for_request(&pool, Some("user-1"), None, 2, 0)
+            .await
+            .unwrap();
+        let ids = items.into_iter().map(|item| item.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["first-unplayed", "second-unplayed"]);
+    }
+
+    #[tokio::test]
+    async fn anonymous_listing_stays_recent_first_for_admin_and_ingestion_callers() {
+        let pool = test_pool().await;
+        insert_item(&pool, "old", 100, "radio").await;
+        insert_item(&pool, "new", 300, "radio").await;
+        insert_item(&pool, "middle", 200, "radio").await;
+
+        let items = fetch_items_for_request(&pool, None, None, 3, 0)
+            .await
+            .unwrap();
+        let ids = items.into_iter().map(|item| item.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["new", "middle", "old"]);
     }
 }

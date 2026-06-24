@@ -5,7 +5,9 @@ import 'package:android_client/src/rust/api/client.dart';
 import 'package:android_client/src/rust/models.dart';
 import 'package:android_client/src/rust/frb_generated.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'app_shell.dart';
 import 'audio_handler.dart';
+import 'day_playlist.dart';
 import 'feed_api.dart';
 import 'ui/theme.dart';
 import 'ui/feed_screen.dart';
@@ -22,7 +24,7 @@ Future<void> main() async {
   try {
     await UpdateManager.initialize();
   } catch (e) {
-    debugPrint("Failed to initialize UpdateManager: \$e");
+    debugPrint("Failed to initialize UpdateManager: $e");
   }
 
   try {
@@ -60,12 +62,10 @@ Future<void> main() async {
       initialUser = User(id: cachedUserId, username: cachedUsername);
     }
 
-    // Check for updates
-    UpdateManager.checkAndDownloadUpdate();
-
     runApp(
       MultiProvider(
         providers: [
+          ChangeNotifierProvider(create: (_) => ShellProvider()),
           ChangeNotifierProvider(
             create: (_) => AuthProvider(client, initialUser),
           ),
@@ -79,9 +79,16 @@ Future<void> main() async {
               return feed!;
             },
           ),
-          ChangeNotifierProvider(
+          ChangeNotifierProxyProvider<AuthProvider, ReadingFeedProvider>(
             create: (_) =>
                 ReadingFeedProvider(CuratedFeedApi(baseUrl: baseUrl)),
+            update: (context, auth, reading) {
+              if (reading != null && reading.userId != auth.user?.id) {
+                reading.userId = auth.user?.id;
+                reading.refresh();
+              }
+              return reading!;
+            },
           ),
         ],
         child: const FreshLoopApp(),
@@ -168,8 +175,34 @@ class ErrorApp extends StatelessWidget {
 }
 
 // App Entry Point and Providers
-class FreshLoopApp extends StatelessWidget {
+class FreshLoopApp extends StatefulWidget {
   const FreshLoopApp({super.key});
+
+  @override
+  State<FreshLoopApp> createState() => _FreshLoopAppState();
+}
+
+class _FreshLoopAppState extends State<FreshLoopApp>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(UpdateManager.checkAndDownloadUpdate(force: true));
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(UpdateManager.checkAndDownloadUpdate());
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -189,33 +222,103 @@ class FeedProvider extends ChangeNotifier {
   int page = 1;
   String? userId;
   static const int maxQueueSize = 50;
+  static const String _pendingPlayedIdsKey = 'freshloop_pending_played_ids';
   final Set<String> _playedIds = {};
+  final Set<String> _pendingPlayedIds = {};
   bool _isBackfilling = false;
+  bool _isSyncingPlayed = false;
+  bool _hasLoadedPendingPlayed = false;
 
   FeedProvider(this.client) {
-    // Wire up the track-completed callback
-    audioHandler.onTrackCompleted = _onTrackCompleted;
-    fetchItems();
+    unawaited(_initialize());
+  }
+
+  List<DayPlaylistGroup<Item>> get dayGroups => buildDayPlaylists<Item>(
+    items: items,
+    idOf: (item) => item.id,
+    timestampSecondsOf: (item) =>
+        item.publishTime?.toInt() ?? item.createdAt?.toInt(),
+    isPlayable: (item) => (item.audioUrl?.trim().isNotEmpty ?? false),
+    durationSecondsOf: (item) => item.durationSec?.toInt(),
+    dayOrder: DayPlaylistSortOrder.descending,
+    itemOrder: DayPlaylistSortOrder.ascending,
+    playbackOrder: DayPlaylistSortOrder.ascending,
+  );
+
+  Future<void> _initialize() async {
+    await _loadPendingPlayedIds();
+    await _syncPendingPlayedIds();
+    await fetchItems();
+  }
+
+  Future<void> _loadPendingPlayedIds() async {
+    if (_hasLoadedPendingPlayed) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    final ids = prefs.getStringList(_pendingPlayedIdsKey) ?? const <String>[];
+    _pendingPlayedIds.addAll(ids);
+    _playedIds.addAll(ids);
+    _hasLoadedPendingPlayed = true;
+  }
+
+  Future<void> _persistPendingPlayedIds() async {
+    final prefs = await SharedPreferences.getInstance();
+    final ids = _pendingPlayedIds.toList()..sort();
+    await prefs.setStringList(_pendingPlayedIdsKey, ids);
+  }
+
+  Future<void> _rememberPlayed(String itemId) async {
+    _playedIds.add(itemId);
+    if (_pendingPlayedIds.add(itemId)) {
+      await _persistPendingPlayedIds();
+    }
+    unawaited(_syncPendingPlayedIds());
+  }
+
+  Future<void> _syncPendingPlayedIds() async {
+    if (_isSyncingPlayed) return;
+    await _loadPendingPlayedIds();
+    if (_pendingPlayedIds.isEmpty) return;
+
+    _isSyncingPlayed = true;
+    var changed = false;
+    try {
+      for (final id in List<String>.from(_pendingPlayedIds)) {
+        try {
+          await client.markAsPlayed(id: id);
+          changed = _pendingPlayedIds.remove(id) || changed;
+        } catch (e) {
+          debugPrint("Will retry mark-as-played for $id later: $e");
+          break;
+        }
+      }
+
+      if (changed) {
+        await _persistPendingPlayedIds();
+      }
+    } finally {
+      _isSyncingPlayed = false;
+    }
   }
 
   Future<void> _onTrackCompleted(String itemId) async {
-    _playedIds.add(itemId);
+    await _rememberPlayed(itemId);
     items.removeWhere((item) => item.id == itemId);
     notifyListeners();
 
-    await audioHandler.updateQueueWithItems(items);
+    await audioHandler.updateQueueWithItems(
+      items,
+      onTrackCompleted: _onTrackCompleted,
+      playbackMode: QueuePlaybackMode.dynamicContinuous,
+    );
 
     if (items.length < maxQueueSize) {
       await _backfill();
     }
   }
 
-  void markAsPlayed(String itemId) {
-    client.markAsPlayed(id: itemId).catchError((e) {
-      debugPrint("Failed to mark as played manually: $e");
-    });
-
-    _playedIds.add(itemId);
+  Future<void> markAsPlayed(String itemId) async {
+    await _rememberPlayed(itemId);
     items.removeWhere((item) => item.id == itemId);
     notifyListeners();
 
@@ -223,7 +326,11 @@ class FeedProvider extends ChangeNotifier {
   }
 
   Future<void> _syncQueueAndBackfill() async {
-    await audioHandler.updateQueueWithItems(items);
+    await audioHandler.updateQueueWithItems(
+      items,
+      onTrackCompleted: _onTrackCompleted,
+      playbackMode: QueuePlaybackMode.dynamicContinuous,
+    );
     if (items.length < maxQueueSize) {
       await _backfill();
     }
@@ -234,12 +341,9 @@ class FeedProvider extends ChangeNotifier {
     _isBackfilling = true;
 
     try {
-      final newItems = await client.fetchItems(
-        page: page,
-        limit: maxQueueSize - items.length,
-      );
+      await _syncPendingPlayedIds();
+      final newItems = await client.fetchItems(page: 1, limit: maxQueueSize);
       if (newItems.isEmpty) return;
-      page++;
 
       final existingIds = items.map((i) => i.id).toSet();
       final fresh = newItems
@@ -250,11 +354,12 @@ class FeedProvider extends ChangeNotifier {
 
       if (fresh.isNotEmpty) {
         items.addAll(fresh);
-        // Backend returns DESC (newest first). We sort ASC (oldest first) so playback is chronological.
-        items.sort(
-          (a, b) => (a.publishTime ?? 0).compareTo(b.publishTime ?? 0),
+        _normalizeQueue(trimToMax: true);
+        await audioHandler.updateQueueWithItems(
+          items,
+          onTrackCompleted: _onTrackCompleted,
+          playbackMode: QueuePlaybackMode.dynamicContinuous,
         );
-        await audioHandler.updateQueueWithItems(items);
         notifyListeners();
       }
     } catch (e) {
@@ -276,23 +381,94 @@ class FeedProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final newItems = await client.fetchItems(page: page, limit: maxQueueSize);
-      items.addAll(newItems);
-      // Remove duplicates and played items
-      final seen = <String>{};
-      items.retainWhere(
-        (item) => seen.add(item.id) && !_playedIds.contains(item.id),
+      await _loadPendingPlayedIds();
+      await _syncPendingPlayedIds();
+      final requestedPage = page;
+      final newItems = await client.fetchItems(
+        page: requestedPage,
+        limit: maxQueueSize,
       );
-
-      // Backend returns DESC (newest first). We sort ASC (oldest first) so playback is chronological.
-      items.sort((a, b) => (a.publishTime ?? 0).compareTo(b.publishTime ?? 0));
-      page++;
-      await audioHandler.updateQueueWithItems(items);
+      items.addAll(newItems);
+      _normalizeQueue();
+      page = requestedPage + 1;
+      await audioHandler.updateQueueWithItems(
+        items,
+        onTrackCompleted: _onTrackCompleted,
+        playbackMode: QueuePlaybackMode.dynamicContinuous,
+      );
     } catch (e) {
       debugPrint("Error fetching items: $e");
     } finally {
       isLoading = false;
       notifyListeners();
+    }
+  }
+
+  void _normalizeQueue({bool trimToMax = false}) {
+    final seen = <String>{};
+    items.retainWhere(
+      (item) => seen.add(item.id) && !_playedIds.contains(item.id),
+    );
+    items.sort(_compareItemsByPlaybackOrder);
+    if (trimToMax && items.length > maxQueueSize) {
+      items.removeRange(maxQueueSize, items.length);
+    }
+  }
+
+  int _compareItemsByPlaybackOrder(Item a, Item b) {
+    final byTime = _queueTime(a).compareTo(_queueTime(b));
+    if (byTime != 0) return byTime;
+    return a.id.compareTo(b.id);
+  }
+
+  int _queueTime(Item item) => item.publishTime ?? item.createdAt ?? 0;
+
+  Future<void> playDay(List<Item> dayItems, {String? startItemId}) async {
+    final queueItems =
+        dayItems
+            .where((item) => item.audioUrl?.trim().isNotEmpty ?? false)
+            .toList()
+          ..sort(_compareItemsByPlaybackOrder);
+    if (queueItems.isEmpty) return;
+
+    final startIndex = startItemId == null
+        ? 0
+        : queueItems.indexWhere((item) => item.id == startItemId);
+    final safeIndex = startIndex >= 0 ? startIndex : 0;
+
+    await audioHandler.updateQueueWithItems(
+      queueItems,
+      onTrackCompleted: _onDayPlaylistTrackCompleted,
+      playbackMode: QueuePlaybackMode.staticPlaylist,
+    );
+    await audioHandler.skipToQueueItem(safeIndex);
+    await audioHandler.play();
+  }
+
+  Future<void> playWholeQueue({String? startItemId}) async {
+    if (items.isEmpty) return;
+    final queueItems = [...items]..sort(_compareItemsByPlaybackOrder);
+    final startIndex = startItemId == null
+        ? 0
+        : queueItems.indexWhere((item) => item.id == startItemId);
+    final safeIndex = startIndex >= 0 ? startIndex : 0;
+
+    await audioHandler.updateQueueWithItems(
+      queueItems,
+      onTrackCompleted: _onTrackCompleted,
+      playbackMode: QueuePlaybackMode.dynamicContinuous,
+    );
+    await audioHandler.skipToQueueItem(safeIndex);
+    await audioHandler.play();
+  }
+
+  Future<void> _onDayPlaylistTrackCompleted(String itemId) async {
+    await _rememberPlayed(itemId);
+    items.removeWhere((item) => item.id == itemId);
+    notifyListeners();
+
+    if (items.length < maxQueueSize) {
+      unawaited(_backfill());
     }
   }
 }

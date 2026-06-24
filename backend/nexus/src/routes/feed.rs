@@ -8,7 +8,7 @@ use serde_json::json;
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{personalization, AppState};
 
 const MAX_TITLE_LENGTH: usize = 500;
 const MAX_URL_LENGTH: usize = 2048;
@@ -16,7 +16,7 @@ const MAX_BODY_LENGTH: usize = 2_000_000;
 const MIN_LIMIT: i64 = 1;
 const MAX_LIMIT: i64 = 100;
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct FeedItem {
     pub id: String,
     pub product_line: String,
@@ -238,6 +238,444 @@ fn prefer_non_empty(incoming: Option<String>, existing: Option<String>) -> Optio
         .or(existing)
 }
 
+#[derive(Clone, Copy)]
+enum MathTextMode {
+    Markdown,
+    Plain,
+}
+
+fn normalize_math_for_markdown(text: &str) -> String {
+    normalize_math_fragments(text, MathTextMode::Markdown)
+}
+
+fn normalize_math_for_plain_text(text: &str) -> String {
+    normalize_math_fragments(text, MathTextMode::Plain)
+}
+
+fn remove_orphan_dollar_markers(text: &str) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut cleaned = String::with_capacity(text.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index] == '$' {
+            let mut end = index + 1;
+            let mut digit_count = 0usize;
+            while end < chars.len() && digit_count < 2 && chars[end].is_ascii_digit() {
+                end += 1;
+                digit_count += 1;
+            }
+
+            if digit_count > 0 {
+                let next = chars.get(end).copied();
+                let next_is_money =
+                    next.is_some_and(|ch| ch.is_ascii_digit() || ch == ',' || ch == '.');
+                if !next_is_money {
+                    let previous = cleaned.chars().last();
+                    let previous_is_inline =
+                        previous.is_some_and(|ch| !ch.is_whitespace() && ch != '$');
+                    let previous_is_boundary = previous
+                        .map(|ch| !ch.is_alphanumeric() && ch != '$')
+                        .unwrap_or(true);
+                    let mut next_significant = end;
+                    while chars
+                        .get(next_significant)
+                        .is_some_and(|ch| ch.is_whitespace())
+                    {
+                        next_significant += 1;
+                    }
+                    let followed_by_terminal = chars
+                        .get(next_significant)
+                        .map(|ch| is_terminal_after_dollar_marker(*ch))
+                        .unwrap_or(true);
+
+                    if previous_is_inline || (previous_is_boundary && followed_by_terminal) {
+                        index = end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        cleaned.push(chars[index]);
+        index += 1;
+    }
+
+    cleaned
+}
+
+fn is_terminal_after_dollar_marker(ch: char) -> bool {
+    matches!(
+        ch,
+        ')' | ']'
+            | '}'
+            | '。'
+            | '！'
+            | '？'
+            | '；'
+            | '，'
+            | '、'
+            | ','
+            | '.'
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+    )
+}
+
+fn normalize_math_fragments(text: &str, mode: MathTextMode) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(text.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index] == '`' {
+            let mut end = index + 1;
+            while end < chars.len() && chars[end] != '`' {
+                end += 1;
+            }
+            if end < chars.len() {
+                normalized.extend(chars[index..=end].iter());
+                index = end + 1;
+                continue;
+            }
+        }
+
+        if chars[index] == '$' {
+            let is_block = chars.get(index + 1) == Some(&'$');
+            let offset = if is_block { 2 } else { 1 };
+            let start = index + offset;
+            if let Some(end) = find_matching_dollar(&chars, start, is_block) {
+                let fragment = chars[start..end].iter().collect::<String>();
+                if is_block || looks_like_math_fragment(&fragment) {
+                    let cleaned = cleanup_latex_expression(&fragment);
+                    if !cleaned.is_empty() {
+                        match mode {
+                            MathTextMode::Markdown => {
+                                normalized.push('`');
+                                normalized.push_str(&cleaned);
+                                normalized.push('`');
+                            }
+                            MathTextMode::Plain => normalized.push_str(&cleaned),
+                        }
+                        index = end + offset;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        normalized.push(chars[index]);
+        index += 1;
+    }
+
+    normalized
+}
+
+fn find_matching_dollar(chars: &[char], start: usize, is_block: bool) -> Option<usize> {
+    let mut index = start;
+    while index < chars.len() {
+        if chars[index] == '\\' {
+            index += 2;
+            continue;
+        }
+        if chars[index] == '$' {
+            if is_block {
+                if chars.get(index + 1) == Some(&'$') {
+                    return Some(index);
+                }
+            } else {
+                return Some(index);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn looks_like_math_fragment(fragment: &str) -> bool {
+    let trimmed = fragment.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('\\')
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains('^')
+        || trimmed.contains('_')
+    {
+        return true;
+    }
+    if trimmed.chars().all(|ch| ch.is_ascii_alphanumeric()) && trimmed.len() <= 4 {
+        return true;
+    }
+    trimmed
+        .chars()
+        .any(|ch| matches!(ch, '=' | '<' | '>' | '≤' | '≥' | '≈' | '≲' | '≳'))
+}
+
+fn cleanup_latex_expression(fragment: &str) -> String {
+    let mut normalized = replace_latex_structures(fragment.trim());
+    for (from, to) in [
+        ("\\left", ""),
+        ("\\right", ""),
+        ("\\,", " "),
+        ("\\;", " "),
+        ("\\:", " "),
+        ("\\!", ""),
+        ("\\cdot", "·"),
+        ("\\times", "×"),
+        ("\\approx", "≈"),
+        ("\\lesssim", "≲"),
+        ("\\gtrsim", "≳"),
+        ("\\leq", "≤"),
+        ("\\le", "≤"),
+        ("\\geq", "≥"),
+        ("\\ge", "≥"),
+        ("\\neq", "≠"),
+        ("\\sim", "~"),
+        ("\\pi", "π"),
+        ("\\alpha", "α"),
+        ("\\beta", "β"),
+        ("\\gamma", "γ"),
+        ("\\delta", "δ"),
+        ("\\theta", "θ"),
+        ("\\lambda", "λ"),
+        ("\\mu", "μ"),
+        ("\\sigma", "σ"),
+        ("\\phi", "φ"),
+        ("\\omega", "ω"),
+        ("\\sin", "sin"),
+        ("\\cos", "cos"),
+        ("\\tan", "tan"),
+        ("\\log", "log"),
+        ("\\ln", "ln"),
+        ("\\exp", "exp"),
+        ("\\min", "min"),
+        ("\\max", "max"),
+    ] {
+        normalized = normalized.replace(from, to);
+    }
+
+    let chars = normalized.chars().collect::<Vec<_>>();
+    let mut cleaned = String::with_capacity(normalized.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if matches_command(&chars, index, "\\operatorname")
+            || matches_command(&chars, index, "\\text")
+            || matches_command(&chars, index, "\\mathrm")
+            || matches_command(&chars, index, "\\mathbb")
+            || matches_command(&chars, index, "\\mathbf")
+            || matches_command(&chars, index, "\\mathcal")
+        {
+            let command_len = command_length_at(&chars, index);
+            if let Some((group, next_index)) = parse_braced_group(&chars, index + command_len) {
+                cleaned.push_str(&cleanup_latex_expression(&group));
+                index = next_index;
+                continue;
+            }
+        }
+
+        if chars[index] == '\\' {
+            let mut next = index + 1;
+            while next < chars.len() && chars[next].is_ascii_alphabetic() {
+                next += 1;
+            }
+            if next > index + 1 {
+                cleaned.extend(chars[index + 1..next].iter());
+                index = next;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+
+        match chars[index] {
+            '{' => cleaned.push('('),
+            '}' => cleaned.push(')'),
+            _ => cleaned.push(chars[index]),
+        }
+        index += 1;
+    }
+
+    cleaned
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+fn replace_latex_structures(fragment: &str) -> String {
+    let chars = fragment.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(fragment.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if matches_command(&chars, index, "\\frac") {
+            let start = index + "\\frac".chars().count();
+            if let Some((numerator, next_index)) = parse_braced_group(&chars, start) {
+                if let Some((denominator, final_index)) = parse_braced_group(&chars, next_index) {
+                    normalized.push_str(&cleanup_latex_expression(&numerator));
+                    normalized.push_str(" / ");
+                    normalized.push_str(&cleanup_latex_expression(&denominator));
+                    index = final_index;
+                    continue;
+                }
+            }
+        }
+
+        if matches_command(&chars, index, "\\sqrt") {
+            let start = index + "\\sqrt".chars().count();
+            if let Some((body, next_index)) = parse_braced_group(&chars, start) {
+                normalized.push_str("sqrt(");
+                normalized.push_str(&cleanup_latex_expression(&body));
+                normalized.push(')');
+                index = next_index;
+                continue;
+            }
+        }
+
+        normalized.push(chars[index]);
+        index += 1;
+    }
+
+    normalized
+}
+
+fn parse_braced_group(chars: &[char], start: usize) -> Option<(String, usize)> {
+    if chars.get(start) != Some(&'{') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut index = start;
+    let mut group = String::new();
+
+    while index < chars.len() {
+        let ch = chars[index];
+        match ch {
+            '{' => {
+                depth += 1;
+                if depth > 1 {
+                    group.push(ch);
+                }
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((group, index + 1));
+                }
+                group.push(ch);
+            }
+            _ => group.push(ch),
+        }
+        index += 1;
+    }
+
+    None
+}
+
+fn matches_command(chars: &[char], start: usize, command: &str) -> bool {
+    let command_chars = command.chars().collect::<Vec<_>>();
+    chars.get(start..start + command_chars.len()) == Some(command_chars.as_slice())
+}
+
+fn command_length_at(chars: &[char], start: usize) -> usize {
+    let mut index = start;
+    if chars.get(index) == Some(&'\\') {
+        index += 1;
+    }
+    while chars.get(index).is_some_and(|ch| ch.is_ascii_alphabetic()) {
+        index += 1;
+    }
+    index - start
+}
+
+fn normalize_block_text(text: &str, mode: MathTextMode) -> String {
+    let normalized = match mode {
+        MathTextMode::Markdown => normalize_math_for_markdown(text),
+        MathTextMode::Plain => normalize_math_for_plain_text(text),
+    };
+
+    remove_orphan_dollar_markers(&normalized)
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\n\n\n", "\n\n")
+        .trim()
+        .to_string()
+}
+
+fn normalize_key_points_json(value: &Option<String>) -> Option<String> {
+    let raw = value.as_deref()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(points) => {
+            let points = points
+                .into_iter()
+                .map(|point| normalize_block_text(&point, MathTextMode::Plain))
+                .filter(|point| !point.trim().is_empty())
+                .collect::<Vec<_>>();
+            serde_json::to_string(&points).ok()
+        }
+        Err(_) => Some(raw.to_string()),
+    }
+}
+
+fn normalize_feed_item_content(content: &FeedItemContentPayload) -> FeedItemContentPayload {
+    FeedItemContentPayload {
+        original_html: content.original_html.clone(),
+        reader_markdown: content.reader_markdown.clone(),
+        plain_text: content.plain_text.clone(),
+        compressed_markdown: content
+            .compressed_markdown
+            .as_deref()
+            .map(|value| normalize_block_text(value, MathTextMode::Markdown)),
+        audio_script: content
+            .audio_script
+            .as_deref()
+            .map(|value| normalize_block_text(value, MathTextMode::Plain)),
+        key_points_json: normalize_key_points_json(&content.key_points_json),
+    }
+}
+
+fn normalize_feed_item_content_response(content: FeedItemContent) -> FeedItemContent {
+    FeedItemContent {
+        compressed_markdown: content
+            .compressed_markdown
+            .as_deref()
+            .map(|value| normalize_block_text(value, MathTextMode::Markdown)),
+        audio_script: content
+            .audio_script
+            .as_deref()
+            .map(|value| normalize_block_text(value, MathTextMode::Plain)),
+        key_points_json: normalize_key_points_json(&content.key_points_json),
+        ..content
+    }
+}
+
+fn normalize_weekly_digest(digest: WeeklyDigest) -> WeeklyDigest {
+    WeeklyDigest {
+        digest_markdown: digest
+            .digest_markdown
+            .as_deref()
+            .map(|value| normalize_block_text(value, MathTextMode::Markdown)),
+        audio_script: digest
+            .audio_script
+            .as_deref()
+            .map(|value| normalize_block_text(value, MathTextMode::Plain)),
+        ..digest
+    }
+}
+
 fn validate_content(
     content: &Option<FeedItemContentPayload>,
 ) -> Result<(), axum::response::Response> {
@@ -314,6 +752,7 @@ async fn upsert_content(
     content: &FeedItemContentPayload,
     now: i64,
 ) -> Result<(), sqlx::Error> {
+    let content = normalize_feed_item_content(content);
     sqlx::query(
         r#"
         INSERT INTO feed_item_contents (
@@ -348,9 +787,24 @@ async fn upsert_content(
 
 pub async fn list_feed_items(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(pagination): Query<FeedPagination>,
 ) -> impl IntoResponse {
+    let requested_user = headers
+        .get("x-user-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let (limit, offset) = sanitize_pagination(pagination.page, pagination.limit);
+    let (query_limit, query_offset) = if requested_user.is_some() {
+        (
+            personalization::recommended_candidate_limit(limit, offset),
+            0,
+        )
+    } else {
+        (limit, offset)
+    };
     let product_line = pagination
         .product_line
         .unwrap_or_else(|| "curated_feed".to_string());
@@ -370,8 +824,8 @@ pub async fn list_feed_items(
             .bind(product_line)
             .bind(item_type)
             .bind(primary_mode)
-            .bind(limit)
-            .bind(offset)
+            .bind(query_limit)
+            .bind(query_offset)
             .fetch_all(&state.db)
             .await
         }
@@ -386,8 +840,8 @@ pub async fn list_feed_items(
             )
             .bind(product_line)
             .bind(item_type)
-            .bind(limit)
-            .bind(offset)
+            .bind(query_limit)
+            .bind(query_offset)
             .fetch_all(&state.db)
             .await
         }
@@ -402,8 +856,8 @@ pub async fn list_feed_items(
             )
             .bind(product_line)
             .bind(primary_mode)
-            .bind(limit)
-            .bind(offset)
+            .bind(query_limit)
+            .bind(query_offset)
             .fetch_all(&state.db)
             .await
         }
@@ -417,15 +871,35 @@ pub async fn list_feed_items(
                 "#,
             )
             .bind(product_line)
-            .bind(limit)
-            .bind(offset)
+            .bind(query_limit)
+            .bind(query_offset)
             .fetch_all(&state.db)
             .await
         }
     };
 
     match result {
-        Ok(items) => Json(items).into_response(),
+        Ok(items) => {
+            let items = if let Some(user_id) = requested_user.as_deref() {
+                let fallback_items = items.clone();
+                match personalization::personalize_feed_items(&state, user_id, items).await {
+                    Ok(items) => items,
+                    Err(_) => fallback_items,
+                }
+            } else {
+                items
+            };
+            let items = if requested_user.is_some() {
+                items
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect::<Vec<_>>()
+            } else {
+                items
+            };
+            Json(items).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -446,6 +920,35 @@ pub async fn get_feed_item(
     }
 }
 
+pub async fn get_feed_item_why(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = headers
+        .get("x-user-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    let result = sqlx::query_as::<_, FeedItem>("SELECT * FROM feed_items WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await;
+
+    match result {
+        Ok(Some(item)) => match personalization::explain_feed_item(&state, user_id, &item).await {
+            Ok(response) => Json(response).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 pub async fn get_feed_item_content(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -457,7 +960,7 @@ pub async fn get_feed_item_content(
             .await;
 
     match result {
-        Ok(Some(content)) => Json(content).into_response(),
+        Ok(Some(content)) => Json(normalize_feed_item_content_response(content)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -647,7 +1150,13 @@ pub async fn list_weekly_digests(State(state): State<AppState>) -> impl IntoResp
     .await;
 
     match result {
-        Ok(digests) => Json(digests).into_response(),
+        Ok(digests) => Json(
+            digests
+                .into_iter()
+                .map(normalize_weekly_digest)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -662,7 +1171,7 @@ pub async fn get_weekly_digest(
         .await;
 
     match result {
-        Ok(Some(digest)) => Json(digest).into_response(),
+        Ok(Some(digest)) => Json(normalize_weekly_digest(digest)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -728,9 +1237,11 @@ pub async fn create_weekly_digest(
             let next_digest_markdown = prefer_non_empty(
                 payload.digest_markdown.clone(),
                 digest.digest_markdown.clone(),
-            );
+            )
+            .map(|value| normalize_block_text(&value, MathTextMode::Markdown));
             let next_audio_script =
-                prefer_non_empty(payload.audio_script.clone(), digest.audio_script.clone());
+                prefer_non_empty(payload.audio_script.clone(), digest.audio_script.clone())
+                    .map(|value| normalize_block_text(&value, MathTextMode::Plain));
             let next_audio_url =
                 prefer_non_empty(payload.audio_url.clone(), digest.audio_url.clone());
             let next_duration_sec = payload.duration_sec.or(digest.duration_sec);
@@ -866,8 +1377,18 @@ pub async fn create_weekly_digest(
     .bind(payload.week_start)
     .bind(payload.week_end)
     .bind(&payload.title)
-    .bind(&payload.digest_markdown)
-    .bind(&payload.audio_script)
+    .bind(
+        &payload
+            .digest_markdown
+            .as_deref()
+            .map(|value| normalize_block_text(value, MathTextMode::Markdown)),
+    )
+    .bind(
+        &payload
+            .audio_script
+            .as_deref()
+            .map(|value| normalize_block_text(value, MathTextMode::Plain)),
+    )
     .bind(&payload.audio_url)
     .bind(payload.duration_sec)
     .bind(&payload.included_item_ids_json)
@@ -946,6 +1467,58 @@ mod tests {
         };
 
         assert!(validate_feed_item(&payload).is_ok());
+    }
+
+    #[test]
+    fn normalizes_latex_math_without_touching_currency_text() {
+        let markdown = "拉普拉斯极限 $e \\approx 0.6627$；标题保留 StubZero: $148,337 RCE。";
+        let normalized_markdown = normalize_block_text(markdown, MathTextMode::Markdown);
+        assert!(normalized_markdown.contains("`e ≈ 0.6627`"));
+        assert!(normalized_markdown.contains("StubZero: $148,337 RCE"));
+        assert!(!normalized_markdown.contains("$e"));
+
+        let plain = normalize_block_text(markdown, MathTextMode::Plain);
+        assert!(plain.contains("e ≈ 0.6627"));
+        assert!(plain.contains("StubZero: $148,337 RCE"));
+        assert!(!plain.contains("`e"));
+    }
+
+    #[test]
+    fn normalizes_content_payload_math_fragments() {
+        let content = FeedItemContentPayload {
+            original_html: None,
+            reader_markdown: None,
+            plain_text: None,
+            compressed_markdown: Some("公式 $M = E - e \\sin E$".to_string()),
+            audio_script: Some("收听版讲 $e \\lesssim 0.6627$".to_string()),
+            key_points_json: Some(
+                serde_json::to_string(&vec!["边界 $e$".to_string()]).unwrap_or_default(),
+            ),
+        };
+
+        let normalized = normalize_feed_item_content(&content);
+        assert_eq!(
+            normalized.compressed_markdown.as_deref(),
+            Some("公式 `M = E - e sin E`")
+        );
+        assert_eq!(
+            normalized.audio_script.as_deref(),
+            Some("收听版讲 e ≲ 0.6627")
+        );
+        assert_eq!(normalized.key_points_json.as_deref(), Some("[\"边界 e\"]"));
+    }
+
+    #[test]
+    fn removes_orphan_capture_markers_but_keeps_money() {
+        let text = "这里$1有残片，括号（$2）。价格 $148,337、$1.99 和 $1 per month 保留。";
+        let normalized = normalize_block_text(text, MathTextMode::Markdown);
+
+        assert!(normalized.contains("这里有残片"));
+        assert!(normalized.contains("括号（）。"));
+        assert!(normalized.contains("$148,337"));
+        assert!(normalized.contains("$1.99"));
+        assert!(normalized.contains("$1 per month"));
+        assert!(!normalized.contains("这里$1"));
     }
 }
 

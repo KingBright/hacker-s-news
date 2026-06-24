@@ -5,4 +5,6 @@ pub mod feed;
 pub mod history;
 pub mod internal_api;
 pub mod items;
+pub mod loops;
+pub mod memory;
 pub mod upload;

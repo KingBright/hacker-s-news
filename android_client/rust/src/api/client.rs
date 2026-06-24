@@ -33,48 +33,83 @@ impl FreshLoopClient {
     }
 
     pub async fn login(&self, username: String, password: String) -> anyhow::Result<User> {
-        let resp = self.client.post(format!("{}/api/auth/login", self.base_url))
+        let resp = self
+            .client
+            .post(format!("{}/api/auth/login", self.base_url))
             .json(&serde_json::json!({ "username": username, "password": password }))
             .send()
             .await?;
-            
+
         if !resp.status().is_success() {
-            return Err(anyhow::anyhow!("Authentication failed (HTTP {})", resp.status()));
+            return Err(anyhow::anyhow!(
+                "Authentication failed (HTTP {})",
+                resp.status()
+            ));
         }
-            
+
         let text = resp.text().await?;
         let user: User = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("Login failed: {} \nResp: {}", e, text))?;
-            
+
         self.set_user_id(Some(user.id.clone()));
         Ok(user)
     }
 
     pub async fn fetch_items(&self, page: u32, limit: u32) -> anyhow::Result<Vec<Item>> {
-        let mut req = self.client.get(format!("{}/api/items?page={}&limit={}", self.base_url, page, limit));
-        
+        let mut req = self.client.get(format!(
+            "{}/api/items?page={}&limit={}",
+            self.base_url, page, limit
+        ));
+
         let uid_opt = self.user_id.read().ok().and_then(|lock| lock.clone());
         if let Some(uid) = uid_opt {
             req = req.header("x-user-id", uid);
         }
-        
+
         let resp = req.send().await?;
+        let status = resp.status();
         let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Fetch items failed (HTTP {}): {}",
+                status,
+                text
+            ));
+        }
+
         let items: Vec<Item> = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("JSON parse error: {} \nResp: {}", e, text))?;
-        
+
         Ok(items)
     }
 
     pub async fn mark_as_played(&self, id: String) -> anyhow::Result<()> {
         let uid_opt = self.user_id.read().ok().and_then(|lock| lock.clone());
-        if let Some(uid) = uid_opt {
-            self.client.post(format!("{}/api/history", self.base_url))
-                .header("x-user-id", uid)
-                .json(&serde_json::json!({ "item_id": id }))
-                .send()
-                .await?;
+        let Some(uid) = uid_opt else {
+            return Err(anyhow::anyhow!(
+                "Cannot mark item {} as played without a user id",
+                id
+            ));
+        };
+
+        let resp = self
+            .client
+            .post(format!("{}/api/history", self.base_url))
+            .header("x-user-id", uid)
+            .json(&serde_json::json!({ "item_id": id }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Mark played failed for item {} (HTTP {}): {}",
+                id,
+                status,
+                text
+            ));
         }
+
         Ok(())
     }
 }

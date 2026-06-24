@@ -83,6 +83,27 @@ if [ ! -f "$BINARY_SOURCE" ]; then
     exit 1
 fi
 
+if [ "${SKIP_TTS_ASR_LOOP:-0}" = "1" ]; then
+    echo ""
+    echo ">>> WARNING: Skipping deployment-blocking TTS ASR loop because SKIP_TTS_ASR_LOOP=1"
+else
+    echo ""
+    echo ">>> Running deployment-blocking TTS ASR loop..."
+    export PATH="/opt/homebrew/bin:$HOME/.local/bin:$HOME/Library/pnpm:$PATH"
+    export ORT_DYLIB_PATH="$WORK_DIR/backend/onnxruntime-osx-arm64-1.19.2/lib/libonnxruntime.dylib"
+    UV_BIN="${UV_BIN:-$(command -v uv || true)}"
+    if [ -z "$UV_BIN" ]; then
+        echo "ERROR: uv is required for the ASR loop. Install uv or set UV_BIN."
+        exit 1
+    fi
+    "$UV_BIN" run \
+        --with SpeechRecognition \
+        --with pypinyin \
+        "$WORK_DIR/scripts/verify_tts_asr_loop.py" \
+        --binary "$BINARY_SOURCE" \
+        --config "$CONFIG_SOURCE"
+fi
+
 # 3. Setup executable
 echo ""
 echo ">>> Setting up executable..."
@@ -121,6 +142,8 @@ cat <<EOF > "$PLIST_PATH"
         <string>info</string>
         <key>HOME</key>
         <string>$SERVICE_HOME</string>
+        <key>ORT_DYLIB_PATH</key>
+        <string>$WORK_DIR/backend/onnxruntime-osx-arm64-1.19.2/lib/libonnxruntime.dylib</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

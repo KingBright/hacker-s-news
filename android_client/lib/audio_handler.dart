@@ -12,6 +12,8 @@ import 'package:android_client/src/rust/models.dart';
 /// Callback invoked when a track finishes playing.
 typedef OnTrackCompleted = FutureOr<void> Function(String itemId);
 
+enum QueuePlaybackMode { dynamicContinuous, staticPlaylist }
+
 class FreshLoopAudioHandler extends BaseAudioHandler
     with QueueHandler, SeekHandler {
   final _player = AudioPlayer();
@@ -66,9 +68,8 @@ class FreshLoopAudioHandler extends BaseAudioHandler
   String? _currentItemId;
   DateTime? _lastBookmarkSaveAt;
   SharedPreferences? _prefs;
-
-  /// External callback so FeedProvider can remove the item from queue.
-  OnTrackCompleted? onTrackCompleted;
+  OnTrackCompleted? _queueCompletionHandler;
+  QueuePlaybackMode _queuePlaybackMode = QueuePlaybackMode.dynamicContinuous;
 
   FreshLoopAudioHandler(this.client, this.baseUrl) {
     _init();
@@ -209,11 +210,7 @@ class FreshLoopAudioHandler extends BaseAudioHandler
       final nextItem = _nextItemAfter(completedId, queue.value);
       await _clearPlaybackBookmarkIfAvailable(itemId: completedId);
 
-      client.markAsPlayed(id: completedId).catchError((e) {
-        debugPrint("Failed to mark as played: $e");
-      });
-
-      final callback = onTrackCompleted;
+      final callback = _queueCompletionHandler;
       if (callback != null) {
         await callback(completedId);
       }
@@ -221,7 +218,9 @@ class FreshLoopAudioHandler extends BaseAudioHandler
       final updatedQueue = queue.value;
       final target = nextItem != null && _containsId(updatedQueue, nextItem.id)
           ? nextItem
-          : updatedQueue.where((item) => item.id != completedId).firstOrNull;
+          : _queuePlaybackMode == QueuePlaybackMode.dynamicContinuous
+          ? updatedQueue.where((item) => item.id != completedId).firstOrNull
+          : null;
 
       if (target != null) {
         await _playMediaItem(target);
@@ -396,7 +395,14 @@ class FreshLoopAudioHandler extends BaseAudioHandler
     }
   }
 
-  Future<void> updateQueueWithItems(List<Item> items) async {
+  Future<void> updateQueueWithItems(
+    List<Item> items, {
+    OnTrackCompleted? onTrackCompleted,
+    QueuePlaybackMode playbackMode = QueuePlaybackMode.dynamicContinuous,
+  }) async {
+    _queueCompletionHandler = onTrackCompleted;
+    _queuePlaybackMode = playbackMode;
+
     final List<MediaItem> mediaItems = items
         .map(
           (item) => MediaItem(
@@ -690,6 +696,11 @@ class FreshLoopAudioHandler extends BaseAudioHandler
     final category = item.category?.trim();
     if (category != null && category.isNotEmpty) {
       extras['category'] = category;
+    }
+
+    final originalUrl = item.originalUrl?.trim();
+    if (originalUrl != null && originalUrl.isNotEmpty) {
+      extras['original_url'] = originalUrl;
     }
 
     return extras;
