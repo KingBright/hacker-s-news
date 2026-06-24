@@ -565,30 +565,21 @@ class _RadioFeedList extends StatelessWidget {
                 onRefresh: provider.refresh,
                 isLoading: provider.isLoading && provider.items.isEmpty,
               ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        '按天处理',
-                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                          fontWeight: FontWeight.w900,
-                        ),
+              if (provider.items.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      onPressed: () => provider.playWholeQueue(),
+                      style: TextButton.styleFrom(
+                        foregroundColor: AppTheme.primaryGreen,
                       ),
+                      icon: const Icon(Icons.play_circle_fill_rounded),
+                      label: const Text('全部播放'),
                     ),
-                    if (provider.items.isNotEmpty)
-                      TextButton.icon(
-                        onPressed: () => provider.playWholeQueue(),
-                        style: TextButton.styleFrom(
-                          foregroundColor: AppTheme.primaryGreen,
-                        ),
-                        icon: const Icon(Icons.play_circle_fill_rounded),
-                        label: const Text('全部播放'),
-                      ),
-                  ],
+                  ),
                 ),
-              ),
               if (provider.dayGroups.isEmpty && !provider.isLoading)
                 const Padding(
                   padding: EdgeInsets.all(24),

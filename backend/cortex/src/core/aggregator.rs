@@ -7,9 +7,12 @@ use crate::core::topic_registry::TopicRegistry;
 use crate::core::tts::TtsClient;
 use anyhow::Result;
 use chinese_lunisolar_calendar::LunisolarDate;
+use chrono::{Datelike, NaiveDate, Weekday};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+const TTS_DRAFT_CACHE_VERSION: &str = "episode-date-context-v2";
 
 // --- Trace Logger ---
 #[derive(Debug, serde::Serialize)]
@@ -19,6 +22,158 @@ struct TraceStep {
     details: String,
     llm_prompt: Option<String>,
     llm_response: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EpisodeDateContext {
+    prompt_block: String,
+    run_of_show_line: String,
+}
+
+fn build_episode_date_context(date: NaiveDate) -> EpisodeDateContext {
+    let date_label = format!(
+        "{}年{}月{}日，{}",
+        date.year(),
+        date.month(),
+        date.day(),
+        weekday_label(date.weekday())
+    );
+
+    let (status, guidance) = if let Some(name) = official_holiday_name(date) {
+        (
+            format!("今天属于{}", name),
+            format!(
+                "开场可以自然融入{}的时间感，但不要把今天说成工作日，也不要编造素材外的出行、天气或活动安排",
+                name
+            ),
+        )
+    } else if let Some(name) = adjusted_workday_name(date) {
+        (
+            format!("今天是{}", name),
+            "如需提及，只能说调休工作日；不要说成普通周末，也不要硬套休息日语气".to_string(),
+        )
+    } else {
+        let festival_names = traditional_festival_names(date);
+        if !festival_names.is_empty() {
+            let names = festival_names.join("、");
+            (
+                format!("今天是{}", names),
+                format!(
+                    "开场可以轻轻带到{}，但不要把它扩写成未提供的公共假期安排",
+                    names
+                ),
+            )
+        } else if matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
+            (
+                "今天是周末".to_string(),
+                "开场可以更从容，但不要说今天是工作日，也不要硬套通勤早高峰".to_string(),
+            )
+        } else {
+            (
+                "今天没有已知节假日背景".to_string(),
+                "不需要强行说工作日；可以只报日期，或直接进入新闻".to_string(),
+            )
+        }
+    };
+
+    let prompt_block = format!("日期语境：{}；{}。{}", date_label, status, guidance);
+    let run_of_show_line = format!("{}；{}", date_label, status);
+
+    EpisodeDateContext {
+        prompt_block,
+        run_of_show_line,
+    }
+}
+
+fn weekday_label(weekday: Weekday) -> &'static str {
+    match weekday {
+        Weekday::Mon => "周一",
+        Weekday::Tue => "周二",
+        Weekday::Wed => "周三",
+        Weekday::Thu => "周四",
+        Weekday::Fri => "周五",
+        Weekday::Sat => "周六",
+        Weekday::Sun => "周日",
+    }
+}
+
+fn official_holiday_name(date: NaiveDate) -> Option<&'static str> {
+    if date.year() != 2026 {
+        return None;
+    }
+
+    if date_in_range(date, 2026, 1, 1, 1, 3) {
+        Some("元旦假期")
+    } else if date_in_range(date, 2026, 2, 15, 2, 23) {
+        Some("春节假期")
+    } else if date_in_range(date, 2026, 4, 4, 4, 6) {
+        Some("清明假期")
+    } else if date_in_range(date, 2026, 5, 1, 5, 5) {
+        Some("劳动节假期")
+    } else if date_in_range(date, 2026, 6, 19, 6, 21) {
+        Some("端午假期")
+    } else if date_in_range(date, 2026, 9, 25, 9, 27) {
+        Some("中秋假期")
+    } else if date_in_range(date, 2026, 10, 1, 10, 7) {
+        Some("国庆假期")
+    } else {
+        None
+    }
+}
+
+fn adjusted_workday_name(date: NaiveDate) -> Option<&'static str> {
+    let is_adjusted_workday = matches!(
+        (date.year(), date.month(), date.day()),
+        (2026, 1, 4)
+            | (2026, 2, 14)
+            | (2026, 2, 28)
+            | (2026, 5, 9)
+            | (2026, 9, 20)
+            | (2026, 10, 10)
+    );
+
+    if is_adjusted_workday {
+        Some("调休工作日")
+    } else {
+        None
+    }
+}
+
+fn traditional_festival_names(date: NaiveDate) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    match (date.month(), date.day()) {
+        (1, 1) => names.push("元旦"),
+        (5, 1) => names.push("劳动节"),
+        (10, 1) => names.push("国庆节"),
+        _ => {}
+    }
+
+    if let Ok(lunar) = LunisolarDate::from_date(date) {
+        let lunar_month = lunar.to_lunar_month().to_u8();
+        let lunar_day = lunar.to_lunar_day().to_u8();
+        match (lunar_month, lunar_day) {
+            (1, 1) => names.push("春节"),
+            (1, 15) => names.push("元宵节"),
+            (5, 5) => names.push("端午节"),
+            (8, 15) => names.push("中秋节"),
+            _ => {}
+        }
+    }
+
+    names
+}
+
+fn date_in_range(
+    date: NaiveDate,
+    year: i32,
+    start_month: u32,
+    start_day: u32,
+    end_month: u32,
+    end_day: u32,
+) -> bool {
+    let start = NaiveDate::from_ymd_opt(year, start_month, start_day).unwrap();
+    let end = NaiveDate::from_ymd_opt(year, end_month, end_day).unwrap();
+    (start..=end).contains(&date)
 }
 
 pub struct TraceLogger {
@@ -949,8 +1104,8 @@ impl NewsAggregator {
         let host_name = host.map(|h| h.name.clone()).unwrap_or("主播".to_string());
         let host_voice = host.map(|h| h.voice.clone());
 
-        // 2. Resolve Holiday Context
-        let holiday_context = self.get_holiday_context();
+        // 2. Resolve date context once so prompts, traces, and cache keys agree.
+        let date_context = self.get_episode_date_context();
 
         // Initialize Tracer
         let logger = Arc::new(Mutex::new(TraceLogger::new(category)));
@@ -992,6 +1147,8 @@ impl NewsAggregator {
             if !is_regen {
                 // Generate a deterministic hash from the sorted URLs of the items
                 let mut hasher = twox_hash::XxHash64::with_seed(0);
+                hasher.write(TTS_DRAFT_CACHE_VERSION.as_bytes());
+                hasher.write(date_context.prompt_block.as_bytes());
                 let mut urls: Vec<String> =
                     item_list.iter().map(|i| i.original_url.clone()).collect();
                 urls.sort();
@@ -1093,7 +1250,7 @@ impl NewsAggregator {
                     &host_name,
                     &all_items,
                     &plans,
-                    &holiday_context,
+                    &date_context,
                     logger.clone(),
                     Some(tx.clone()),
                 )
@@ -1131,8 +1288,7 @@ impl NewsAggregator {
             (script, title)
         } else {
             // No Items (Regen or legacy fallback): Use simple prompt
-            let prompt =
-                self.build_prompt(category, &host_name, context, &holiday_context, is_regen);
+            let prompt = self.build_prompt(category, &host_name, context, &date_context, is_regen);
             let response = self.llm.chat(&prompt, is_regen).await?;
             logger.lock().await.log_llm(
                 "Simple Generation",
@@ -1218,38 +1374,8 @@ impl NewsAggregator {
         Ok((script_body, final_title, final_audio, duration, false))
     }
 
-    fn get_holiday_context(&self) -> String {
-        let now = chrono::Local::now();
-        let today_solar = now.format("%m-%d").to_string();
-        let lunar = LunisolarDate::from_date(now).unwrap();
-        let l_month = lunar.to_lunar_month().to_u8();
-        let l_day = lunar.to_lunar_day().to_u8();
-
-        let mut greeting = String::new();
-        match today_solar.as_str() {
-            "01-01" => greeting.push_str("今天是元旦节，"),
-            "05-01" => greeting.push_str("今天是劳动节，"),
-            "10-01" => greeting.push_str("今天是国庆节，"),
-            _ => {}
-        }
-        if l_month == 1 && l_day == 1 {
-            greeting.push_str("今天是农历正月初一，春节快乐！");
-        }
-        if l_month == 1 && l_day == 15 {
-            greeting.push_str("今天是元宵节，");
-        }
-        if l_month == 5 && l_day == 5 {
-            greeting.push_str("今天是端午节，");
-        }
-        if l_month == 8 && l_day == 15 {
-            greeting.push_str("今天是中秋节，");
-        }
-
-        if !greeting.is_empty() {
-            format!("特别提示：{} 请在开场问候中自然融入节日祝福。", greeting)
-        } else {
-            String::new()
-        }
+    fn get_episode_date_context(&self) -> EpisodeDateContext {
+        build_episode_date_context(chrono::Local::now().date_naive())
     }
 
     fn build_prompt(
@@ -1257,11 +1383,9 @@ impl NewsAggregator {
         category: &str,
         host: &str,
         context: &str,
-        holiday: &str,
+        date_context: &EpisodeDateContext,
         is_regen: bool,
     ) -> String {
-        let now = chrono::Local::now();
-        let time_info = now.format("%Y年%-m月%-d日 %H点").to_string();
         let regen_instruction = if is_regen {
             "注意：这是一个【重新生成】请求。请专注于改进提供的具体新闻故事，保留所有有意义的细节。"
         } else {
@@ -1269,15 +1393,14 @@ impl NewsAggregator {
         };
 
         format!(
-            "角色：FreshLoop 信息密度型音频编辑兼主播（{}）。任务：撰写适合通勤路上听的新闻音频稿。\n\
-            时间：{}\n\
-            节日背景：{}\n\
+            "角色：FreshLoop 信息密度型音频编辑兼主播（{}）。任务：撰写适合路上或碎片时间听的新闻音频稿。\n\
+            {}\n\
             分类：{}\n\
             {}\n\
             \n\
             核心规则：\n\
             1. **结构**：一句自然开场 -> 逐条播报新闻 -> 一句自然结束语。\n\
-            2. **标准开场**：自然融入\"欢迎收听 FreshLoop [{}频道]\"以及\"我是{}\"，不要寒暄太久。\n\
+            2. **标准开场**：自然融入\"欢迎收听 FreshLoop [{}频道]\"以及\"我是{}\"，不要寒暄太久；日期、周末、节假日、调休信息必须与【日期语境】一致，不要使用固定模板。\n\
             3. **标准结束语**：包含\"我是{}\"和 FreshLoop，但只用一句话收束。\n\
             4. **每条新闻的信息结构**：必须交代“发生了什么 / 关键事实 / 为什么和听众有关”。信息不足的低价值素材只用一句话带过。\n\
             5. **细节保留**：保留来源中的具体人名、公司名、数字、日期、地点和引语；没有给出的细节不要补。\n\
@@ -1297,7 +1420,14 @@ impl NewsAggregator {
             原始素材：\n{}\n\
             \n\
             现在输出完整的广播稿（第一行必须是TITLE）。",
-            host, time_info, holiday, category, regen_instruction, category, host, host, context
+            host,
+            date_context.prompt_block,
+            category,
+            regen_instruction,
+            category,
+            host,
+            host,
+            context
         )
     }
 
@@ -1333,7 +1463,7 @@ impl NewsAggregator {
         host_name: &str,
         items: &[BroadcastItem],
         plans: &[SegmentPlan],
-        holiday_context: &str,
+        date_context: &EpisodeDateContext,
         logger: Arc<Mutex<TraceLogger>>,
         tx: Option<tokio::sync::mpsc::Sender<String>>,
     ) -> Result<String> {
@@ -1374,14 +1504,8 @@ impl NewsAggregator {
             let mut ros = String::new();
             if is_first {
                 ros.push_str(&format!("【节目单 - {}频道】\n", category));
-                ros.push_str(&format!(
-                    "时间: {}\n",
-                    chrono::Local::now().format("%Y-%m-%d")
-                ));
+                ros.push_str(&format!("时间: {}\n", date_context.run_of_show_line));
                 ros.push_str(&format!("主播: {}\n", host_name));
-                if !holiday_context.is_empty() {
-                    ros.push_str(&format!("节日: {}\n", holiday_context));
-                }
             }
             ros.push_str(&format!(
                 "\n--- 第 {}/{} 部分播报流程 ---\n",
@@ -1424,22 +1548,20 @@ impl NewsAggregator {
             }
 
             // 3. Prompt Construction
-            let now = chrono::Local::now();
-            let date_str = now.format("%Y年%-m月%-d日").to_string();
             let run_of_show = ros;
             let full_content_block = content;
 
             let requirement_intro_outro = if total_chunks == 1 {
                 format!(
                     "必须包含 [开场白] -> [正文(按顺序串联)] -> [结束语]。\n\
-                - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (包含日期)\n\
+                - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (可自然包含日期或时间语境，但必须准确)\n\
                 - 结束语: \"以上就是本期内容...\"",
                     category
                 )
             } else if is_first {
                 format!(
                     "必须包含 [开场白] -> [正文(按顺序串联)]，不要写结束语，因为后面还有内容。\n\
-                - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (包含日期)",
+                - 开场白: \"大家好，欢迎收听 FreshLoop {}频道...\" (可自然包含日期或时间语境，但必须准确)",
                     category
                 )
             } else if is_last {
@@ -1459,11 +1581,10 @@ impl NewsAggregator {
             let prompt = format!(
                 "Role: FreshLoop 信息密度型音频编辑兼主播 (Host: {})。\n\
                 频道: {}\n\
-                当前日期: {} (请务必基于此日期播报，今天是普通工作日，除非明确提到节日，否则不要编造“新年”、“春节”等背景)\n\
                 {}\n\
                 \n\
                 【任务目标】\n\
-                基于以下【第 {}/{} 部分的节目编排表】和【详细新闻素材】，撰写一份适合通勤路上听的单人口播稿。\n\
+                基于以下【第 {}/{} 部分的节目编排表】和【详细新闻素材】，撰写一份适合路上或碎片时间听的单人口播稿。\n\
                 {}\
                 \n\
                 【节目编排表 (Run of Show)】\n\
@@ -1478,16 +1599,17 @@ impl NewsAggregator {
                    - **以素材为准**：必须基于提供的【详细新闻素材】。禁止引入你训练记忆中可能冲突的事实。\n\
                    - **禁止幻觉**：严禁编造任何时间、地点、天气、具体数字或素材中未提及的背景故事。\n\
                 3. **音频信息结构**：每条新闻都尽量回答三件事：发生了什么、关键事实是什么、为什么和听众有关。信息不足的低价值素材只用一句话带过。\n\
-                4. **简洁衔接**：段落之间的过渡必须短、自然、基于事实。\n\
+                4. **时间语境准确**：开场如提到日期、周末、节假日或调休，只能使用上面的【日期语境】；不要套用“工作日”“周末”“通勤早高峰”等与日期语境冲突的固定说法。\n\
+                5. **简洁衔接**：段落之间的过渡必须短、自然、基于事实。\n\
                    - 可以直接进入下一条，不必每条都解释为什么相关。\n\
                    - 禁止使用\"我们先从...说起\"、\"说到...\"、“接下来我们来看”等固定模板。如果提供了【上一部分结尾供参考】，第一句要顺着语境承接。\n\
                    - 禁止使用：\"视线转向\"、\"视线转回\"、\"不妨把目光投向\"、\"同样需要\"、\"聊完…不妨…\"、\"话题延伸至\"、\"议题回归\"、\"视角转换至\"、\"从…延伸到…\"。\n\
-                5. **口语化改写（必须）**：\n\
+                6. **口语化改写（必须）**：\n\
                    - 严禁逐字照搬素材摘要原文，必须用自己的话重新表述。\n\
                    - 语气像聪明朋友在解释新闻，不是照本宣科念新闻稿，也不是夸张播客腔。\n\
                    - 少用语气词，不要为了“活泼”牺牲信息密度。\n\
-                6. **篇幅控制**：重要新闻 160-240 字，普通新闻 80-130 字，低价值新闻一句带过或自然省略；不要让每条听起来一样长。\n\
-                7. **禁止空话**：不要使用\"值得关注\"、\"引发热议\"、\"未来可期\"、\"意义重大\"、\"不容忽视\"这类没有信息量的形容。\n\
+                7. **篇幅控制**：重要新闻 160-240 字，普通新闻 80-130 字，低价值新闻一句带过或自然省略；不要让每条听起来一样长。\n\
+                8. **禁止空话**：不要使用\"值得关注\"、\"引发热议\"、\"未来可期\"、\"意义重大\"、\"不容忽视\"这类没有信息量的形容。\n\
                 \n\
                 【格式禁忌 (Strict Mocks)】\n\
                 1. **纯文本输出**：输出必须是【纯纯的口播稿】！\n\
@@ -1495,8 +1617,9 @@ impl NewsAggregator {
                 3. **严禁小标题**：不要给每条新闻加标题，直接用话术过渡。\n\
                 \n\
                 现在，请输出克制、顺滑、信息密度高的口播稿：",
-                host_name, category, date_str,
-                if !holiday_context.is_empty() { format!("节日背景: {}", holiday_context) } else { String::new() },
+                host_name,
+                category,
+                date_context.prompt_block,
                 chunk_idx + 1, total_chunks,
                 previous_context_str,
                 run_of_show,
@@ -1951,4 +2074,56 @@ fn clean_content(text: String) -> String {
     cleaned = re_newlines.replace_all(&cleaned, "\n\n").to_string();
 
     cleaned
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    }
+
+    fn assert_no_plain_workday_context(context: &EpisodeDateContext) {
+        let forbidden = ["普通", "工作日"].join("");
+        assert!(!context.prompt_block.contains(&forbidden));
+    }
+
+    #[test]
+    fn date_context_marks_plain_saturday_as_weekend_not_workday() {
+        let context = build_episode_date_context(date(2026, 6, 27));
+
+        assert!(context.prompt_block.contains("周六"));
+        assert!(context.prompt_block.contains("周末"));
+        assert!(context.prompt_block.contains("不要说今天是工作日"));
+        assert_no_plain_workday_context(&context);
+    }
+
+    #[test]
+    fn date_context_does_not_force_workday_for_regular_weekday() {
+        let context = build_episode_date_context(date(2026, 6, 24));
+
+        assert!(context.prompt_block.contains("周三"));
+        assert!(context.prompt_block.contains("不需要强行说工作日"));
+        assert_no_plain_workday_context(&context);
+    }
+
+    #[test]
+    fn date_context_marks_known_official_holiday() {
+        let context = build_episode_date_context(date(2026, 2, 17));
+
+        assert!(context.prompt_block.contains("春节假期"));
+        assert!(context.prompt_block.contains("不要把今天说成工作日"));
+        assert_no_plain_workday_context(&context);
+    }
+
+    #[test]
+    fn date_context_marks_adjusted_weekend_workday_precisely() {
+        let context = build_episode_date_context(date(2026, 2, 14));
+
+        assert!(context.prompt_block.contains("周六"));
+        assert!(context.prompt_block.contains("调休工作日"));
+        assert_no_plain_workday_context(&context);
+    }
 }
