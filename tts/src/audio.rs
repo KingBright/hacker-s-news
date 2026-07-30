@@ -46,6 +46,7 @@ pub fn normalize_for_tts(raw_text: &str, options: NormalizeOptions) -> String {
     if let Ok(re) = regex::Regex::new(r"(?i)[（(]\s*(source|来源|via)[:：][^）)]*[）)]") {
         text = re.replace_all(&text, "").into_owned();
     }
+    text = expand_pronunciation_ambiguities(&text);
     if let Ok(re) = regex::Regex::new(r"(?:US\$|\$)\s*([0-9]+(?:\.[0-9]+)?)") {
         text = re.replace_all(&text, "$1 美元").into_owned();
     }
@@ -115,6 +116,31 @@ pub fn normalize_for_tts(raw_text: &str, options: NormalizeOptions) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+fn expand_pronunciation_ambiguities(text: &str) -> String {
+    text.replace("长三角", "长江三角洲")
+        .replace("珠三角", "珠江三角洲")
+        .replace("央行行长", "央行负责人")
+        .replace("银行行长", "银行负责人")
+        .replace("分行行长", "分行负责人")
+        .replace("支行行长", "支行负责人")
+        .replace("副行长", "银行副负责人")
+        .replace("重启", "重新启动")
+        .replace("重置", "重新设置")
+        .replace("重构", "重新构建")
+        .replace("重组", "重新组合")
+        .replace("重估", "重新估值")
+        .replace("重算", "重新计算")
+        .replace("重试", "再次尝试")
+        .replace("重返", "再次回到")
+        .replace("重申", "再次说明")
+        .replace("重塑", "重新塑造")
+        .replace("重写", "重新编写")
+        .replace("重开", "重新开放")
+        .replace("重建", "重新建设")
+        .replace("重获", "再次获得")
+        .replace("重仓", "大比例持仓")
 }
 
 fn take_leading_parenthetical(text: &str) -> Option<String> {
@@ -452,6 +478,29 @@ mod tests {
         assert!(normalized.contains("23 摄氏度"));
         assert!(normalized.contains("大于等于"));
         assert!(normalized.contains("指向"));
+    }
+
+    #[test]
+    fn expands_common_chinese_pronunciation_ambiguities() {
+        let text = "长三角和珠三角都有银行行长发声，企业也在重启重组计划并重仓股权。";
+        let normalized = normalize_for_tts(text, NormalizeOptions::default());
+
+        assert!(normalized.contains("长江三角洲"));
+        assert!(normalized.contains("珠江三角洲"));
+        assert!(normalized.contains("银行负责人"));
+        assert!(normalized.contains("重新启动"));
+        assert!(normalized.contains("重新组合"));
+        assert!(normalized.contains("大比例持仓股权"));
+        assert!(!normalized.contains("长三角"));
+        assert!(!normalized.contains("行长"));
+    }
+
+    #[test]
+    fn pronunciation_expansion_does_not_cross_word_boundaries_for_hangzhang() {
+        let normalized = normalize_for_tts("公司计划发行长期债券。", NormalizeOptions::default());
+
+        assert!(normalized.contains("发行长期债券"));
+        assert!(!normalized.contains("发银行负责人期"));
     }
 
     #[test]

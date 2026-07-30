@@ -1150,22 +1150,30 @@ export default function Home() {
               const isActiveDay = radioPlaybackContext.kind === 'day' && radioPlaybackContext.dayKey === group.key;
 
               return (
-                <section key={group.key} className="rounded-[28px] border border-white/6 bg-white/[0.03] p-4 shadow-[0_14px_40px_rgba(0,0,0,0.18)]">
-                  <div className="mb-4 flex items-start justify-between gap-3">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <h4 className="text-lg font-black text-white">{group.title}</h4>
-                        {isActiveDay && <span className="rounded-full bg-primary/15 px-2 py-1 text-[10px] font-black uppercase tracking-[0.16em] text-primary">Active</span>}
+                <section key={group.key} className="space-y-3 pt-2">
+                  <div className="flex items-center justify-between gap-3 px-1">
+                    <div className="flex min-w-0 items-center gap-3">
+                      <div className="h-9 w-1 rounded-full bg-primary/80 shadow-[0_0_18px_rgba(25,230,107,0.25)]" aria-hidden="true" />
+                      <div className="min-w-0">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <h4 className="truncate text-lg font-black text-white">{group.title}</h4>
+                          {isActiveDay && (
+                            <span className="rounded-full bg-primary/15 px-2 py-1 text-[10px] font-black uppercase tracking-[0.16em] text-primary">
+                              Active
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-1 text-xs text-white/55">
+                          {group.items.length} 条内容 · {group.playableCount} 段可播{dayMinutes > 0 ? ` · ${dayMinutes} min` : ''}
+                        </p>
                       </div>
-                      <p className="mt-2 text-xs text-white/55">
-                        {group.items.length} 条内容 · {group.playableCount} 段可播{dayMinutes > 0 ? ` · ${dayMinutes} min` : ''}
-                      </p>
                     </div>
                     {group.playbackIds.length > 0 && (
                       <button
                         onClick={() => playRadioDay(group.key, group.playbackIds)}
-                        className="rounded-full bg-primary px-4 py-2 text-sm font-bold text-black transition-colors hover:bg-primary/90"
+                        className="flex shrink-0 items-center gap-1.5 rounded-full bg-primary px-3.5 py-2 text-sm font-bold text-black transition-colors hover:bg-primary/90"
                       >
+                        <span className="material-symbols-outlined filled text-[18px]">play_arrow</span>
                         播放当天
                       </button>
                     )}

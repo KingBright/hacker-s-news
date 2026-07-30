@@ -1334,7 +1334,8 @@ fn build_article_analysis_prompt(
 5. 不要使用 LaTeX、$...$、$$...$$ 或反斜杠数学命令。若必须保留公式，请改写成普通文本，例如 `M = E - e sin E`。\n\
 6. audio_script 是给耳朵听的信息压缩版，不朗读原文，不保留 Markdown 符号；保持作者观点顺序，口语自然，2-4 分钟。\n\
 7. key_points 给出 3-7 条作者在文中表达的关键观点或事实。\n\
-8. 只能使用正文信息，不要编造正文外的信息，不要加入你的判断。",
+8. 只能使用正文信息，不要编造正文外的信息，不要加入你的判断。\n\
+9. compressed_markdown 和 audio_script 都不得重复同一句话或同一事实表达；audio_script 遇到多音字和缩写时优先写成不易误读的全称，例如\"长三角\"写作\"长江三角洲\"、\"行长\"写作\"银行负责人\"，不要使用拼音或括号读音标注。",
         source_name, title, url, context, personalization_block
     )
 }
@@ -1366,7 +1367,8 @@ fn build_weekly_digest_prompt(context: &str, personalization_context: Option<&st
 3. 不要使用 LaTeX、$...$、$$...$$ 或反斜杠数学命令。若必须提到公式，请改写成普通文本。\n\
 4. audio_script 面向收听，语气自然，3-6 分钟，避免逐条机械报标题。\n\
 5. themes 给出 3-6 个本周主题词。\n\
-6. 只能使用素材中的事实，不要编造外部信息。",
+6. 只能使用素材中的事实，不要编造外部信息。\n\
+7. digest_markdown 和 audio_script 都不得重复同一句话或同一事实表达；audio_script 遇到多音字和缩写时优先写成不易误读的全称，例如\"长三角\"写作\"长江三角洲\"、\"行长\"写作\"银行负责人\"，不要使用拼音或括号读音标注。",
         context, personalization_block
     )
 }
@@ -1772,14 +1774,94 @@ fn normalize_article_markdown(markdown: &str) -> String {
 }
 
 fn normalize_audio_script_text(text: &str) -> String {
-    remove_orphan_dollar_markers(&normalize_math_for_plain_text(text))
+    let cleaned = remove_orphan_dollar_markers(&normalize_math_for_plain_text(text))
         .lines()
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
         .replace("\n\n\n", "\n\n")
         .trim()
-        .to_string()
+        .to_string();
+
+    remove_repeated_audio_sentences(&cleaned)
+}
+
+fn remove_repeated_audio_sentences(text: &str) -> String {
+    let mut seen = HashSet::new();
+    let mut output = String::new();
+    let mut sentence = String::new();
+
+    for ch in text.chars() {
+        sentence.push(ch);
+        if matches!(ch, '。' | '！' | '？' | '!' | '?' | ';' | '；' | '\n') {
+            push_audio_sentence_if_new(&mut output, &sentence, &mut seen);
+            sentence.clear();
+        }
+    }
+
+    if !sentence.is_empty() {
+        push_audio_sentence_if_new(&mut output, &sentence, &mut seen);
+    }
+
+    output.trim().replace("\n\n\n", "\n\n").trim().to_string()
+}
+
+fn push_audio_sentence_if_new(output: &mut String, sentence: &str, seen: &mut HashSet<String>) {
+    let key = audio_sentence_key(sentence);
+    if key.chars().count() >= 12 {
+        let repeated = seen.contains(&key)
+            || seen.iter().any(|existing| {
+                let key_len = key.chars().count();
+                let existing_len = existing.chars().count();
+                key_len >= 18
+                    && existing_len >= 18
+                    && ((key.contains(existing) && existing_len * 100 >= key_len * 75)
+                        || (existing.contains(&key) && key_len * 100 >= existing_len * 75))
+            });
+        if repeated {
+            return;
+        }
+        seen.insert(key);
+    }
+    output.push_str(sentence);
+}
+
+fn audio_sentence_key(sentence: &str) -> String {
+    sentence
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    ch,
+                    '。' | '，'
+                        | '、'
+                        | '！'
+                        | '？'
+                        | '；'
+                        | '：'
+                        | '.'
+                        | ','
+                        | '!'
+                        | '?'
+                        | ';'
+                        | ':'
+                        | '"'
+                        | '\''
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '（'
+                        | '）'
+                        | '('
+                        | ')'
+                        | '-'
+                        | '—'
+                        | '–'
+                )
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn article_content_needs_repair(content: &FeedItemContentPayload) -> bool {
@@ -2240,6 +2322,16 @@ mod tests {
     }
 
     #[test]
+    fn audio_script_normalization_removes_repeated_sentences() {
+        let audio = normalize_audio_script_text(
+            "这篇文章的核心是把记忆系统做成长期基础设施。\n这篇文章的核心是把记忆系统做成长期基础设施。\n作者随后解释了缓存和索引的取舍。",
+        );
+
+        assert_eq!(audio.matches("记忆系统做成长期基础设施").count(), 1);
+        assert!(audio.contains("作者随后解释了缓存和索引的取舍。"));
+    }
+
+    #[test]
     fn article_prompt_uses_personalization_without_changing_author_meaning() {
         let prompt = build_article_analysis_prompt(
             "Source",
@@ -2256,6 +2348,8 @@ mod tests {
         assert!(prompt.contains("不要因为用户偏好改写作者观点"));
         assert!(prompt.contains("只能使用正文信息"));
         assert!(prompt.contains("不要使用 LaTeX"));
+        assert!(prompt.contains("不得重复同一句话"));
+        assert!(prompt.contains("长江三角洲"));
     }
 
     #[test]
@@ -2271,6 +2365,8 @@ mod tests {
         assert!(prompt.contains("不要为了迎合偏好添加素材之外的事实"));
         assert!(prompt.contains("只能使用素材中的事实"));
         assert!(prompt.contains("不要使用 LaTeX"));
+        assert!(prompt.contains("不得重复同一句话"));
+        assert!(prompt.contains("银行负责人"));
     }
 
     #[test]

@@ -7,11 +7,12 @@ use crate::core::topic_registry::TopicRegistry;
 use crate::core::tts::TtsClient;
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate, Weekday};
+use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const TTS_DRAFT_CACHE_VERSION: &str = "episode-date-context-v3";
+const TTS_DRAFT_CACHE_VERSION: &str = "episode-script-dedupe-v4";
 
 // --- Trace Logger ---
 #[derive(Debug, serde::Serialize)]
@@ -1127,6 +1128,7 @@ impl NewsAggregator {
         // SMART FLOW (Unified)
         // Check if we recovered from cache
         let (raw_script, generated_title) = if let Some(script) = cached_script {
+            let script = clean_content(script);
             let _ = tx.send(script.clone()).await;
             (script, cached_title)
         } else if let Some(item_list) = items {
@@ -1232,8 +1234,10 @@ impl NewsAggregator {
                 &prompt,
                 &response,
             );
-            let _ = tx.send(response.clone()).await;
-            (response, None) // No title extraction for legacy mode
+            let (inline_title, body) = extract_inline_title(&response);
+            let cleaned = clean_content(body);
+            let _ = tx.send(cleaned.clone()).await;
+            (cleaned, inline_title)
         };
 
         drop(tx); // Close the channel
@@ -1431,6 +1435,7 @@ impl NewsAggregator {
         let mut full_script = String::new();
         let total_chunks = chunks.len();
         let mut previous_chunk_ending: Option<String> = None;
+        let mut seen_script_sentences = HashSet::new();
 
         for (chunk_idx, plan_chunk) in chunks.iter().enumerate() {
             let is_first = chunk_idx == 0;
@@ -1546,6 +1551,7 @@ impl NewsAggregator {
                    - 少用语气词，不要为了“活泼”牺牲信息密度。\n\
                 7. **篇幅控制**：重要新闻 160-240 字，普通新闻 80-130 字，低价值新闻一句带过或自然省略；不要让每条听起来一样长。\n\
                 8. **禁止空话**：不要使用\"值得关注\"、\"引发热议\"、\"未来可期\"、\"意义重大\"、\"不容忽视\"这类没有信息量的形容。\n\
+                9. **禁止重复与 TTS 误读**：同一句话、同一事实、同一判断不得重复表达；输出前自检并删除重复句。遇到多音字或缩写时，优先使用不易误读的全称或解释性表达，例如把\"长三角\"写成\"长江三角洲\"，把\"行长\"写成\"银行负责人\"；不要使用拼音、音素、SSML 或括号读音标注。\n\
                 \n\
                 【格式禁忌 (Strict Mocks)】\n\
                 1. **纯文本输出**：输出必须是【纯纯的口播稿】！\n\
@@ -1583,6 +1589,15 @@ impl NewsAggregator {
             );
 
             let cleaned = clean_content(response);
+            let cleaned = remove_repeated_sentences_with_seen(&cleaned, &mut seen_script_sentences);
+            if cleaned.trim().is_empty() {
+                log::warn!(
+                    "Unified generation chunk {}/{} became empty after duplicate removal",
+                    chunk_idx + 1,
+                    total_chunks
+                );
+                continue;
+            }
 
             // Capture the tail for the next chunk's context
             let tail_chars = 150; // Extract last 150 chars
@@ -1946,6 +1961,28 @@ fn clean_for_tts(input: &str) -> String {
     tts::normalize_for_tts(input, tts::NormalizeOptions::default())
 }
 
+fn extract_inline_title(text: &str) -> (Option<String>, String) {
+    let trimmed = text.trim_start();
+    let Some(prefix) = trimmed.get(..6) else {
+        return (None, text.to_string());
+    };
+    if !prefix.eq_ignore_ascii_case("TITLE:") {
+        return (None, text.to_string());
+    }
+
+    let Some(newline_idx) = trimmed.find('\n') else {
+        let title = trimmed[6..].trim();
+        return (
+            (!title.is_empty()).then(|| title.to_string()),
+            String::new(),
+        );
+    };
+
+    let title = trimmed[6..newline_idx].trim();
+    let body = trimmed[newline_idx + 1..].trim().to_string();
+    ((!title.is_empty()).then(|| title.to_string()), body)
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct SegmentPlan {
     action: String, // "sequence" | "merge"
@@ -2009,7 +2046,112 @@ fn clean_content(text: String) -> String {
     let re_newlines = Regex::new(r"\n{3,}").unwrap();
     cleaned = re_newlines.replace_all(&cleaned, "\n\n").to_string();
 
-    cleaned
+    remove_repeated_sentences(&cleaned)
+}
+
+fn remove_repeated_sentences(text: &str) -> String {
+    let mut seen = HashSet::new();
+    remove_repeated_sentences_with_seen(text, &mut seen)
+}
+
+fn remove_repeated_sentences_with_seen(text: &str, seen: &mut HashSet<String>) -> String {
+    let mut output = String::new();
+    let mut sentence = String::new();
+
+    for ch in text.chars() {
+        sentence.push(ch);
+        if is_sentence_boundary(ch) {
+            push_sentence_if_new(&mut output, &sentence, seen);
+            sentence.clear();
+        }
+    }
+
+    if !sentence.is_empty() {
+        push_sentence_if_new(&mut output, &sentence, seen);
+    }
+
+    normalize_dedupe_spacing(&output)
+}
+
+fn push_sentence_if_new(output: &mut String, sentence: &str, seen: &mut HashSet<String>) {
+    let key = repeated_sentence_key(sentence);
+    let key_chars = key.chars().count();
+    const MIN_REPEAT_KEY_CHARS: usize = 12;
+
+    if key_chars >= MIN_REPEAT_KEY_CHARS {
+        let repeated = seen.contains(&key)
+            || seen
+                .iter()
+                .any(|existing| is_near_duplicate(&key, existing));
+        if repeated {
+            return;
+        }
+        seen.insert(key);
+    }
+
+    output.push_str(sentence);
+}
+
+fn repeated_sentence_key(sentence: &str) -> String {
+    sentence
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    ch,
+                    '。' | '，'
+                        | '、'
+                        | '！'
+                        | '？'
+                        | '；'
+                        | '：'
+                        | '.'
+                        | ','
+                        | '!'
+                        | '?'
+                        | ';'
+                        | ':'
+                        | '"'
+                        | '\''
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '（'
+                        | '）'
+                        | '('
+                        | ')'
+                        | '-'
+                        | '—'
+                        | '–'
+                )
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_near_duplicate(key: &str, existing: &str) -> bool {
+    let key_chars = key.chars().count();
+    let existing_chars = existing.chars().count();
+    if key_chars < 18 || existing_chars < 18 {
+        return false;
+    }
+
+    (key.contains(existing) && existing_chars * 100 >= key_chars * 75)
+        || (existing.contains(key) && key_chars * 100 >= existing_chars * 75)
+}
+
+fn is_sentence_boundary(ch: char) -> bool {
+    matches!(ch, '。' | '！' | '？' | '!' | '?' | ';' | '；' | '\n')
+}
+
+fn normalize_dedupe_spacing(text: &str) -> String {
+    use regex::Regex;
+    let trimmed = text.trim();
+    let re_spaces = Regex::new(r"[ \t]{2,}").unwrap();
+    let text = re_spaces.replace_all(trimmed, " ");
+    let re_newlines = Regex::new(r"\n{3,}").unwrap();
+    re_newlines.replace_all(&text, "\n\n").to_string()
 }
 
 #[cfg(test)]
@@ -2052,6 +2194,48 @@ mod tests {
         assert!(context.prompt_block.contains("春节假期"));
         assert!(context.prompt_block.contains("不要把今天说成工作日"));
         assert_no_plain_workday_context(&context);
+    }
+
+    #[test]
+    fn clean_content_removes_repeated_sentences() {
+        let cleaned = clean_content(
+            "【正文】苹果发布了新的芯片，强调端侧 AI 性能会提升。\n苹果发布了新的芯片，强调端侧 AI 性能会提升。\n这次更新还降低了功耗。"
+                .to_string(),
+        );
+
+        assert_eq!(
+            cleaned.matches("苹果发布了新的芯片").count(),
+            1,
+            "{cleaned}"
+        );
+        assert!(cleaned.contains("这次更新还降低了功耗。"));
+        assert!(!cleaned.contains("【正文】"));
+    }
+
+    #[test]
+    fn repeated_sentence_dedupe_tracks_across_chunks() {
+        let mut seen = HashSet::new();
+        let first = remove_repeated_sentences_with_seen(
+            "微软表示新模型会先面向企业客户开放。随后公司会扩大测试。",
+            &mut seen,
+        );
+        let second = remove_repeated_sentences_with_seen(
+            "微软表示新模型会先面向企业客户开放。与此同时，监管讨论还在继续。",
+            &mut seen,
+        );
+
+        assert!(first.contains("微软表示新模型会先面向企业客户开放。"));
+        assert!(!second.contains("微软表示新模型会先面向企业客户开放。"));
+        assert!(second.contains("与此同时，监管讨论还在继续。"));
+    }
+
+    #[test]
+    fn inline_title_is_split_before_body_cleanup() {
+        let (title, body) =
+            extract_inline_title("TITLE:AI 早报\n【正文】今天的主要变化来自模型端。");
+
+        assert_eq!(title.as_deref(), Some("AI 早报"));
+        assert_eq!(clean_content(body), "今天的主要变化来自模型端。");
     }
 
     #[test]
