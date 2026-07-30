@@ -9,22 +9,27 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "next": "^16.2.6",
-    "postcss": "8.5.14",
+    "next": "^16.2.12",
+    "postcss": "8.5.25",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4.3.0",
+    "@eslint/js": "^10.0.1",
+    "@next/eslint-plugin-next": "^16.2.12",
+    "@tailwindcss/postcss": "^4.3.3",
     "@types/node": "^20.19.41",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "eslint": "^9.39.4",
-    "eslint-config-next": "^16.2.6",
-    "tailwindcss": "^4.3.0",
-    "typescript": "^5.9.3"
+    "eslint": "^10.8.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.8.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.65.0"
   },
   "overrides": {
-    "postcss": "8.5.14"
+    "postcss": "8.5.25",
+    "sharp": "0.35.3"
   }
 }
