@@ -4,18 +4,12 @@
 
 # Refresh interval (if schedule_times is commented out or empty)
 interval_min = 60
+timezone_offset = 8
 
 # Fixed Schedule (Service will skip checks outside these times)
 schedule_times = [
-    "06:00",
-    "08:00",
-    "10:00",
-    "12:00",
-    "14:00",
-    "16:00",
+    "07:30",
     "18:00",
-    "20:00",
-    "22:00",
 ]
 
 # RSS Feeds to monitor
@@ -96,6 +90,8 @@ description = "无法归入以上分类的内容"
 # ===========================================
 
 [nexus]
+# Optional verified LAN route; preserves the HTTPS hostname and certificate check.
+# connect_ip = "192.168.2.200"
 # URL of your deployed Nexus backend (or local)
 api_url = "http://127.0.0.1:8899"
 # API Key must match server's NEXUS_KEY env var
@@ -103,17 +99,61 @@ auth_key = "your-secret-api-key"
 
 [llm]
 # OpenAI-compatible LLM endpoint
-model = "nvidia/nemotron-3-nano"
+model = "google/gemma-4-26b-a4b-qat"
 api_url = "http://127.0.0.1:1234/v1"
+json_mode = "none"
 
 [tts]
 engine = "voxcpm"
+process_isolation = true
+# Match voice_worker.concurrency when benchmarking dedicated external-agent TTS.
+# More Metal processes share one GPU; benchmark before increasing (maximum 4).
+worker_max_processes = 1
 
 [tts.voxcpm]
 # Path to local VoxCPM model directory (required for aha)
 model_path = "/path/to/VoxCPM1.5"
 prompt_text = "我最近在研究 AI Agent 工作流，发现豆包 TTS 2.0 的效果真的非常 amazing。它可以 seamlessly 地在中文和 English 之间切换，听起来特别自然。"
 prompt_wav_path = "file:///path/to/ref.wav"
+
+[content_generation]
+mode = "self_driven" # or "external_agent"; enabled=false alone remains legacy voice-only
+# App-internal production lets Cortex run RSS/LLM generation locally.
+# Set false only when an external scheduled agent owns content generation.
+enabled = true
+
+[curated_feed]
+enabled = true
+schedule_times = ["07:30", "18:00"]
+source_group = "default"
+max_items_per_cycle = 8
+max_age_days = 90
+min_quality_score = 5
+prefer_proxy = true
+article_audio_enabled = true
+article_audio_max_items_per_cycle = 3
+weekly_digest_enabled = true
+weekly_digest_schedule_times = ["18:00"]
+weekly_digest_min_items = 3
+weekly_digest_max_items = 12
+
+[loop_preferences]
+enabled = true
+schedule_times = ["07:30", "18:00"]
+max_posts_per_cycle = 20
+profile_context_max_chars = 3200
+
+[voice_worker]
+# Poll Nexus voice_jobs for generated or backfilled audio.
+enabled = true
+poll_interval_secs = 30
+# Keep this aligned with tts.worker_max_processes to avoid leasing jobs just to wait.
+concurrency = 1
+max_jobs_per_tick = 1
+lease_seconds = 1800
+repair_missing_audio = true
+repair_interval_secs = 600
+repair_limit = 20
 
 # ===========================================
 # HOSTS (Array of Tables)
@@ -145,3 +185,10 @@ categories = ["财经", "政治"]
 name = "小何"
 voice = "file:///path/to/audio/xiaohe.wav"
 categories = ["探索", "生活", "其他"]
+
+# External editorial production: set mode = "external_agent" in the EXISTING
+# [content_generation] section above (do not create a duplicate TOML table).
+# Default mode = "self_driven" preserves the current local-LLM pipeline.
+# External mode runs source ingestion/cache and voice_worker, never local drafting.
+# Cortex source API: /api/agent/sources (uses the existing Cortex authentication).
+# Mature Codex/Antigravity editor: skills/freshloop-content-agent/SKILL.md.

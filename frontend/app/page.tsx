@@ -1,11 +1,10 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
-import Image from 'next/image';
 import { Item } from '../src/types';
-import { FreshLoopNav } from '../components/FreshLoopNav';
+import { BrandHeader } from '../components/BrandHeader';
 import { saveLoopDraft } from '../src/loop';
-import { buildDayPlaylists } from '../src/day-playlists';
+import { buildRadioEditions, isRadioProgram, programSectionCount } from '../src/radio-editions';
 
 const SPEED_OPTIONS: number[] = [1.0, 1.25, 1.5, 1.75, 2.0];
 
@@ -39,11 +38,6 @@ function itemTimestamp(item: Item): number {
 function compareItemsNewestFirst(a: Item, b: Item): number {
   const byTime = itemTimestamp(b) - itemTimestamp(a);
   return byTime !== 0 ? byTime : b.id.localeCompare(a.id);
-}
-
-function compareItemsOldestFirst(a: Item, b: Item): number {
-  const byTime = itemTimestamp(a) - itemTimestamp(b);
-  return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
 }
 
 // Animated Equalizer Component for Playing State
@@ -81,6 +75,8 @@ export default function Home() {
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
+  const [hasLoadedItems, setHasLoadedItems] = useState(false);
+  const [itemsError, setItemsError] = useState<string | null>(null);
 
   // Persistence State
   const [playedIds, setPlayedIds] = useState<Set<string>>(new Set());
@@ -301,109 +297,68 @@ export default function Home() {
   // Request ID for race condition prevention in fetch operations
   const fetchRequestId = useRef(0);
 
-  // Weather State
-  const [weather, setWeather] = useState<{ temp: number, code: number } | null>(null);
-  const [greeting, setGreeting] = useState('Good Morning');
-
-  useEffect(() => {
-    const updateGreeting = () => {
-      const hour = new Date().getHours();
-      if (hour < 5) setGreeting("Good Late Night");
-      else if (hour < 12) setGreeting("Good Morning");
-      else if (hour < 17) setGreeting("Good Afternoon");
-      else if (hour < 21) setGreeting("Good Evening");
-      else setGreeting("Good Night");
-    };
-
-    updateGreeting(); // Initial call
-    const intervalId = setInterval(updateGreeting, 60000); // Update every minute
-
-    return () => clearInterval(intervalId); // Cleanup on unmount
-  }, []);
-
-  useEffect(() => {
-    if ("geolocation" in navigator) {
-      navigator.geolocation.getCurrentPosition(async (position) => {
-        try {
-          const { latitude, longitude } = position.coords;
-          const res = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current_weather=true`);
-          const data = await res.json();
-          if (data.current_weather) {
-            setWeather({
-              temp: Math.round(data.current_weather.temperature),
-              code: data.current_weather.weathercode
-            });
-          }
-        } catch (e) {
-          console.error("Weather fetch failed", e);
-        }
-      });
-    }
-  }, []);
-
-  const getWeatherIcon = (code: number) => {
-    if (code === 0) return 'wb_sunny';
-    if (code <= 3) return 'partly_cloudy_day';
-    if (code <= 48) return 'foggy';
-    if (code <= 67) return 'rainy';
-    if (code <= 77) return 'ac_unit';
-    if (code <= 82) return 'rainy';
-    if (code <= 86) return 'ac_unit';
-    return 'thunderstorm';
-  };
+  const [expandedEditions, setExpandedEditions] = useState<Set<string>>(new Set());
+  const [newAudioIds, setNewAudioIds] = useState<Set<string>>(new Set());
+  const knownAudio = useRef<Set<string> | null>(null);
 
   // Display and playback intentionally use different order:
   // browsing is newest-first, while continuous listening catches up oldest-first.
-  const pendingItems = items
+  const radioDayGroups = useMemo(() => buildRadioEditions(items), [items]);
+  const visibleItems = useMemo(() => radioDayGroups.flatMap(group => group.items), [radioDayGroups]);
+  const pendingItems = visibleItems
     .filter(i => !playedIds.has(i.id))
     .sort(compareItemsNewestFirst);
 
-  const pendingPlaybackItems = [...pendingItems].sort(compareItemsOldestFirst);
 
-  const playedItems = items
+  const playedItems = visibleItems
     .filter(i => playedIds.has(i.id))
     .sort((a, b) => (b.publish_time || 0) - (a.publish_time || 0)); // New -> Old (History)
-
-  const radioDayGroups = useMemo(
-    () =>
-      buildDayPlaylists<Item>({
-        items: pendingItems,
-        getId: (item) => item.id,
-        getTimestampMs: (item) => ((item.publish_time || item.created_at || 0) * 1000),
-        isPlayable: (item) => Boolean(item.audio_url),
-        getDurationSec: (item) => item.duration_sec || 0,
-        dayOrder: 'desc',
-        itemOrder: 'desc',
-        playbackOrder: 'asc',
-      }),
-    [pendingItems],
-  );
 
   const activeRadioQueueItems = useMemo(() => {
     if (radioPlaybackContext.kind === 'day') {
       const itemMap = new Map(items.map((item) => [item.id, item]));
       return radioPlaybackContext.itemIds
-        .filter((id) => !playedIds.has(id))
         .map((id) => itemMap.get(id))
         .filter((item): item is Item => Boolean(item));
     }
     return pendingItems;
-  }, [items, pendingItems, playedIds, radioPlaybackContext]);
+  }, [items, pendingItems, radioPlaybackContext]);
 
-  const activeRadioQueueGroups = useMemo(
-    () =>
-      buildDayPlaylists<Item>({
-        items: activeRadioQueueItems,
-        getId: (item) => item.id,
-        getTimestampMs: (item) => ((item.publish_time || item.created_at || 0) * 1000),
-        isPlayable: (item) => Boolean(item.audio_url),
-        getDurationSec: (item) => item.duration_sec || 0,
-        dayOrder: 'desc',
-        itemOrder: 'desc',
-        playbackOrder: 'asc',
-      }),
-    [activeRadioQueueItems],
-  );
+  const activeRadioQueueGroups = useMemo(() => buildRadioEditions(activeRadioQueueItems), [activeRadioQueueItems]);
+
+  useEffect(() => {
+    if (!hasLoadedItems) return;
+    const audio = new Set(items.filter(item => item.audio_url?.trim()).map(item => item.id));
+    knownAudio.current = new Set([...(knownAudio.current || []), ...audio]);
+  }, [items, hasLoadedItems]);
+
+  useEffect(() => {
+    if (!authRestored || !hasLoadedItems) return;
+    let stopped = false;
+    let busy = false;
+    const controller = new AbortController();
+    const refresh = async () => {
+      if (busy || document.hidden) return;
+      busy = true;
+      const requestVersion = fetchRequestId.current;
+      try {
+        const response = await fetch('/api/items?edition_pages=true&page=1', { headers: user ? {'x-user-id': user.id} : {}, signal: controller.signal, cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const fresh: Item[] = await response.json();
+        if (!Array.isArray(fresh)) throw new Error('Invalid Radio response');
+        if (!stopped && requestVersion === fetchRequestId.current) {
+          const added = fresh.filter(i => i.audio_url?.trim() && knownAudio.current !== null && !knownAudio.current.has(i.id)).map(i => i.id);
+          if (added.length) setNewAudioIds(previous => new Set([...previous, ...added]));
+          setItems(previous => { const merged = new Map(previous.map(i => [i.id,i])); fresh.forEach(i => merged.set(i.id,i)); return [...merged.values()]; });
+        }
+      } catch (error) { if (!stopped) console.warn('Radio refresh failed', error); }
+      finally { busy = false; }
+    };
+    const timer = window.setInterval(() => void refresh(), 30000);
+    const visible = () => { if (!document.hidden) void refresh(); };
+    document.addEventListener('visibilitychange', visible);
+    return () => { stopped = true; controller.abort(); clearInterval(timer); document.removeEventListener('visibilitychange', visible); };
+  }, [authRestored, hasLoadedItems, page, user]);
 
   // Fetch Items (Raw Data)
   // Use request ID to prevent race conditions
@@ -417,7 +372,7 @@ export default function Home() {
       if (user) {
         headers['x-user-id'] = user.id;
       }
-      const res = await fetch(`/api/items?page=${pageNum}&limit=50`, { headers });
+      const res = await fetch(`/api/items?edition_pages=true&page=${pageNum}&limit=50`, { headers });
 
       // Check if response is OK before parsing JSON
       if (!res.ok) {
@@ -435,9 +390,11 @@ export default function Home() {
       // Validate data is an array
       if (!Array.isArray(data)) {
         console.error('[FetchItems] Invalid response format:', data);
+        setItemsError('内容格式异常');
         return;
       }
 
+      setItemsError(null);
       setItems(prev => {
         if (isRefresh) {
           // Strict Consistency: A refresh (manual or full) resets the auto-play intent.
@@ -451,16 +408,18 @@ export default function Home() {
         return [...prev, ...newItems];
       });
 
-      setHasMore(data.length === 50);
+      setHasMore(data.length > 0);
     } catch (err) {
       // Only log error if this is still the current request
       if (currentRequestId === fetchRequestId.current) {
         console.error('Failed to fetch items:', err);
+        setItemsError('内容加载失败');
       }
     } finally {
       // Only update loading state if this is still the current request
       if (currentRequestId === fetchRequestId.current) {
         setIsLoading(false);
+        setHasLoadedItems(true);
       }
     }
   }, [user]);
@@ -586,6 +545,7 @@ export default function Home() {
   }, []);
 
   const playItem = useCallback((id: string, context: RadioPlaybackContext = { kind: 'feed' }) => {
+    setRadioPlaybackContext(context);
     if (currentId === id) {
       if (isPlaying) {
         pausePlayback();
@@ -602,15 +562,10 @@ export default function Home() {
     selectTrack(id, true);
   }, [attemptPlayback, currentId, isPlaying, pausePlayback, selectTrack]);
 
-  const playWholeFeed = useCallback(() => {
-    const firstId = pendingPlaybackItems[0]?.id;
-    if (!firstId) return;
-    playItem(firstId, { kind: 'feed' });
-  }, [pendingPlaybackItems, playItem]);
-
   const playRadioDay = useCallback((dayKey: string, itemIds: string[], startId?: string) => {
     const nextId = startId && itemIds.includes(startId) ? startId : itemIds[0];
     if (!nextId) return;
+    setNewAudioIds(previous => new Set([...previous].filter(id => !itemIds.includes(id))));
     playItem(nextId, { kind: 'day', dayKey, itemIds });
   }, [playItem]);
 
@@ -672,7 +627,7 @@ export default function Home() {
 
       const nextId = queueIds
         .slice(currentIndex + 1)
-        .find((id) => id !== currentId && !playedIds.has(id));
+        .find((id) => id !== currentId);
 
       if (nextId) {
         selectTrack(nextId, true);
@@ -908,12 +863,12 @@ export default function Home() {
     }
 
     mediaSession.metadata = new MediaMetadata({
-      title: item.title.replace(/^【.*?】/, '').trim() || 'FreshLoop Briefing',
+      title: item.title.replace(/^【.*?】/, '').trim() || 'FreshLoop Radio',
       artist: item.category || 'FreshLoop',
-      album: 'FreshLoop Daily Briefing',
+      album: 'FreshLoop Radio',
       artwork: [
-        { src: '/logo.png', sizes: '192x192', type: 'image/png' },
-        { src: '/logo.png', sizes: '512x512', type: 'image/png' },
+        { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+        { src: '/icon-512.png', sizes: '512x512', type: 'image/png' },
       ],
     });
   }, [currentId, items]);
@@ -998,8 +953,7 @@ export default function Home() {
   };
 
   const currentItem = items.find(i => i.id === currentId);
-  const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
-  const unreadCount = pendingItems.length;
+  const showInitialLoading = !authRestored || (!hasLoadedItems && isLoading);
 
   return (
     <div className="relative flex min-h-screen w-full flex-col overflow-x-hidden max-w-md mx-auto shadow-2xl pb-32 bg-background-dark text-white font-display">
@@ -1043,41 +997,34 @@ export default function Home() {
         playsInline
       />
 
-      {/* Header */}
-      <header className="sticky top-0 z-20 bg-background-dark/95 backdrop-blur-md px-4 pt-12 pb-4 border-b border-white/5">
-        <div className="flex items-center justify-between">
-          <div className="flex-1 min-w-0 mr-4">
-            <div className="flex items-center gap-2 sm:gap-3" onClick={handleDebugTrigger}>
-              <div className="size-8 sm:size-10 shrink-0 rounded-xl overflow-hidden shadow-lg ring-1 ring-white/10">
-                <Image src="/logo.png" alt="FreshLoop Logo" width={40} height={40} className="w-full h-full object-cover" />
-              </div>
-              <h1 className="text-xl sm:text-[28px] font-bold leading-none tracking-tight text-white truncate">FreshLoop</h1>
-              {showDebug && <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse shrink-0" />}
-            </div>
-            <p className="text-[10px] sm:text-xs text-slate-500 dark:text-[#93c8a8] mt-1 font-medium tracking-wide uppercase truncate">Audio Briefing • Zen Mode</p>
-          </div>
-          <div className="flex items-center gap-2">
+      <BrandHeader
+        contentClassName="max-w-md"
+        onBrandClick={handleDebugTrigger}
+        actions={
+          <>
+            {showDebug && <span className="size-2 rounded-full bg-red-500 animate-pulse" aria-label="调试模式" />}
             <a
               href="/android-app.apk"
               download="FreshLoop.apk"
               className="flex items-center justify-center bg-green-500/10 hover:bg-green-500/20 text-green-400 size-8 rounded-full transition-colors ring-1 ring-green-500/30 shrink-0"
-              title="Download Android App"
+              title="下载 Android 应用"
+              aria-label="下载 Android 应用"
             >
               <span className="material-symbols-outlined text-[18px]">android</span>
             </a>
             <button
-              onClick={() => user ? (confirm('Logout?') && handleLogout()) : setShowLogin(true)}
+              onClick={() => user ? (confirm('退出登录？') && handleLogout()) : setShowLogin(true)}
               className="flex items-center gap-1.5 bg-white/5 hover:bg-white/10 pl-1.5 pr-3 py-1 rounded-full transition-colors shrink-0 max-w-[120px]"
+              aria-label={user ? "账户与退出" : "登录"}
             >
               <div className={`size-6 rounded-full flex items-center justify-center shrink-0 ${user ? 'bg-primary text-black' : 'bg-white/20 text-white'}`}>
                 <span className="material-symbols-outlined text-[14px]">person</span>
               </div>
               {user && <span className="text-[11px] font-medium text-white/80 truncate">{user.username}</span>}
             </button>
-          </div>
-        </div>
-        <FreshLoopNav />
-      </header>
+          </>
+        }
+      />
 
       <LoginModal
         isOpen={showLogin}
@@ -1086,100 +1033,57 @@ export default function Home() {
       />
 
       <main className="flex flex-col gap-6 p-4">
-        {/* Hero Card: Daily Summary */}
-        <section className="relative overflow-hidden rounded-3xl bg-surface-dark shadow-lg ring-1 ring-white/5 group">
-          {/* Abstract Background Pattern */}
-          <div className="absolute inset-0 opacity-40 mix-blend-overlay" style={{ backgroundImage: 'radial-gradient(circle at 80% 20%, rgba(25, 230, 107, 0.3) 0%, transparent 50%)' }}></div>
-          <div className="relative flex flex-col p-6 z-10">
-            <div className="flex items-start justify-between mb-8">
-              <div>
-                <p className="text-[#93c8a8] text-sm font-medium uppercase tracking-wider mb-1">{today}</p>
-                <h2 className="text-3xl font-bold text-white tracking-tight leading-none">{greeting}</h2>
-              </div>
-              <div className="flex items-center gap-2">
-                {weather && <span className="text-white text-lg font-bold tracking-tight">{weather.temp}°</span>}
-                <div className="h-8 w-8 rounded-full bg-primary/20 flex items-center justify-center text-primary">
-                  <span className="material-symbols-outlined text-[18px]">{weather ? getWeatherIcon(weather.code) : 'wb_sunny'}</span>
-                </div>
-              </div>
-            </div>
-            <div className="space-y-4">
-              <div className="flex items-center gap-4">
-                <span className="text-5xl font-bold text-primary font-display tabular-nums leading-none">{unreadCount}</span>
-                <div className="flex flex-col">
-                  <span className="text-lg font-bold text-white leading-tight">Fresh stories</span>
-                  <span className="text-sm font-medium text-white/70">Tailored for you</span>
-                </div>
-                {pendingItems.length > 0 && (
-                  <button
-                    onClick={playWholeFeed}
-                    className="h-10 rounded-full bg-primary px-4 text-sm font-bold text-black transition-colors hover:bg-primary/90"
-                  >
-                    全部播放
-                  </button>
-                )}
-                <button
-                  onClick={() => {
-                    setPage(1);
-                    setHasMore(true);
-                    fetchItems(1, true);
-                  }}
-                  disabled={isLoading}
-                  className="h-10 w-10 ml-2 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white transition-colors active:scale-95 disabled:opacity-50"
-                  title="Refresh Feed"
-                >
-                  <span className={`material-symbols-outlined ${isLoading ? 'animate-spin' : ''}`}>refresh</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </section>
-
         {/* Collections Section (Items List) */}
         <section className="flex flex-col gap-4">
           <div className="flex items-center justify-between px-1">
-            <h3 className="text-xl font-bold text-white">Your Feed</h3>
+            <h3 className="text-xl font-bold text-white">新闻</h3>
             <span className="text-xs font-bold uppercase tracking-[0.18em] text-[#93c8a8]">
-              {radioDayGroups.length} Days
+              {pendingItems.length} 条待听
             </span>
           </div>
 
           <div className="flex flex-col gap-3">
             {radioDayGroups.map((group) => {
-              const dayMinutes = group.totalDurationSec > 0 ? Math.ceil(group.totalDurationSec / 60) : 0;
+              const newCount = group.playbackIds.filter(id => newAudioIds.has(id)).length;
+              const isExpanded = expandedEditions.has(group.key);
               const isActiveDay = radioPlaybackContext.kind === 'day' && radioPlaybackContext.dayKey === group.key;
 
               return (
-                <section key={group.key} className="space-y-3 pt-2">
+                <section key={group.key} data-edition={group.key} className="space-y-3 rounded-2xl bg-surface-dark p-4 ring-1 ring-white/5">
                   <div className="flex items-center justify-between gap-3 px-1">
                     <div className="flex min-w-0 items-center gap-3">
                       <div className="h-9 w-1 rounded-full bg-primary/80 shadow-[0_0_18px_rgba(25,230,107,0.25)]" aria-hidden="true" />
                       <div className="min-w-0">
                         <div className="flex min-w-0 items-center gap-2">
-                          <h4 className="truncate text-lg font-black text-white">{group.title}</h4>
-                          {isActiveDay && (
+                          <h4 className="text-base font-black text-white">{group.shortTitle}</h4>
+                          {isActiveDay && isPlaying && (
                             <span className="rounded-full bg-primary/15 px-2 py-1 text-[10px] font-black uppercase tracking-[0.16em] text-primary">
-                              Active
+                              播放中
                             </span>
                           )}
                         </div>
+                        <p className="mt-1 text-sm text-[#93c8a8]">{group.title.split(' · ')[1]}</p>
                         <p className="mt-1 text-xs text-white/55">
-                          {group.items.length} 条内容 · {group.playableCount} 段可播{dayMinutes > 0 ? ` · ${dayMinutes} min` : ''}
+                          {group.items.length === 1 && isRadioProgram(group.items[0]) ? `${programSectionCount(group.items[0])} 个板块 · 完整节目` : `${group.playableCount} 个音频`} · {formatTime(group.totalDurationSec)}
+                          {group.items.length > group.playableCount && ` · ${group.items.length - group.playableCount} 篇待生成`}
+                          {newCount > 0 && <span role="status" className="ml-2 text-primary">新增 {newCount} 个音频</span>}
                         </p>
                       </div>
                     </div>
                     {group.playbackIds.length > 0 && (
                       <button
+                        aria-label="播放节目"
                         onClick={() => playRadioDay(group.key, group.playbackIds)}
                         className="flex shrink-0 items-center gap-1.5 rounded-full bg-primary px-3.5 py-2 text-sm font-bold text-black transition-colors hover:bg-primary/90"
                       >
                         <span className="material-symbols-outlined filled text-[18px]">play_arrow</span>
-                        播放当天
+                        <span className="hidden sm:inline">播放节目</span>
                       </button>
                     )}
                   </div>
 
-                  <div className="flex flex-col gap-3">
+                  <button aria-expanded={isExpanded} className="text-sm text-[#93c8a8]" onClick={() => setExpandedEditions(previous => { const next = new Set(previous); if (next.has(group.key)) next.delete(group.key); else next.add(group.key); return next; })}>{isExpanded ? '收起节目' : '查看节目'}</button>
+                  {isExpanded && <div className="flex flex-col divide-y divide-white/5">
                     {group.items.map((item) => {
                       const isActive = currentId === item.id;
                       let category = item.category || 'News';
@@ -1199,10 +1103,7 @@ export default function Home() {
                         <div
                           key={item.id}
                           onClick={() => item.audio_url && playRadioDay(group.key, group.playbackIds, item.id)}
-                          className={`
-                              group flex items-center gap-4 bg-surface-dark p-4 rounded-2xl ring-1 shadow-sm hover:shadow-md transition-all cursor-pointer active:scale-[0.99]
-                              ${isActive ? 'ring-primary' : 'ring-white/5 hover:ring-primary/50'}
-                            `}
+                          className="group flex items-center gap-3 py-3 cursor-pointer"
                         >
                           <div className="relative shrink-0">
                             <div className={`flex flex-col items-center justify-center rounded-xl size-14 shadow-inner leading-none ${isActive ? 'bg-primary text-black' : 'bg-[#244732] text-white'}`}>
@@ -1262,14 +1163,33 @@ export default function Home() {
                         </div>
                       );
                     })}
-                  </div>
+                  </div>}
                 </section>
               );
             })}
 
-            {items.length === 0 && !isLoading && (
+            {showInitialLoading && (
+              <div className="flex justify-center py-20">
+                <div className="size-6 rounded-full border-2 border-white/20 border-t-primary animate-spin"></div>
+              </div>
+            )}
+
+            {!showInitialLoading && itemsError && items.length === 0 && (
+              <div className="flex flex-col items-center gap-3 py-20 text-center text-[#93c8a8]">
+                <span className="material-symbols-outlined text-3xl opacity-70">sync_problem</span>
+                <span>{itemsError}</span>
+                <button
+                  onClick={() => fetchItems(1, true)}
+                  className="rounded-full bg-white/10 px-4 py-2 text-sm font-bold text-white transition-colors hover:bg-white/15"
+                >
+                  重试
+                </button>
+              </div>
+            )}
+
+            {!showInitialLoading && !itemsError && items.length === 0 && (
               <div className="text-center py-20 text-[#93c8a8]">
-                No stories found.
+                暂时没有新的内容
               </div>
             )}
 

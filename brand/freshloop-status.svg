@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">FreshLoop audio status mark</title>
+  <g
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <circle cx="512" cy="512" r="310" stroke-width="78"/>
+    <path
+      d="M260 520h112l58-154 86 324 82-274 58 104h108"
+      stroke-width="74"
+    />
+  </g>
+</svg>

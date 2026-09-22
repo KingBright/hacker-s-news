@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod agent;
 pub mod auth;
 pub mod dedup;
 pub mod feed;

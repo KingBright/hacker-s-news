@@ -397,6 +397,11 @@ pub async fn run_news_loop(
         "Scheduler configured with timezone_offset: {:?}",
         config.timezone_offset
     );
+    let content_generation_enabled = config.content_generation_enabled();
+    log::info!(
+        "Cortex internal content generation enabled: {}",
+        content_generation_enabled
+    );
     // Initialize v2.0 Components
     let buffer = Arc::new(tokio::sync::Mutex::new(
         NewsBuffer::new(&cache_dir).expect("Failed to init NewsBuffer"),
@@ -424,12 +429,23 @@ pub async fn run_news_loop(
         llm.clone(),
         nexus.clone(),
     ));
+    {
+        let worker_config = config.clone();
+        let worker_tts = tts.clone();
+        let worker_nexus = nexus.clone();
+        tokio::spawn(async move {
+            crate::core::voice_jobs::run_voice_worker_loop(worker_config, worker_tts, worker_nexus)
+                .await;
+        });
+    }
 
     // Migration / Startup Maintenance
-    let _ = aggregator
-        .backfill_history()
-        .await
-        .map_err(|e| log::warn!("Backfill failed: {}", e));
+    if content_generation_enabled {
+        let _ = aggregator
+            .backfill_history()
+            .await
+            .map_err(|e| log::warn!("Backfill failed: {}", e));
+    }
     let _ = registry
         .prune()
         .map(|n| log::info!("Pruned {} old topics", n));
@@ -489,13 +505,15 @@ pub async fn run_news_loop(
     });
 
     // Background Trace Log Cleanup (daily - removes trace files older than 7 days)
+    let trace_dir = PathBuf::from(&cache_dir)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("logs/traces");
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(24 * 3600)); // Daily
         interval.tick().await; // Skip first tick
         loop {
             interval.tick().await;
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            let trace_dir = std::path::PathBuf::from(&home).join(".freshloop/logs/traces");
             if let Ok(entries) = std::fs::read_dir(&trace_dir) {
                 let cutoff = std::time::SystemTime::now()
                     .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600))
@@ -521,6 +539,8 @@ pub async fn run_news_loop(
     let sched = JobScheduler::new()
         .await
         .expect("Failed to create scheduler");
+    let run_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let running = Arc::new(tokio::sync::Mutex::new(false));
     let timezone_config = config.clone();
     let get_now = move || {
         let offset = timezone_config.timezone_offset.unwrap_or(8);
@@ -529,228 +549,290 @@ pub async fn run_news_loop(
         chrono::Utc::now().with_timezone(&tz)
     };
 
-    // Scheduled runs
-    if let Some(times) = &config.schedule_times {
-        for time_str in times {
-            let parts: Vec<&str> = time_str.split(':').collect();
-            if parts.len() == 2 {
-                let h: i32 = parts[0].parse().unwrap_or(0);
-                let m: i32 = parts[1].parse().unwrap_or(0);
+    // Scheduled content generation runs
+    if content_generation_enabled {
+        // Scheduled runs
+        if let Some(times) = &config.schedule_times {
+            for time_str in times {
+                let parts: Vec<&str> = time_str.split(':').collect();
+                if parts.len() == 2 {
+                    let h: i32 = parts[0].parse().unwrap_or(0);
+                    let m: i32 = parts[1].parse().unwrap_or(0);
 
-                // Adjust for offset to get UTC cron string
-                let offset = config.timezone_offset.unwrap_or(8);
-                let mut utc_h = h - offset;
-                while utc_h < 0 {
-                    utc_h += 24;
-                }
-                while utc_h >= 24 {
-                    utc_h -= 24;
-                }
+                    // Adjust for offset to get UTC cron string
+                    let offset = config.timezone_offset.unwrap_or(8);
+                    let mut utc_h = h - offset;
+                    while utc_h < 0 {
+                        utc_h += 24;
+                    }
+                    while utc_h >= 24 {
+                        utc_h -= 24;
+                    }
 
-                let cron_str = format!("0 {} {} * * *", m, utc_h);
-                log::info!(
-                    "Adding scheduled job: {} (Local) -> {} (UTC Cron)",
-                    time_str,
-                    cron_str
-                );
+                    let cron_str = format!("0 {} {} * * *", m, utc_h);
+                    log::info!(
+                        "Adding scheduled job: {} (Local) -> {} (UTC Cron)",
+                        time_str,
+                        cron_str
+                    );
 
-                let c = config.clone();
-                let l = llm.clone();
-                let n = nexus.clone();
-                let a = aggregator.clone();
-                let b = buffer.clone();
-                let gn = get_now.clone();
+                    let c = config.clone();
+                    let l = llm.clone();
+                    let n = nexus.clone();
+                    let a = aggregator.clone();
+                    let b = buffer.clone();
+                    let gn = get_now.clone();
+                    let rl = run_lock.clone();
+                    let running = running.clone();
+                    let job_label = format!("Scheduled news cycle {}", time_str);
 
-                let job = Job::new_async(cron_str.as_str(), move |_uuid, _l| {
-                    let c = c.clone();
-                    let l = l.clone();
-                    let n = n.clone();
-                    let a = a.clone();
-                    let b = b.clone();
-                    let now = gn();
-                    Box::pin(async move {
-                        if let Err(e) = run_one_cycle(c, l, n, a, b, now).await {
-                            log::error!("Scheduled news cycle failed: {}", e);
-                        }
+                    let job = Job::new_async(cron_str.as_str(), move |_uuid, _l| {
+                        let c = c.clone();
+                        let l = l.clone();
+                        let n = n.clone();
+                        let a = a.clone();
+                        let b = b.clone();
+                        let now = gn();
+                        let rl = rl.clone();
+                        let running = running.clone();
+                        let job_label = job_label.clone();
+                        Box::pin(async move {
+                            run_with_shared_lock(job_label, rl, running, async move {
+                                if let Err(e) = run_one_cycle(c, l, n, a, b, now).await {
+                                    log::error!("Scheduled news cycle failed: {}", e);
+                                }
+                            })
+                            .await;
+                        })
                     })
-                })
-                .expect("Failed to create job");
-                sched.add(job).await.expect("Failed to add job");
-            }
-        }
-    } else {
-        // Fallback: Default hourly if no schedule (using cron)
-        log::info!("No schedule_times configured, adding hourly default job");
-        let c = config.clone();
-        let l = llm.clone();
-        let n = nexus.clone();
-        let a = aggregator.clone();
-        let b = buffer.clone();
-        let gn = get_now.clone();
-        let job = Job::new_async("0 0 * * * *", move |_uuid, _l| {
-            let c = c.clone();
-            let l = l.clone();
-            let n = n.clone();
-            let a = a.clone();
-            let b = b.clone();
-            let now = gn();
-            Box::pin(async move {
-                if let Err(e) = run_one_cycle(c, l, n, a, b, now).await {
-                    log::error!("Hourly news cycle failed: {}", e);
+                    .expect("Failed to create job");
+                    sched.add(job).await.expect("Failed to add job");
                 }
+            }
+        } else {
+            // Fallback: Default hourly if no schedule (using cron)
+            log::info!("No schedule_times configured, adding hourly default job");
+            let c = config.clone();
+            let l = llm.clone();
+            let n = nexus.clone();
+            let a = aggregator.clone();
+            let b = buffer.clone();
+            let gn = get_now.clone();
+            let rl = run_lock.clone();
+            let running = running.clone();
+            let job = Job::new_async("0 0 * * * *", move |_uuid, _l| {
+                let c = c.clone();
+                let l = l.clone();
+                let n = n.clone();
+                let a = a.clone();
+                let b = b.clone();
+                let now = gn();
+                let rl = rl.clone();
+                let running = running.clone();
+                Box::pin(async move {
+                    run_with_shared_lock(
+                        "Hourly news cycle".to_string(),
+                        rl,
+                        running,
+                        async move {
+                            if let Err(e) = run_one_cycle(c, l, n, a, b, now).await {
+                                log::error!("Hourly news cycle failed: {}", e);
+                            }
+                        },
+                    )
+                    .await;
+                })
             })
-        })
-        .expect("Failed to create hourly job");
-        sched.add(job).await.expect("Failed to add hourly job");
-    }
-
-    if curated_pipeline.is_enabled() {
-        let curated_times = config
-            .curated_feed
-            .as_ref()
-            .and_then(|feed| feed.schedule_times.clone())
-            .unwrap_or_else(|| vec!["08:30".to_string()]);
-
-        for time_str in curated_times {
-            if let Some(cron_str) = local_time_to_utc_cron(&time_str, config.timezone_offset) {
-                log::info!(
-                    "Adding curated feed job: {} (Local) -> {} (UTC Cron)",
-                    time_str,
-                    cron_str
-                );
-                let pipeline = curated_pipeline.clone();
-                let gn = get_now.clone();
-                let job = Job::new_async(cron_str.as_str(), move |_uuid, _l| {
-                    let pipeline = pipeline.clone();
-                    let now = gn();
-                    Box::pin(async move {
-                        if let Err(e) = pipeline.run_once(now).await {
-                            log::error!("Scheduled curated feed cycle failed: {}", e);
-                        }
-                    })
-                })
-                .expect("Failed to create curated feed job");
-                sched
-                    .add(job)
-                    .await
-                    .expect("Failed to add curated feed job");
-            } else {
-                log::warn!("Invalid curated feed schedule time '{}'", time_str);
-            }
+            .expect("Failed to create hourly job");
+            sched.add(job).await.expect("Failed to add hourly job");
         }
 
-        let weekly_digest_enabled = config
-            .curated_feed
-            .as_ref()
-            .and_then(|feed| feed.weekly_digest_enabled)
-            .unwrap_or(true);
-        if weekly_digest_enabled {
-            let weekly_times = config
+        if curated_pipeline.is_enabled() {
+            let curated_times = config
                 .curated_feed
                 .as_ref()
-                .and_then(|feed| feed.weekly_digest_schedule_times.clone())
-                .unwrap_or_else(|| vec!["21:00".to_string()]);
+                .and_then(|feed| feed.schedule_times.clone())
+                .unwrap_or_else(|| vec!["08:30".to_string()]);
 
-            for time_str in weekly_times {
+            for time_str in curated_times {
                 if let Some(cron_str) = local_time_to_utc_cron(&time_str, config.timezone_offset) {
                     log::info!(
-                        "Adding curated weekly digest check: {} (Local) -> {} (UTC Cron)",
+                        "Adding curated feed job: {} (Local) -> {} (UTC Cron)",
                         time_str,
                         cron_str
                     );
                     let pipeline = curated_pipeline.clone();
                     let gn = get_now.clone();
+                    let rl = run_lock.clone();
+                    let running = running.clone();
+                    let job_label = format!("Scheduled curated feed cycle {}", time_str);
                     let job = Job::new_async(cron_str.as_str(), move |_uuid, _l| {
                         let pipeline = pipeline.clone();
                         let now = gn();
+                        let rl = rl.clone();
+                        let running = running.clone();
+                        let job_label = job_label.clone();
                         Box::pin(async move {
-                            match pipeline.run_weekly_digest(now, false).await {
-                                Ok(stats) if stats.published => log::info!(
-                                    "Scheduled curated weekly digest published: included={}",
-                                    stats.included_items
-                                ),
-                                Ok(stats) => log::info!(
-                                    "Scheduled curated weekly digest skipped: {:?}",
-                                    stats.skipped_reason
-                                ),
-                                Err(e) => {
-                                    log::error!("Scheduled curated weekly digest failed: {}", e)
+                            run_with_shared_lock(job_label, rl, running, async move {
+                                if let Err(e) = pipeline.run_once(now).await {
+                                    log::error!("Scheduled curated feed cycle failed: {}", e);
                                 }
-                            }
+                            })
+                            .await;
                         })
                     })
-                    .expect("Failed to create curated weekly digest job");
+                    .expect("Failed to create curated feed job");
                     sched
                         .add(job)
                         .await
-                        .expect("Failed to add curated weekly digest job");
+                        .expect("Failed to add curated feed job");
                 } else {
-                    log::warn!("Invalid curated weekly digest schedule time '{}'", time_str);
+                    log::warn!("Invalid curated feed schedule time '{}'", time_str);
+                }
+            }
+
+            let weekly_digest_enabled = config
+                .curated_feed
+                .as_ref()
+                .and_then(|feed| feed.weekly_digest_enabled)
+                .unwrap_or(true);
+            if weekly_digest_enabled {
+                let weekly_times = config
+                    .curated_feed
+                    .as_ref()
+                    .and_then(|feed| feed.weekly_digest_schedule_times.clone())
+                    .unwrap_or_else(|| vec!["21:00".to_string()]);
+
+                for time_str in weekly_times {
+                    if let Some(cron_str) =
+                        local_time_to_utc_cron(&time_str, config.timezone_offset)
+                    {
+                        log::info!(
+                            "Adding curated weekly digest check: {} (Local) -> {} (UTC Cron)",
+                            time_str,
+                            cron_str
+                        );
+                        let pipeline = curated_pipeline.clone();
+                        let gn = get_now.clone();
+                        let rl = run_lock.clone();
+                        let running = running.clone();
+                        let job_label = format!("Scheduled curated weekly digest {}", time_str);
+                        let job = Job::new_async(cron_str.as_str(), move |_uuid, _l| {
+                            let pipeline = pipeline.clone();
+                            let now = gn();
+                            let rl = rl.clone();
+                            let running = running.clone();
+                            let job_label = job_label.clone();
+                            Box::pin(async move {
+                                run_with_shared_lock(job_label, rl, running, async move {
+                                    match pipeline.run_weekly_digest(now, false).await {
+                                        Ok(stats) if stats.published => log::info!(
+                                        "Scheduled curated weekly digest published: included={}",
+                                        stats.included_items
+                                    ),
+                                        Ok(stats) => log::info!(
+                                            "Scheduled curated weekly digest skipped: {:?}",
+                                            stats.skipped_reason
+                                        ),
+                                        Err(e) => {
+                                            log::error!(
+                                                "Scheduled curated weekly digest failed: {}",
+                                                e
+                                            )
+                                        }
+                                    }
+                                })
+                                .await;
+                            })
+                        })
+                        .expect("Failed to create curated weekly digest job");
+                        sched
+                            .add(job)
+                            .await
+                            .expect("Failed to add curated weekly digest job");
+                    } else {
+                        log::warn!("Invalid curated weekly digest schedule time '{}'", time_str);
+                    }
                 }
             }
         }
-    }
 
-    if loop_preference_pipeline.is_enabled() {
-        let loop_preference_times = config
-            .loop_preferences
-            .as_ref()
-            .and_then(|prefs| prefs.schedule_times.clone())
-            .unwrap_or_else(|| vec!["09:00".to_string(), "21:00".to_string()]);
+        if loop_preference_pipeline.is_enabled() {
+            let loop_preference_times = config
+                .loop_preferences
+                .as_ref()
+                .and_then(|prefs| prefs.schedule_times.clone())
+                .unwrap_or_else(|| vec!["09:00".to_string(), "21:00".to_string()]);
 
-        for time_str in loop_preference_times {
-            if let Some(cron_str) = local_time_to_utc_cron(&time_str, config.timezone_offset) {
-                log::info!(
-                    "Adding Loop preference extraction job: {} (Local) -> {} (UTC Cron)",
-                    time_str,
-                    cron_str
-                );
-                let pipeline = loop_preference_pipeline.clone();
-                let job = Job::new_async(cron_str.as_str(), move |_uuid, _l| {
-                    let pipeline = pipeline.clone();
-                    Box::pin(async move {
-                        match pipeline.run_once().await {
-                            Ok(stats) => log::info!(
-                                "Scheduled Loop preference extraction completed: considered={}, processed={}, skipped={}, failed={}, signals={}",
-                                stats.considered_posts,
-                                stats.processed_posts,
-                                stats.skipped_posts,
-                                stats.failed_posts,
-                                stats.written_signals
-                            ),
-                            Err(e) => log::error!(
-                                "Scheduled Loop preference extraction failed: {}",
-                                e
-                            ),
-                        }
+            for time_str in loop_preference_times {
+                if let Some(cron_str) = local_time_to_utc_cron(&time_str, config.timezone_offset) {
+                    log::info!(
+                        "Adding Loop preference extraction job: {} (Local) -> {} (UTC Cron)",
+                        time_str,
+                        cron_str
+                    );
+                    let pipeline = loop_preference_pipeline.clone();
+                    let rl = run_lock.clone();
+                    let running = running.clone();
+                    let job_label = format!("Scheduled Loop preference extraction {}", time_str);
+                    let job = Job::new_async(cron_str.as_str(), move |_uuid, _l| {
+                        let pipeline = pipeline.clone();
+                        let rl = rl.clone();
+                        let running = running.clone();
+                        let job_label = job_label.clone();
+                        Box::pin(async move {
+                            run_with_shared_lock(job_label, rl, running, async move {
+                                match pipeline.run_once().await {
+                                    Ok(stats) => log::info!(
+                                        "Scheduled Loop preference extraction completed: considered={}, processed={}, skipped={}, failed={}, signals={}",
+                                        stats.considered_posts,
+                                        stats.processed_posts,
+                                        stats.skipped_posts,
+                                        stats.failed_posts,
+                                        stats.written_signals
+                                    ),
+                                    Err(e) => log::error!(
+                                        "Scheduled Loop preference extraction failed: {}",
+                                        e
+                                    ),
+                                }
+                            })
+                            .await;
+                        })
                     })
-                })
-                .expect("Failed to create Loop preference extraction job");
-                sched
-                    .add(job)
-                    .await
-                    .expect("Failed to add Loop preference extraction job");
-            } else {
-                log::warn!("Invalid Loop preference schedule time '{}'", time_str);
+                    .expect("Failed to create Loop preference extraction job");
+                    sched
+                        .add(job)
+                        .await
+                        .expect("Failed to add Loop preference extraction job");
+                } else {
+                    log::warn!("Invalid Loop preference schedule time '{}'", time_str);
+                }
             }
         }
+    } else {
+        log::info!(
+            "[ContentGeneration] Disabled by config; skipping Cortex news, curated feed, weekly digest, preference extraction, and regeneration jobs"
+        );
     }
 
     // 3. Maintenance job (every minute)
-    let m_aggregator = aggregator.clone();
-    let maintenance_job = Job::new_async("0 * * * * *", move |_uuid, _l| {
-        let a = m_aggregator.clone();
-        Box::pin(async move {
-            if let Err(e) = a.process_regenerations().await {
-                log::error!("Regeneration cycle failed: {}", e);
-            }
+    if content_generation_enabled {
+        let m_aggregator = aggregator.clone();
+        let maintenance_job = Job::new_async("0 * * * * *", move |_uuid, _l| {
+            let a = m_aggregator.clone();
+            Box::pin(async move {
+                if let Err(e) = a.process_regenerations().await {
+                    log::error!("Regeneration cycle failed: {}", e);
+                }
+            })
         })
-    })
-    .expect("Failed to create maintenance job");
-    sched
-        .add(maintenance_job)
-        .await
-        .expect("Failed to add maintenance job");
+        .expect("Failed to create maintenance job");
+        sched
+            .add(maintenance_job)
+            .await
+            .expect("Failed to add maintenance job");
+    }
 
     sched.start().await.expect("Failed to start scheduler");
     log::info!("Job scheduler started successfully.");
@@ -771,7 +853,20 @@ pub async fn run_news_loop(
         );
     }
 
+    let source_cache = Arc::new(
+        crate::core::content::source_cache::SourceCache::open(
+            &PathBuf::from(&cache_dir).join("agent_sources"),
+        )
+        .expect("Failed to initialize source cache"),
+    );
+    if config.external_agent_enabled() {
+        tokio::spawn(crate::core::content::source_cache::run(
+            source_cache.clone(),
+            config.clone(),
+        ));
+    }
     let app_state = Arc::new(TriggerState {
+        source_cache,
         config: config.clone(),
         llm: llm.clone(),
         nexus: nexus.clone(),
@@ -781,11 +876,20 @@ pub async fn run_news_loop(
         curated_pipeline: curated_pipeline.clone(),
         loop_preference_pipeline: loop_preference_pipeline.clone(),
         get_now: Box::new(get_now),
-        running: tokio::sync::Mutex::new(false),
+        running,
+        run_lock,
         api_key,
     });
 
     let app = Router::new()
+        .route("/api/agent/sources", get(handle_source_list))
+        .route("/api/agent/sources/refresh", post(handle_source_refresh))
+        .route("/api/agent/sources/{id}", get(handle_source_get))
+        .route(
+            "/api/agent/sources/{id}/media/{index}",
+            get(handle_source_media),
+        )
+        .route("/api/agent/sources/{id}/fetch", post(handle_source_fetch))
         .route("/api/trigger", post(handle_trigger))
         .route("/api/trigger/feed", post(handle_feed_trigger))
         .route("/api/trigger/feed/weekly", post(handle_feed_weekly_trigger))
@@ -810,6 +914,7 @@ pub async fn run_news_loop(
 // --- HTTP Trigger API ---
 
 struct TriggerState {
+    source_cache: Arc<crate::core::content::source_cache::SourceCache>,
     config: Arc<Config>,
     llm: Arc<LlmClient>,
     nexus: Arc<NexusClient>,
@@ -819,7 +924,8 @@ struct TriggerState {
     curated_pipeline: Arc<CuratedFeedPipeline>,
     loop_preference_pipeline: Arc<LoopPreferencePipeline>,
     get_now: Box<dyn Fn() -> chrono::DateTime<chrono::FixedOffset> + Send + Sync>,
-    running: tokio::sync::Mutex<bool>,
+    running: Arc<tokio::sync::Mutex<bool>>,
+    run_lock: Arc<tokio::sync::Mutex<()>>,
     api_key: Option<String>,
 }
 
@@ -886,6 +992,37 @@ fn unauthorized_response() -> axum::response::Response {
         .into_response()
 }
 
+fn content_generation_disabled_response(action: &str) -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "success": false,
+            "message": format!(
+                "Cortex internal content generation is disabled by [content_generation] configuration; {} is not available. Submit content through the Nexus agent API and let voice_worker handle TTS.",
+                action
+            )
+        })),
+    )
+        .into_response()
+}
+
+async fn run_with_shared_lock<Fut>(
+    label: String,
+    run_lock: Arc<tokio::sync::Mutex<()>>,
+    running: Arc<tokio::sync::Mutex<bool>>,
+    fut: Fut,
+) where
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    log::info!("{} waiting for exclusive pipeline slot", label);
+    let _guard = run_lock.lock_owned().await;
+    *running.lock().await = true;
+    log::info!("{} started", label);
+    fut.await;
+    *running.lock().await = false;
+    log::info!("{} finished", label);
+}
+
 fn local_time_to_utc_cron(time_str: &str, timezone_offset: Option<i32>) -> Option<String> {
     let parts: Vec<&str> = time_str.split(':').collect();
     if parts.len() != 2 {
@@ -916,19 +1053,21 @@ async fn handle_trigger(
     if !has_valid_cortex_key(&headers, &state.api_key) {
         return unauthorized_response();
     }
+    if !state.config.content_generation_enabled() {
+        return content_generation_disabled_response("manual news trigger");
+    }
 
-    // Prevent concurrent triggers
-    {
-        let mut running = state.running.lock().await;
-        if *running {
+    let run_guard = match state.run_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
             return Json(TriggerResponse {
                 success: false,
                 message: "A cycle is already running. Please wait.".to_string(),
             })
             .into_response();
         }
-        *running = true;
-    }
+    };
+    *state.running.lock().await = true;
 
     let now = (state.get_now)();
     let flush_only = query.flush_only;
@@ -951,6 +1090,7 @@ async fn handle_trigger(
 
     // Run in background so the HTTP response returns immediately
     tokio::spawn(async move {
+        let _run_guard = run_guard;
         let result = if flush_only {
             // Skip RSS + LLM, directly process buffered clusters
             log::info!(
@@ -1001,24 +1141,28 @@ async fn handle_feed_trigger(
     if !has_valid_cortex_key(&headers, &state.api_key) {
         return unauthorized_response();
     }
+    if !state.config.content_generation_enabled() {
+        return content_generation_disabled_response("manual curated feed trigger");
+    }
 
-    {
-        let mut running = state.running.lock().await;
-        if *running {
+    let run_guard = match state.run_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
             return Json(TriggerResponse {
                 success: false,
                 message: "A cycle is already running. Please wait.".to_string(),
             })
             .into_response();
         }
-        *running = true;
-    }
+    };
+    *state.running.lock().await = true;
 
     let now = (state.get_now)();
     let pipeline = state.curated_pipeline.clone();
     let state_clone = state.clone();
 
     tokio::spawn(async move {
+        let _run_guard = run_guard;
         let result = pipeline.run_once(now).await;
         match &result {
             Ok(stats) => log::info!(
@@ -1052,18 +1196,21 @@ async fn handle_feed_weekly_trigger(
     if !has_valid_cortex_key(&headers, &state.api_key) {
         return unauthorized_response();
     }
+    if !state.config.content_generation_enabled() {
+        return content_generation_disabled_response("manual curated weekly digest trigger");
+    }
 
-    {
-        let mut running = state.running.lock().await;
-        if *running {
+    let run_guard = match state.run_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
             return Json(TriggerResponse {
                 success: false,
                 message: "A cycle is already running. Please wait.".to_string(),
             })
             .into_response();
         }
-        *running = true;
-    }
+    };
+    *state.running.lock().await = true;
 
     let now = (state.get_now)();
     let force = query.force;
@@ -1071,6 +1218,7 @@ async fn handle_feed_weekly_trigger(
     let state_clone = state.clone();
 
     tokio::spawn(async move {
+        let _run_guard = run_guard;
         let result = pipeline.run_weekly_digest(now, force).await;
         match &result {
             Ok(stats) if stats.published => log::info!(
@@ -1104,23 +1252,27 @@ async fn handle_loop_preferences_trigger(
     if !has_valid_cortex_key(&headers, &state.api_key) {
         return unauthorized_response();
     }
+    if !state.config.content_generation_enabled() {
+        return content_generation_disabled_response("manual Loop preference trigger");
+    }
 
-    {
-        let mut running = state.running.lock().await;
-        if *running {
+    let run_guard = match state.run_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
             return Json(TriggerResponse {
                 success: false,
                 message: "A cycle is already running. Please wait.".to_string(),
             })
             .into_response();
         }
-        *running = true;
-    }
+    };
+    *state.running.lock().await = true;
 
     let pipeline = state.loop_preference_pipeline.clone();
     let state_clone = state.clone();
 
     tokio::spawn(async move {
+        let _run_guard = run_guard;
         let result = pipeline.run_once().await;
         match &result {
             Ok(stats) => log::info!(
@@ -1158,14 +1310,24 @@ async fn handle_status(
     };
     let total_clusters: usize = category_stats.values().map(|(c, _)| c).sum();
     let now = (state.get_now)();
+    let content_generation_enabled = state.config.content_generation_enabled();
+    let voice_worker_enabled = state
+        .config
+        .voice_worker
+        .as_ref()
+        .map(|worker| worker.enabled)
+        .unwrap_or(true);
 
     Json(serde_json::json!({
         "status": if running { "running" } else { "idle" },
         "current_time": now.to_string(),
+        "content_generation_enabled": content_generation_enabled,
+        "external_agent_enabled": state.config.external_agent_enabled(),
+        "voice_worker_enabled": voice_worker_enabled,
         "pending_clusters": total_clusters,
-        "curated_feed_enabled": state.curated_pipeline.is_enabled(),
-        "curated_weekly_digest_enabled": state.config.curated_feed.as_ref().and_then(|feed| feed.weekly_digest_enabled).unwrap_or(true),
-        "loop_preferences_enabled": state.loop_preference_pipeline.is_enabled(),
+        "curated_feed_enabled": content_generation_enabled && state.curated_pipeline.is_enabled(),
+        "curated_weekly_digest_enabled": content_generation_enabled && state.config.curated_feed.as_ref().and_then(|feed| feed.weekly_digest_enabled).unwrap_or(true),
+        "loop_preferences_enabled": content_generation_enabled && state.loop_preference_pipeline.is_enabled(),
         "categories": category_stats.iter().map(|(k, (count, oldest))| {
             serde_json::json!({ "name": k, "clusters": count, "oldest_ts": oldest })
         }).collect::<Vec<_>>(),
@@ -1349,5 +1511,99 @@ async fn handle_nexus_health(
             "message": "Failed to check Nexus health"
         }))
         .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct SourceQuery {
+    product_line: Option<String>,
+    since: Option<i64>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+async fn handle_source_list(
+    State(state): State<Arc<TriggerState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<SourceQuery>,
+) -> axum::response::Response {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+    match state.source_cache.list(query.product_line.as_deref(), query.since.unwrap_or(0), query.offset.unwrap_or(0), query.limit.unwrap_or(30)) {
+        Ok(items) => Json(serde_json::json!({"sources": items, "categories": state.config.categories.as_ref().map(|cs| cs.iter().map(|c| serde_json::json!({"name":c.name,"description":c.description})).collect::<Vec<_>>())})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn handle_source_get(
+    State(state): State<Arc<TriggerState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+    match state.source_cache.get(&id) {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn handle_source_fetch(
+    State(state): State<Arc<TriggerState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+    let options = FeedFetchOptions::new(state.config.http_proxy.clone());
+    match state.source_cache.fetch_article(&id, &options).await {
+        Ok(record) => Json(record).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
+}
+
+async fn handle_source_refresh(
+    State(state): State<Arc<TriggerState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+    match state.source_cache.refresh(&state.config).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (StatusCode::CONFLICT, e.to_string()).into_response(),
+    }
+}
+
+async fn handle_source_media(
+    State(state): State<Arc<TriggerState>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, index)): axum::extract::Path<(String, usize)>,
+) -> axum::response::Response {
+    if !has_valid_cortex_key(&headers, &state.api_key) {
+        return unauthorized_response();
+    }
+    match state
+        .source_cache
+        .fetch_media(
+            &id,
+            index,
+            &FeedFetchOptions::new(state.config.http_proxy.clone()),
+        )
+        .await
+    {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CONTENT_DISPOSITION, "attachment"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
 }

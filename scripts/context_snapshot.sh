@@ -25,6 +25,8 @@ for file in \
     AGENTS.md \
     task.md \
     docs/agent-memory.md \
+    docs/agent-content-workflow.md \
+    docs/scheduled-agent-runbook.md \
     docs/build-and-deploy.md \
     docs/freshloop-product-style.md
 do

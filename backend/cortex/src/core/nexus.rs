@@ -154,9 +154,62 @@ pub struct MemoryProfilePayload {
     pub prompt_context: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct VoiceJobPayload {
+    pub id: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub product_line: String,
+    pub voice_kind: String,
+    pub text: String,
+    pub file_prefix: String,
+    pub status: String,
+    pub priority: Option<i64>,
+    pub run_after: Option<i64>,
+    pub lease_owner: Option<String>,
+    pub lease_token: Option<String>,
+    pub lease_expires_at: Option<i64>,
+    pub attempt_count: Option<i64>,
+    pub max_attempts: Option<i64>,
+    pub audio_url: Option<String>,
+    pub duration_sec: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct LeaseVoiceJobRequest {
+    worker_id: String,
+    voice_kinds: Option<Vec<String>>,
+    lease_seconds: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct LeaseVoiceJobResponse {
+    job: Option<VoiceJobPayload>,
+}
+
+#[derive(Serialize)]
+struct RepairVoiceJobsRequest {
+    limit: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RepairVoiceJobsResponse {
+    pub created: usize,
+    pub backfilled_completed: usize,
+    pub skipped_active: usize,
+    pub skipped_recent_failures: usize,
+    pub skipped_missing_text: usize,
+    pub scanned: usize,
+    pub voice_job_ids: Vec<String>,
+}
+
 impl NexusClient {
     pub fn new(config: NexusConfig) -> Self {
-        let client = Self::build_client();
+        let client = Self::build_client(&config);
         let health = ConnectionHealth {
             is_healthy: true,
             latency_ms: 0,
@@ -172,8 +225,17 @@ impl NexusClient {
         }
     }
 
-    fn build_client() -> Client {
-        Client::builder()
+    fn build_client(config: &NexusConfig) -> Client {
+        let mut builder = Client::builder();
+        if let (Some(ip), Ok(url)) = (config.connect_ip, reqwest::Url::parse(&config.api_url)) {
+            if let Some(host) = url.host_str() {
+                builder = builder.resolve(
+                    host,
+                    std::net::SocketAddr::new(ip, url.port_or_known_default().unwrap_or(443)),
+                );
+            }
+        }
+        builder
             .timeout(std::time::Duration::from_secs(300)) // 5 minutes for large uploads
             .connect_timeout(std::time::Duration::from_secs(10)) // Fast fail on connection to allow retry
             .pool_idle_timeout(Some(std::time::Duration::from_secs(30))) // Close idle connections quickly
@@ -185,7 +247,7 @@ impl NexusClient {
     /// Refresh the HTTP client to bypass DNS cache
     pub async fn refresh_client(&self) {
         log::info!("[NexusClient] Refreshing HTTP client to bypass DNS cache");
-        let new_client = Self::build_client();
+        let new_client = Self::build_client(&self.config);
         *self.client.write().await = new_client;
     }
 
@@ -348,6 +410,262 @@ impl NexusClient {
 
     pub async fn upload_audio(&self, audio_data: Vec<u8>, filename: &str) -> Result<String> {
         self.upload_file(audio_data, filename, "audio/mpeg").await
+    }
+
+    pub async fn lease_voice_job(
+        &self,
+        worker_id: &str,
+        voice_kinds: Option<Vec<String>>,
+        lease_seconds: Option<i64>,
+    ) -> Result<Option<VoiceJobPayload>> {
+        let url = format!(
+            "{}/api/internal/agent/voice-jobs/lease",
+            self.config.api_url
+        );
+        let auth_key = self.config.auth_key.clone();
+        let payload = serde_json::to_value(LeaseVoiceJobRequest {
+            worker_id: worker_id.to_string(),
+            voice_kinds,
+            lease_seconds,
+        })?;
+
+        let res = self
+            .request_with_retry(|client| {
+                let url = url.clone();
+                let auth_key = auth_key.clone();
+                let payload = payload.clone();
+                async move {
+                    client
+                        .post(&url)
+                        .header("X-NEXUS-KEY", &auth_key)
+                        .json(&payload)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!("Failed to lease voice job: {} - {}", status, text));
+        }
+
+        let body: LeaseVoiceJobResponse = res.json().await?;
+        Ok(body.job)
+    }
+
+    pub async fn get_voice_job(&self, id: &str) -> Result<Option<VoiceJobPayload>> {
+        let url = format!(
+            "{}/api/internal/agent/voice-jobs/{}",
+            self.config.api_url, id
+        );
+        let auth_key = self.config.auth_key.clone();
+
+        let res = self
+            .request_with_retry(|client| {
+                let url = url.clone();
+                let auth_key = auth_key.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("X-NEXUS-KEY", &auth_key)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to get voice job {}: {} - {}",
+                id,
+                status,
+                text
+            ));
+        }
+
+        Ok(Some(res.json().await?))
+    }
+
+    pub async fn repair_missing_voice_jobs(
+        &self,
+        limit: Option<i64>,
+    ) -> Result<RepairVoiceJobsResponse> {
+        let url = format!(
+            "{}/api/internal/agent/voice-jobs/repair",
+            self.config.api_url
+        );
+        let auth_key = self.config.auth_key.clone();
+        let payload = serde_json::to_value(RepairVoiceJobsRequest { limit })?;
+
+        let res = self
+            .request_with_retry(|client| {
+                let url = url.clone();
+                let auth_key = auth_key.clone();
+                let payload = payload.clone();
+                async move {
+                    client
+                        .post(&url)
+                        .header("X-NEXUS-KEY", &auth_key)
+                        .json(&payload)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to repair missing voice jobs: {} - {}",
+                status,
+                text
+            ));
+        }
+
+        Ok(res.json().await?)
+    }
+
+    pub async fn heartbeat_voice_job(
+        &self,
+        id: &str,
+        lease_token: &str,
+        lease_seconds: Option<i64>,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/internal/agent/voice-jobs/{}/heartbeat",
+            self.config.api_url, id
+        );
+        let auth_key = self.config.auth_key.clone();
+        let payload = serde_json::json!({
+            "lease_token": lease_token,
+            "lease_seconds": lease_seconds,
+        });
+
+        let res = self
+            .request_with_retry(|client| {
+                let url = url.clone();
+                let auth_key = auth_key.clone();
+                let payload = payload.clone();
+                async move {
+                    client
+                        .post(&url)
+                        .header("X-NEXUS-KEY", &auth_key)
+                        .json(&payload)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to heartbeat voice job {}: {} - {}",
+                id,
+                status,
+                text
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub async fn complete_voice_job(
+        &self,
+        id: &str,
+        lease_token: &str,
+        audio_url: &str,
+        duration_sec: Option<i64>,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/internal/agent/voice-jobs/{}/complete",
+            self.config.api_url, id
+        );
+        let auth_key = self.config.auth_key.clone();
+        let payload = serde_json::json!({
+            "lease_token": lease_token,
+            "audio_url": audio_url,
+            "duration_sec": duration_sec,
+        });
+
+        let res = self
+            .request_with_retry(|client| {
+                let url = url.clone();
+                let auth_key = auth_key.clone();
+                let payload = payload.clone();
+                async move {
+                    client
+                        .post(&url)
+                        .header("X-NEXUS-KEY", &auth_key)
+                        .json(&payload)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to complete voice job {}: {} - {}",
+                id,
+                status,
+                text
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub async fn fail_voice_job(&self, id: &str, lease_token: &str, error: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/internal/agent/voice-jobs/{}/fail",
+            self.config.api_url, id
+        );
+        let auth_key = self.config.auth_key.clone();
+        let payload = serde_json::json!({
+            "lease_token": lease_token,
+            "error": error,
+        });
+
+        let res = self
+            .request_with_retry(|client| {
+                let url = url.clone();
+                let auth_key = auth_key.clone();
+                let payload = payload.clone();
+                async move {
+                    client
+                        .post(&url)
+                        .header("X-NEXUS-KEY", &auth_key)
+                        .json(&payload)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to fail voice job {}: {} - {}",
+                id,
+                status,
+                text
+            ));
+        }
+
+        Ok(())
     }
 
     pub async fn push_item(&self, item: ItemPayload) -> Result<String> {

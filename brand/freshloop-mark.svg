@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">FreshLoop</title>
+  <g
+    fill="none"
+    stroke="#19E66B"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path
+      d="M250 674C140 674 78 602 78 512S140 350 250 350c112 0 192 86 262 162 70 76 150 162 262 162 110 0 172-72 172-162s-62-162-172-162c-112 0-192 86-262 162-70 76-150 162-262 162Z"
+      stroke-width="64"
+    />
+    <path
+      d="M168 493c68-50 164-36 250 42"
+      stroke-width="38"
+    />
+    <path
+      d="M598 516h38l30-78 38 160 38-134 30 52h72"
+      stroke-width="38"
+    />
+  </g>
+</svg>

@@ -40,6 +40,8 @@ fn build_cors_layer() -> CorsLayer {
         .filter(|origins| !origins.is_empty())
         .unwrap_or_else(|| {
             vec![
+                "https://news.hackerlife.fun".to_string(),
+                "https://news.hackerlife.fun:8443".to_string(),
                 "http://localhost:3000".to_string(),
                 "http://127.0.0.1:3000".to_string(),
                 "http://localhost:8899".to_string(),
@@ -68,7 +70,7 @@ fn build_cors_layer() -> CorsLayer {
 async fn main() {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "nexus=debug,tower_http=debug".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "nexus=info,tower_http=info".into()),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -176,6 +178,62 @@ async fn main() {
         .route(
             "/api/internal/memory/profile/{user_id}",
             get(routes::memory::get_memory_profile_internal),
+        )
+        .route(
+            "/api/internal/agent/capabilities",
+            get(routes::agent::capabilities),
+        )
+        .route(
+            "/api/internal/agent/jobs",
+            post(routes::agent::create_agent_job),
+        )
+        .route(
+            "/api/internal/agent/jobs/lease",
+            post(routes::agent::lease_agent_job),
+        )
+        .route(
+            "/api/internal/agent/jobs/{id}/context",
+            get(routes::agent::get_agent_job_context),
+        )
+        .route(
+            "/api/internal/agent/jobs/{id}/heartbeat",
+            post(routes::agent::heartbeat_agent_job),
+        )
+        .route(
+            "/api/internal/agent/jobs/{id}/submit",
+            post(routes::agent::submit_agent_job),
+        )
+        .route(
+            "/api/internal/agent/jobs/{id}/fail",
+            post(routes::agent::fail_agent_job),
+        )
+        .route(
+            "/api/internal/agent/voice-jobs",
+            get(routes::agent::list_voice_jobs),
+        )
+        .route(
+            "/api/internal/agent/voice-jobs/repair",
+            post(routes::agent::repair_missing_voice_jobs),
+        )
+        .route(
+            "/api/internal/agent/voice-jobs/{id}",
+            get(routes::agent::get_voice_job),
+        )
+        .route(
+            "/api/internal/agent/voice-jobs/lease",
+            post(routes::agent::lease_voice_job),
+        )
+        .route(
+            "/api/internal/agent/voice-jobs/{id}/heartbeat",
+            post(routes::agent::heartbeat_voice_job),
+        )
+        .route(
+            "/api/internal/agent/voice-jobs/{id}/complete",
+            post(routes::agent::complete_voice_job),
+        )
+        .route(
+            "/api/internal/agent/voice-jobs/{id}/fail",
+            post(routes::agent::fail_voice_job),
         )
         .route(
             "/api/internal/items/multipart",

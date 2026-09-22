@@ -101,7 +101,16 @@ pub async fn fetch_url_bytes(url: &str, options: &FeedFetchOptions) -> Result<by
 
 async fn fetch_bytes(url: &str, proxy_url: Option<&str>) -> Result<bytes::Bytes> {
     let client = build_client(proxy_url)?;
-    Ok(client.get(url).send().await?.bytes().await?)
+    let mut response = client.get(url).send().await?.error_for_status()?;
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_BYTES {
+            return Err(anyhow!("source exceeds 8 MiB limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.into())
 }
 
 fn build_client(proxy_url: Option<&str>) -> Result<reqwest::Client> {
@@ -196,6 +205,9 @@ fn persist_proxy_domains(domains: &HashSet<String>) {
 }
 
 fn proxy_domain_cache_path() -> PathBuf {
+    if let Some(root) = std::env::var_os("CORTEX_DATA_DIR") {
+        return PathBuf::from(root).join("cache/feed_proxy_domains.json");
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(PROXY_DOMAIN_CACHE)
@@ -217,10 +229,55 @@ pub(crate) fn parse_feed_entries(content: &[u8]) -> Result<Vec<FetchedEntry>> {
         .entries
         .into_iter()
         .map(|entry| {
+            let mut media: Vec<super::source_cache::MediaLink> = entry
+                .media
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter_map(|m| {
+                    let url = m.url.as_ref()?;
+                    let kind = m
+                        .content_type
+                        .as_ref()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default();
+                    Some(super::source_cache::MediaLink {
+                        kind: kind.split('/').next().unwrap_or("media").to_string(),
+                        url: url.to_string(),
+                        description: String::new(),
+                        inspected: false,
+                    })
+                })
+                .collect();
+            media.extend(
+                entry
+                    .links
+                    .iter()
+                    .filter(|l| l.rel.as_deref() == Some("enclosure"))
+                    .map(|l| super::source_cache::MediaLink {
+                        kind: l
+                            .media_type
+                            .as_deref()
+                            .unwrap_or("media")
+                            .split('/')
+                            .next()
+                            .unwrap_or("media")
+                            .to_string(),
+                        url: l.href.clone(),
+                        description: String::new(),
+                        inspected: false,
+                    }),
+            );
             let title = entry.title.map(|t| t.content).unwrap_or_default();
             let link = entry
                 .links
-                .first()
+                .iter()
+                .find(|link| {
+                    link.rel.as_deref().is_none_or(|rel| rel == "alternate")
+                        && link
+                            .media_type
+                            .as_deref()
+                            .is_none_or(|kind| kind == "text/html")
+                })
                 .map(|l| l.href.clone())
                 .unwrap_or_default();
 
@@ -235,6 +292,7 @@ pub(crate) fn parse_feed_entries(content: &[u8]) -> Result<Vec<FetchedEntry>> {
             let pub_date = entry.published.or(entry.updated).map(|d| d.to_rfc3339());
 
             FetchedEntry {
+                media,
                 title,
                 link,
                 description,
@@ -312,5 +370,32 @@ mod tests {
             Some("example.com")
         );
         assert_eq!(proxy_cache_key("not a url"), None);
+    }
+    #[test]
+    fn atom_uses_article_not_self_link_and_preserves_enclosure() {
+        let xml = br#"<feed xmlns="http://www.w3.org/2005/Atom"><title>Podcast</title><entry><title>Episode</title><id>x</id><updated>2026-09-21T00:00:00Z</updated><link rel="self" href="https://example.org/api/item" type="application/atom+xml"/><link rel="alternate" href="https://example.org/article" type="text/html"/><link rel="enclosure" href="https://example.org/audio.mp3" type="audio/mpeg"/></entry></feed>"#;
+        let entries = parse_feed_entries(xml).unwrap();
+        assert_eq!(entries[0].link, "https://example.org/article");
+        assert!(entries[0]
+            .media
+            .iter()
+            .any(|m| m.url == "https://example.org/audio.mp3"));
+    }
+
+    #[tokio::test]
+    async fn http_error_is_not_cached_as_successful_source() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/feed", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let _ = socket.read(&mut request).await;
+            socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops").await.unwrap();
+        });
+        assert!(fetch_url_bytes(&url, &FeedFetchOptions::default())
+            .await
+            .is_err());
+        server.await.unwrap();
     }
 }

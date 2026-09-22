@@ -1,11 +1,11 @@
 use crate::core::config::{load_config, TtsConfig as CortexTtsConfig};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::{mpsc::RecvTimeoutError, Arc, OnceLock};
+use std::sync::{mpsc::RecvTimeoutError, Arc};
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
 use tts::{EngineFactory, TtsEngine};
@@ -20,6 +20,8 @@ use uuid::Uuid;
 const MAX_TOTAL_CHARS: usize = 8000;
 const DEFAULT_TTS_WORKER_MEMORY_LIMIT_MB: u64 = 24 * 1024;
 const DEFAULT_TTS_WORKER_IDLE_TIMEOUT_SECS: u64 = 20 * 60;
+const DEFAULT_TTS_WORKER_MAX_PROCESSES: usize = 1;
+const MAX_TTS_WORKER_MAX_PROCESSES: usize = 4;
 const PRODUCTION_VOXCPM_MAX_LEN: usize = 1024;
 const PRODUCTION_VOXCPM_INFERENCE_TIMESTEPS: usize = 10;
 const PRODUCTION_VOXCPM_CFG_VALUE: f64 = 2.0;
@@ -69,6 +71,8 @@ pub struct TtsClient {
     process_isolation: bool,
     worker_memory_limit_mb: u64,
     worker_idle_timeout: Duration,
+    worker_max_processes: usize,
+    worker_semaphore: Arc<Semaphore>,
 }
 
 impl TtsClient {
@@ -115,6 +119,7 @@ impl TtsClient {
         let worker_memory_limit_mb = config
             .worker_memory_limit_mb
             .unwrap_or(DEFAULT_TTS_WORKER_MEMORY_LIMIT_MB);
+        let worker_max_processes = normalize_tts_worker_max_processes(config.worker_max_processes);
         let worker_idle_timeout = Duration::from_secs(
             config
                 .worker_idle_timeout_secs
@@ -196,13 +201,14 @@ impl TtsClient {
         };
 
         log::info!(
-            "[TTS] Runtime policy: engine={}, device={}, keep_engine_loaded={}, process_isolation={}, worker_memory_limit_mb={}, worker_idle_timeout_secs={}",
+            "[TTS] Runtime policy: engine={}, device={}, keep_engine_loaded={}, process_isolation={}, worker_memory_limit_mb={}, worker_idle_timeout_secs={}, worker_max_processes={}",
             engine_name,
             device_name,
             keep_engine_loaded,
             process_isolation,
             worker_memory_limit_mb,
             worker_idle_timeout.as_secs(),
+            worker_max_processes,
         );
 
         Self {
@@ -213,6 +219,8 @@ impl TtsClient {
             process_isolation,
             worker_memory_limit_mb,
             worker_idle_timeout,
+            worker_max_processes,
+            worker_semaphore: Arc::new(Semaphore::new(worker_max_processes)),
         }
     }
 
@@ -501,11 +509,14 @@ impl TtsClient {
         request: TtsWorkerRequest,
         output_ext: &str,
     ) -> Result<(Vec<u8>, TtsWorkerResponse)> {
-        let semaphore = tts_worker_semaphore();
-        if semaphore.available_permits() == 0 {
-            log::info!("[TTS] Waiting for existing TTS worker to finish before starting another");
+        if self.worker_semaphore.available_permits() == 0 {
+            log::info!(
+                "[TTS] Waiting for one of {} TTS worker slots to become available",
+                self.worker_max_processes
+            );
         }
-        let _worker_slot = semaphore
+        let _worker_slot = self
+            .worker_semaphore
             .acquire()
             .await
             .map_err(|e| anyhow::anyhow!("TTS worker semaphore closed: {}", e))?;
@@ -527,6 +538,7 @@ impl TtsClient {
         let stdout_file = std::fs::File::create(&stdout_path)?;
         let stderr_file = std::fs::File::create(&stderr_path)?;
         let mut child = Command::new(std::env::current_exe()?)
+            .kill_on_drop(true)
             .arg("tts-worker")
             .arg(&input_path)
             .arg(&output_path)
@@ -699,6 +711,8 @@ impl TtsClient {
     }
 
     fn bounded_text(raw_text: &str) -> String {
+        let normalized = super::speech_text::prepare_speech(raw_text);
+        let raw_text = normalized.as_str();
         if raw_text.chars().count() > MAX_TOTAL_CHARS {
             log::warn!(
                 "[TTS] Text too long ({} chars > {} limit), truncating",
@@ -738,9 +752,9 @@ pub async fn run_tts_worker(
             text: request.prompt_override.clone(),
             wav_path: request.voice_override.clone(),
         };
-        if let Err(e) = engine.cache_voice_prompt(&override_prompt) {
-            log::warn!("Failed to apply worker voice override cache: {}", e);
-        }
+        engine
+            .cache_voice_prompt(&override_prompt)
+            .context("apply requested host voice")?;
     }
 
     match request.mode {
@@ -1725,6 +1739,8 @@ fn stabilize_tts_chunks(chunks: Vec<String>, max_chars: usize) -> Vec<String> {
 }
 
 fn split_tts_text_with_max_chars(text: &str, max_chars: usize) -> Vec<String> {
+    let normalized = super::speech_text::prepare_speech(text);
+    let text = normalized.as_str();
     let max_chars = max_chars.max(1);
     let chunks = tts::chunk_text(text);
     if chunks.is_empty() {
@@ -1776,16 +1792,14 @@ fn tts_stable_chunk_max_chars(config: &LibTtsConfig) -> usize {
 }
 
 fn tts_worker_temp_dir() -> PathBuf {
+    if let Some(root) = std::env::var_os("CORTEX_DATA_DIR") {
+        return PathBuf::from(root).join("cache/tts_worker");
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".freshloop")
         .join("cache")
         .join("tts_worker")
-}
-
-fn tts_worker_semaphore() -> &'static Semaphore {
-    static SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
-    SEMAPHORE.get_or_init(|| Semaphore::new(1))
 }
 
 async fn wait_for_worker_with_limits(
@@ -1794,6 +1808,7 @@ async fn wait_for_worker_with_limits(
     memory_limit_mb: u64,
     idle_timeout: Duration,
 ) -> Result<ExitStatus> {
+    let mut system = System::new();
     let mut last_progress = Instant::now();
     let mut last_progress_mtime = progress_mtime(progress_path);
 
@@ -1817,7 +1832,7 @@ async fn wait_for_worker_with_limits(
         }
 
         if let Some(child_id) = child.id() {
-            let memory_mb = process_memory_mb(child_id);
+            let memory_mb = process_memory_mb(&mut system, child_id);
             if memory_mb > memory_limit_mb {
                 let _ = child.kill().await;
                 anyhow::bail!(
@@ -1851,9 +1866,12 @@ fn write_worker_progress(path: &Path, status: &str) -> Result<()> {
     Ok(())
 }
 
-fn process_memory_mb(pid: u32) -> u64 {
-    let mut system = System::new_all();
-    system.refresh_all();
+fn process_memory_mb(system: &mut System, pid: u32) -> u64 {
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing().with_memory(),
+    );
     system
         .process(Pid::from_u32(pid))
         .map(|process| process.memory() / 1024 / 1024)
@@ -1878,6 +1896,12 @@ fn cleanup_worker_files(paths: &[&Path]) {
     }
 }
 
+fn normalize_tts_worker_max_processes(value: Option<usize>) -> usize {
+    value
+        .unwrap_or(DEFAULT_TTS_WORKER_MAX_PROCESSES)
+        .clamp(1, MAX_TTS_WORKER_MAX_PROCESSES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1900,6 +1924,7 @@ mod tests {
             worker_memory_limit_mb: None,
             worker_idle_timeout_secs: None,
             worker_timeout_secs: None,
+            worker_max_processes: None,
             voxcpm: None,
             qwen3: None,
             magictts: None,
@@ -1989,6 +2014,30 @@ mod tests {
 
         assert_eq!(engine, "voxcpm_metal");
         assert_eq!(device, "metal");
+    }
+
+    #[test]
+    fn tts_worker_max_processes_defaults_and_clamps() {
+        let default_client = TtsClient::new(tts_config("voxcpm", None));
+        assert_eq!(default_client.worker_max_processes, 1);
+        assert_eq!(default_client.worker_semaphore.available_permits(), 1);
+
+        let mut two_workers = tts_config("voxcpm", None);
+        two_workers.worker_max_processes = Some(2);
+        let two_worker_client = TtsClient::new(two_workers);
+        assert_eq!(two_worker_client.worker_max_processes, 2);
+        assert_eq!(two_worker_client.worker_semaphore.available_permits(), 2);
+
+        let mut too_low = tts_config("voxcpm", None);
+        too_low.worker_max_processes = Some(0);
+        assert_eq!(TtsClient::new(too_low).worker_max_processes, 1);
+
+        let mut too_high = tts_config("voxcpm", None);
+        too_high.worker_max_processes = Some(99);
+        assert_eq!(
+            TtsClient::new(too_high).worker_max_processes,
+            MAX_TTS_WORKER_MAX_PROCESSES
+        );
     }
 
     #[test]

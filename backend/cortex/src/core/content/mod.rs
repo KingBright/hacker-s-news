@@ -9,3 +9,5 @@ pub use model::FetchedEntry;
 pub use normalizer::clean_text_for_processing;
 pub use opml::parse_opml_sources;
 pub use source::{ContentSource, ProductLine};
+
+pub mod source_cache;

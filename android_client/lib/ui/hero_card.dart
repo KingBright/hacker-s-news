@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
 import 'theme.dart';
 
 class HeroCard extends StatelessWidget {
@@ -16,16 +15,18 @@ class HeroCard extends StatelessWidget {
 
   String _getGreeting() {
     final hour = DateTime.now().hour;
-    if (hour < 5) return "Good Late Night";
-    if (hour < 12) return "Good Morning";
-    if (hour < 17) return "Good Afternoon";
-    if (hour < 21) return "Good Evening";
-    return "Good Night";
+    if (hour < 5) return "夜深了";
+    if (hour < 12) return "早上好";
+    if (hour < 17) return "下午好";
+    if (hour < 21) return "晚上好";
+    return "夜间好";
   }
 
   @override
   Widget build(BuildContext context) {
-    final today = DateFormat('EEEE, MMM d').format(DateTime.now());
+    final now = DateTime.now();
+    const weekdays = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日'];
+    final today = '${now.month}月${now.day}日 ${weekdays[now.weekday - 1]}';
 
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -55,7 +56,7 @@ class HeroCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            today.toUpperCase(),
+            today,
             style: const TextStyle(
               color: AppTheme.textMuted,
               fontSize: 12,
@@ -91,7 +92,7 @@ class HeroCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      "Fresh stories",
+                      "待听内容",
                       style: TextStyle(
                         color: Colors.white,
                         fontSize: 16,
@@ -99,7 +100,7 @@ class HeroCard extends StatelessWidget {
                       ),
                     ),
                     Text(
-                      "Tailored for you",
+                      "已为你整理",
                       style: TextStyle(color: Colors.white54, fontSize: 13),
                     ),
                   ],

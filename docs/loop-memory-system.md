@@ -92,13 +92,13 @@ Internal preference extraction:
 - `POST /api/trigger/loop/preferences`: manually trigger extraction from the
   Cortex trigger API.
 
-The default scheduled extraction times are `09:00` and `21:00` local time,
+The default scheduled extraction times are `07:30` and `18:00` local time,
 unless overridden by:
 
 ```toml
 [loop_preferences]
 enabled = true
-schedule_times = ["09:00", "21:00"]
+schedule_times = ["07:30", "18:00"]
 max_posts_per_cycle = 20
 # personalization_user_id = "USER_ID"
 profile_context_max_chars = 3200

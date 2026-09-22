@@ -5,6 +5,18 @@ BASE_URL="${BASE_URL:-https://news.hackerlife.fun:8443}"
 CORTEX_URL="${CORTEX_URL:-http://localhost:3721}"
 EXPECT_ITEMS="${EXPECT_ITEMS:-1}"
 NEXUS_KEY="${NEXUS_KEY:-}"
+CORTEX_API_KEY="${CORTEX_API_KEY:-}"
+CURL_ROUTE_ARGS=()
+if [ -n "${NEXUS_CONNECT_IP:-}" ]; then
+    route="$(python3 - "$BASE_URL" "$NEXUS_CONNECT_IP" <<'PYROUTE'
+import ipaddress, sys
+from urllib.parse import urlparse
+url = urlparse(sys.argv[1])
+print(f"{url.hostname}:{url.port or (443 if url.scheme == 'https' else 80)}:{ipaddress.ip_address(sys.argv[2])}")
+PYROUTE
+)"
+    CURL_ROUTE_ARGS=(--resolve "$route")
+fi
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -18,7 +30,10 @@ request() {
     local url="$2"
     local body_file="$3"
     shift 3
-    curl -sS -X "$method" "$url" "$@" -o "$body_file" -w '%{http_code}'
+    if [[ "$url" == "$CORTEX_URL/"* ]] && [ -n "$CORTEX_API_KEY" ]; then
+        set -- -H "X-CORTEX-KEY: $CORTEX_API_KEY" "$@"
+    fi
+    curl -sS "${CURL_ROUTE_ARGS[@]}" -X "$method" "$url" "$@" -o "$body_file" -w '%{http_code}'
 }
 
 assert_status() {
@@ -64,8 +79,15 @@ assert_status "$status" "200" "GET /api/status"
 python3 - "$tmpdir/body" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
-assert data.get("curated_feed_enabled") is True, "curated_feed_enabled must be true"
-print("PASS /api/status curated_feed_enabled=true")
+content_generation_enabled = data.get("content_generation_enabled", True)
+if content_generation_enabled:
+    assert data.get("curated_feed_enabled") is True, "curated_feed_enabled must be true when content generation is enabled"
+    print("PASS /api/status content_generation_enabled=true curated_feed_enabled=true")
+else:
+    assert data.get("curated_feed_enabled") is False, "curated_feed_enabled must be false when content generation is disabled"
+    assert data.get("loop_preferences_enabled") is False, "loop_preferences_enabled must be false when content generation is disabled"
+    assert data.get("voice_worker_enabled") is True, "voice_worker_enabled must remain true in agent-driven mode"
+    print("PASS /api/status agent-mode content_generation_enabled=false voice_worker_enabled=true")
 PY
 
 say "Nexus health"

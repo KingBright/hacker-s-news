@@ -6,45 +6,62 @@ inspect the script before changing behavior.
 
 ## Android
 
-Use:
+There is one release command:
 
 ```bash
 ./scripts/deploy.sh --android
 ```
 
-What it does:
+No manual version edit is required for the normal patch-release path:
 
-- Locates Homebrew `openjdk@17`.
-- Exports `JAVA_HOME` and prepends `$JAVA_HOME/bin` to `PATH`.
-- Runs `flutter build apk --release --target-platform android-arm64` from
-  `android_client/`.
-- Copies `android_client/build/app/outputs/flutter-apk/app-release.apk` to
-  `frontend/public/android-app.apk`.
-- Regenerates `frontend/public/version.json` from
-  `android_client/pubspec.yaml`.
-- Builds and uploads the frontend so the new APK and `version.json` are
-  published together.
+- If the local build equals the build currently published on port 8443, the
+  command increments the patch version and build number exactly once.
+- If the local build is already newer than production, the command keeps that
+  unpublished version. Retrying a failed release therefore does not bump again.
+- If the local build is behind production, the command stops. Update the
+  checkout instead of overwriting a newer release.
+
+Use `--bump minor` or `--bump major` only when local and production builds still
+match and the release intentionally changes that semantic version component.
+
+The release contract then:
+
+- Fetches the current production `version.json` and APK only from
+  `https://news.hackerlife.fun:8443`, with cache busting.
+- Preflights Java, Flutter, `aapt`, `apksigner`, `curl`, Python, and SHA-256
+  tooling before changing the version.
+- Builds the arm64 release APK and verifies the copied bytes are identical.
+- Verifies package `fun.hackerlife.freshloop`, label `FreshLoop`, manifest
+  `versionName`/`versionCode`, canonical download URL, and signing-certificate
+  continuity with the currently installed production line.
+- Checks that production did not change while the local build was running.
+- Uploads the APK and `version.json` together through the frontend bundle.
+- Downloads both files back through public port 8443 and checks version,
+  manifest, signature, and APK SHA-256. Only then does the script print
+  `Deployment Complete`.
 
 In-app update detection only triggers when the remote `build_number` in
-`version.json` is higher than the installed Android app's build number. If you
-expect clients to receive an update notification, make sure the Android version
-was bumped before deployment.
+`version.json` is higher than the installed Android app's build number. The
+release entrypoint enforces that invariant; replacing APK bytes under an old
+build number is rejected.
 
-Current script note: after the Android block, `deploy.sh` still performs the
-remote directory preparation step. That is harmless for a normal deploy path,
-but if a future change needs a purely local APK build, split that behavior into
-a dedicated local packaging script instead of falling back to bare Flutter.
-
-Optional version bump:
+Before editing this mechanism, run its deterministic contract tests:
 
 ```bash
-./scripts/deploy.sh --android --bump patch
+./scripts/test_android_release_contract.sh
 ```
 
-Do not use bare `flutter build apk` as the final answer for this project unless
-you intentionally want to test the ambient shell environment. A bare command can
-fail if `JAVA_HOME` is not globally configured even though the repository's
-packaging script works.
+Do not publish Android through bare `flutter build apk`, manual copies,
+`./scripts/deploy.sh --frontend`, or direct calls to `scripts/deploy_core.sh`.
+Frontend-only and full frontend/backend deployments copy the exact Android
+files already online into the generated frontend output, so local unpublished
+APK work cannot leak into production.
+
+`scripts/deploy.sh` is intentionally gitignored because it stores target server
+coordinates. It must remain a thin configuration wrapper matching
+`scripts/deploy.sh.template` and execute the tracked `scripts/deploy_core.sh`.
+Never put release logic only in the ignored wrapper; otherwise the mechanism
+cannot be reviewed, committed, or restored on another machine.
 
 ## Frontend
 
@@ -90,6 +107,20 @@ curl http://localhost:3721/api/status
 ```
 
 If `CORTEX_API_KEY` is configured, include it as `X-CORTEX-KEY` or bearer auth.
+These generation trigger endpoints are available only when
+`[content_generation].enabled = true`. App-internal production uses this mode so
+Cortex runs RSS fetch, LLM drafting, curated Reading generation, weekly digest
+checks, and Loop preference extraction against the local OpenAI-compatible LLM.
+For the external scheduled-agent mode, keep `enabled = true` and set
+`[content_generation].mode = "external_agent"`. Cortex then returns HTTP `409`
+for local generation triggers, retains source ingestion/cache and consumes voice
+jobs. `enabled=false` without an explicit mode is the legacy voice-only path;
+it does not provide the new source-cache workflow.
+
+Cortex also starts the `voice_worker` loop by default. It polls Nexus
+`/api/internal/agent/voice-jobs/lease`, synthesizes queued agent-created audio
+jobs, uploads MP3 files through Nexus, and completes the corresponding target
+record. See `docs/agent-content-workflow.md` before changing this contract.
 
 TTS resource policy for the local Cortex service:
 
@@ -113,6 +144,15 @@ TTS resource policy for the local Cortex service:
 - `[tts].worker_idle_timeout_secs` is an idle-progress timeout, not a total
   generation timeout. Long audio jobs may run past it as long as each chunk keeps
   updating worker progress.
+- `[tts].worker_max_processes` controls how many isolated `cortex tts-worker`
+  child processes may run concurrently. Pair it with
+  `[voice_worker].concurrency`; otherwise extra voice workers will just queue
+  behind the TTS semaphore. Start at `2` for the current 64 GB Mac while the
+  single-worker memory limit remains `24576` MB.
+- `[voice_worker].repair_missing_audio = true` keeps Reading audio reliable in
+  agent-driven mode. Cortex periodically asks Nexus to create missing
+  `voice_jobs` for published Reading items or weekly digests that already have
+  an `audio_script` but no audio URL.
 - Radio production uses VoxCPM with Metal acceleration in the isolated worker:
   `engine = "voxcpm_metal"`, `device = "metal"`,
   `process_isolation = true`. Do not run Metal VoxCPM in the long-running parent
@@ -163,3 +203,23 @@ The script verifies:
 - Reading progress accepts unauthenticated guest no-op updates.
 - Internal feed write rejects missing auth.
 - Internal feed write accepts local `/audio/...` URLs when `NEXUS_KEY` is set.
+
+
+## External editorial mode (v2)
+
+See [scheduled-agent-runbook.md](scheduled-agent-runbook.md) and the canonical
+[content agent skill](../skills/freshloop-content-agent/SKILL.md). Use explicit
+`[content_generation] mode = "external_agent"` for ingestion/cache plus external
+editorial work. The old `enabled=false` switch alone remains voice-only.
+Deploy Nexus schema 2 before enabling the new skill. Default self-driven behavior
+and the Android release entrypoint are unchanged.
+
+Additional contract check:
+
+```bash
+python3 -m unittest discover -s skills/freshloop-content-agent/scripts -p 'test_*.py'
+```
+
+For isolated acceptance runs, set `CORTEX_DATA_DIR` to a temporary data directory
+and `CORTEX_BIND_ADDR` to a separate loopback port. Keep the config in that run
+directory and point Nexus to isolated SQLite, memory and audio paths.

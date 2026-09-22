@@ -1,3 +1,4 @@
+import '../radio_editions.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:audio_service/audio_service.dart';
@@ -7,7 +8,7 @@ import '../app_shell.dart';
 import '../main.dart'; // FeedProvider and audioHandler
 import '../src/rust/models.dart';
 import 'theme.dart';
-import 'hero_card.dart';
+import 'brand_mark.dart';
 import 'animated_eq.dart';
 import 'focus_screen.dart';
 import 'loop_screen.dart';
@@ -22,7 +23,26 @@ class FeedScreen extends StatefulWidget {
   State<FeedScreen> createState() => _FeedScreenState();
 }
 
-class _FeedScreenState extends State<FeedScreen> {
+class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      context.read<FeedProvider>().pollUpdates();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     final shell = context.watch<ShellProvider>();
@@ -76,49 +96,15 @@ class _FeedScreenState extends State<FeedScreen> {
             children: [
               Row(
                 children: [
-                  Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(12),
-                      color: AppTheme.surfaceHighlight,
-                    ),
-                    child: const Icon(
-                      Icons.waves,
-                      color: AppTheme.primaryGreen,
-                    ),
-                  ),
+                  const FreshLoopBrandMark(),
                   const SizedBox(width: 12),
-                  const Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        "FreshLoop",
-                        style: TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.bold,
-                          letterSpacing: -0.5,
-                        ),
-                      ),
-                      Text(
-                        "RADIO + READING",
-                        style: TextStyle(
-                          fontSize: 9,
-                          color: AppTheme.textMuted,
-                          fontWeight: FontWeight.bold,
-                          letterSpacing: 1.0,
-                        ),
-                      ),
-                      Text(
-                        "LOOP + FOCUS",
-                        style: TextStyle(
-                          fontSize: 9,
-                          color: Colors.white38,
-                          fontWeight: FontWeight.bold,
-                          letterSpacing: 1.0,
-                        ),
-                      ),
-                    ],
+                  const Text(
+                    "FreshLoop",
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: -0.7,
+                    ),
                   ),
                 ],
               ),
@@ -131,12 +117,12 @@ class _FeedScreenState extends State<FeedScreen> {
                           context: context,
                           builder: (context) => AlertDialog(
                             backgroundColor: const Color(0xFF18181B),
-                            title: Text('Hi, ${auth.user!.username}'),
-                            content: const Text('Do you want to log out?'),
+                            title: Text('你好，${auth.user!.username}'),
+                            content: const Text('要退出当前账户吗？'),
                             actions: [
                               TextButton(
                                 onPressed: () => Navigator.pop(context),
-                                child: const Text('Cancel'),
+                                child: const Text('取消'),
                               ),
                               TextButton(
                                 onPressed: () {
@@ -144,7 +130,7 @@ class _FeedScreenState extends State<FeedScreen> {
                                   Navigator.pop(context);
                                 },
                                 child: const Text(
-                                  'Log Out',
+                                  '退出登录',
                                   style: TextStyle(color: Colors.redAccent),
                                 ),
                               ),
@@ -213,7 +199,7 @@ class _FeedScreenState extends State<FeedScreen> {
               children: [
                 Expanded(
                   child: _ProductLineButton(
-                    icon: Icons.radio,
+                    icon: Icons.radio_rounded,
                     label: 'Radio',
                     selected: currentTab == AppTab.radio,
                     onTap: () => onChanged(AppTab.radio),
@@ -221,7 +207,7 @@ class _FeedScreenState extends State<FeedScreen> {
                 ),
                 Expanded(
                   child: _ProductLineButton(
-                    icon: Icons.menu_book,
+                    icon: Icons.menu_book_rounded,
                     label: 'Reading',
                     selected: currentTab == AppTab.reading,
                     onTap: () => onChanged(AppTab.reading),
@@ -229,7 +215,7 @@ class _FeedScreenState extends State<FeedScreen> {
                 ),
                 Expanded(
                   child: _ProductLineButton(
-                    icon: Icons.format_quote,
+                    icon: Icons.repeat_rounded,
                     label: 'Loop',
                     selected: currentTab == AppTab.loop,
                     onTap: () => onChanged(AppTab.loop),
@@ -237,7 +223,7 @@ class _FeedScreenState extends State<FeedScreen> {
                 ),
                 Expanded(
                   child: _ProductLineButton(
-                    icon: Icons.adjust,
+                    icon: Icons.adjust_rounded,
                     label: 'Focus',
                     selected: currentTab == AppTab.focus,
                     onTap: () => onChanged(AppTab.focus),
@@ -297,19 +283,8 @@ class _FeedScreenState extends State<FeedScreen> {
                   playing ? audioHandler.pause() : audioHandler.play();
                 }
               },
-              child: Container(
-                margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: AppTheme.surfaceDark,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                    color: isActive
-                        ? AppTheme.primaryGreen
-                        : Colors.white.withValues(alpha: 0.05),
-                    width: isActive ? 1.5 : 1.0,
-                  ),
-                ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
                 child: Row(
                   children: [
                     // Icon Box
@@ -560,39 +535,26 @@ class _RadioFeedList extends StatelessWidget {
           child: ListView(
             padding: const EdgeInsets.only(bottom: 120),
             children: [
-              HeroCard(
-                unreadCount: provider.items.length,
-                onRefresh: provider.refresh,
-                isLoading: provider.isLoading && provider.items.isEmpty,
-              ),
-              if (provider.items.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-                  child: Align(
-                    alignment: Alignment.centerRight,
-                    child: TextButton.icon(
-                      onPressed: () => provider.playWholeQueue(),
-                      style: TextButton.styleFrom(
-                        foregroundColor: AppTheme.primaryGreen,
-                      ),
-                      icon: const Icon(Icons.play_circle_fill_rounded),
-                      label: const Text('全部播放'),
-                    ),
-                  ),
-                ),
-              if (provider.dayGroups.isEmpty && !provider.isLoading)
-                const Padding(
-                  padding: EdgeInsets.all(24),
-                  child: Center(
-                    child: Text(
-                      '暂无待处理内容',
-                      style: TextStyle(color: Colors.white54),
-                    ),
-                  ),
+              if (provider.error != null && provider.items.isEmpty)
+                _RadioStatusPanel(
+                  icon: Icons.cloud_off_outlined,
+                  text: '新闻暂时加载失败',
+                  detail: provider.error,
+                  actionLabel: '重试',
+                  onAction: provider.refresh,
+                )
+              else if (provider.dayGroups.isEmpty &&
+                  !provider.isLoading &&
+                  provider.hasLoadedItems)
+                const _RadioStatusPanel(
+                  icon: Icons.check_circle_outline,
+                  text: '暂无待处理内容',
+                  detail: '新的音频生成后会自动出现在这里',
                 )
               else
                 ...provider.dayGroups.map(
                   (group) => _RadioDaySection(
+                    key: ValueKey(group.key),
                     group: group,
                     buildFeedItem: buildFeedItem,
                   ),
@@ -625,7 +587,71 @@ class _RadioFeedList extends StatelessWidget {
   }
 }
 
-class _RadioDaySection extends StatelessWidget {
+class _RadioStatusPanel extends StatelessWidget {
+  final IconData icon;
+  final String text;
+  final String? detail;
+  final String? actionLabel;
+  final VoidCallback? onAction;
+
+  const _RadioStatusPanel({
+    required this.icon,
+    required this.text,
+    this.detail,
+    this.actionLabel,
+    this.onAction,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(18),
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.04),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+        ),
+        child: Column(
+          children: [
+            Icon(icon, color: AppTheme.primaryGreen, size: 30),
+            const SizedBox(height: 10),
+            Text(
+              text,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w800,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            if (detail != null && detail!.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                detail!,
+                style: const TextStyle(color: Colors.white54, height: 1.35),
+                textAlign: TextAlign.center,
+              ),
+            ],
+            if (actionLabel != null && onAction != null) ...[
+              const SizedBox(height: 12),
+              TextButton(
+                onPressed: onAction,
+                style: TextButton.styleFrom(
+                  foregroundColor: AppTheme.primaryGreen,
+                ),
+                child: Text(actionLabel!),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _RadioDaySection extends StatefulWidget {
   final DayPlaylistGroup<Item> group;
   final Widget Function(
     BuildContext context,
@@ -633,94 +659,104 @@ class _RadioDaySection extends StatelessWidget {
     required List<Item> playlistItems,
   })
   buildFeedItem;
+  const _RadioDaySection({
+    required this.group,
+    required this.buildFeedItem,
+    super.key,
+  });
+  @override
+  State<_RadioDaySection> createState() => _RadioDaySectionState();
+}
 
-  const _RadioDaySection({required this.group, required this.buildFeedItem});
-
+class _RadioDaySectionState extends State<_RadioDaySection> {
+  bool expanded = false;
   @override
   Widget build(BuildContext context) {
-    final playlistItems = group.items;
-    final durationMinutes = group.totalDurationSec > 0
-        ? (group.totalDurationSec / 60).ceil()
-        : 0;
-
-    return Padding(
-      padding: const EdgeInsets.only(top: 12),
+    final group = widget.group;
+    final provider = context.watch<FeedProvider>();
+    final added = group.playbackIds.where(provider.newAudioIds.contains).length;
+    final duration =
+        '${group.totalDurationSec ~/ 60}:${(group.totalDurationSec % 60).toString().padLeft(2, '0')}';
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppTheme.surfaceDark,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                Container(
-                  width: 4,
-                  height: 36,
-                  decoration: BoxDecoration(
-                    color: AppTheme.primaryGreen.withValues(alpha: 0.85),
-                    borderRadius: BorderRadius.circular(99),
-                    boxShadow: [
-                      BoxShadow(
-                        color: AppTheme.primaryGreen.withValues(alpha: 0.18),
-                        blurRadius: 14,
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        group.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w900,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '${group.items.length} 条内容 · ${group.playableCount} 段可播${durationMinutes > 0 ? ' · $durationMinutes min' : ''}',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Colors.white54,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                if (group.playableCount > 0) ...[
-                  const SizedBox(width: 8),
-                  TextButton.icon(
-                    onPressed: () {
-                      context.read<FeedProvider>().playDay(playlistItems);
-                    },
-                    style: TextButton.styleFrom(
-                      foregroundColor: Colors.black,
-                      backgroundColor: AppTheme.primaryGreen,
-                      minimumSize: const Size(0, 38),
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(999),
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      group.shortTitle,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w900,
                       ),
                     ),
-                    icon: const Icon(Icons.play_arrow_rounded),
-                    label: const Text('播放当天'),
-                  ),
-                ],
-              ],
+                    const SizedBox(height: 6),
+                    Text(
+                      group.title.split(' · ').last,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      '${group.items.length == 1 && isRadioProgram(group.items.first) ? '${programSectionCount(group.items.first)} 个板块 · 完整节目' : '${group.playableCount} 个音频'} · $duration${group.items.length > group.playableCount ? ' · ${group.items.length - group.playableCount} 篇待生成' : ''}',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.white54,
+                      ),
+                    ),
+                    if (added > 0)
+                      Semantics(
+                        liveRegion: true,
+                        child: Text(
+                          '新增 $added 个音频',
+                          style: const TextStyle(
+                            color: AppTheme.primaryGreen,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filled(
+                tooltip: '播放节目',
+                style: IconButton.styleFrom(
+                  backgroundColor: AppTheme.primaryGreen,
+                  foregroundColor: Colors.black,
+                ),
+                onPressed: group.playableCount == 0
+                    ? null
+                    : () => provider.playDay(group.items),
+                icon: const Icon(Icons.play_arrow_rounded),
+              ),
+            ],
+          ),
+          TextButton(
+            onPressed: () => setState(() => expanded = !expanded),
+            child: Text(expanded ? '收起节目' : '查看节目'),
+          ),
+          if (expanded)
+            ...group.items.map(
+              (item) => widget.buildFeedItem(
+                context,
+                item,
+                playlistItems: group.items,
+              ),
             ),
-          ),
-          const SizedBox(height: 6),
-          ...playlistItems.map(
-            (item) =>
-                buildFeedItem(context, item, playlistItems: playlistItems),
-          ),
         ],
       ),
     );

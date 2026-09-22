@@ -1,16 +1,9 @@
 import type { Metadata, Viewport } from "next";
-import { Work_Sans } from "next/font/google";
 import "./globals.css";
-
-const workSans = Work_Sans({
-  subsets: ["latin"],
-  weight: ["300", "400", "500", "600", "700", "800"],
-  variable: "--font-work-sans",
-});
 
 export const metadata: Metadata = {
   title: "FreshLoop",
-  description: "Zen Reading",
+  description: "让重要信息，进入你的循环",
   manifest: "/manifest.json",
 };
 
@@ -19,7 +12,7 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   userScalable: false,
-  themeColor: "#1c1917",
+  themeColor: "#050a07",
 };
 
 export default function RootLayout({
@@ -28,7 +21,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="zh-CN" className={`dark ${workSans.variable}`} translate="no">
+    <html lang="zh-CN" className="dark" translate="no">
       <head>
         <meta name="google" content="notranslate" />
       </head>

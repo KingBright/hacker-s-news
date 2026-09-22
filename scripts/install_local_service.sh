@@ -48,8 +48,8 @@ if [ ! -f "$CONFIG_SOURCE" ]; then
 fi
 
 # Verify critical config values
-NEXUS_KEY_IN_CONFIG=$(grep -A2 "^\[nexus\]" "$CONFIG_SOURCE" | grep "auth_key" | cut -d'"' -f2)
-NEXUS_URL_IN_CONFIG=$(grep -A2 "^\[nexus\]" "$CONFIG_SOURCE" | grep "api_url" | cut -d'"' -f2)
+NEXUS_KEY_IN_CONFIG=$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1],"rb"))["nexus"]["auth_key"])' "$CONFIG_SOURCE")
+NEXUS_URL_IN_CONFIG=$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1],"rb"))["nexus"]["api_url"])' "$CONFIG_SOURCE")
 
 if [ -z "$NEXUS_KEY_IN_CONFIG" ]; then
     echo "ERROR: [nexus].auth_key not found in config.toml"
@@ -57,7 +57,7 @@ if [ -z "$NEXUS_KEY_IN_CONFIG" ]; then
 fi
 
 echo "  Nexus URL: $NEXUS_URL_IN_CONFIG"
-echo "  Auth Key: ${NEXUS_KEY_IN_CONFIG:0:8}****"
+echo "  Auth Key: configured (hidden)"
 echo "  Cargo Target: $CARGO_TARGET_DIR"
 echo "  Install Mode: $RUNTIME_MODE"
 echo "  Service Home: $SERVICE_HOME"
@@ -75,7 +75,7 @@ cd "$WORK_DIR/backend"
 # Force recompile of external path dependency (qwen3-tts-rs is outside workspace)
 # Cargo's incremental compilation may not detect changes in external path deps
 cargo clean -p qwen3-tts 2>/dev/null || true
-cargo build -p cortex --release --features metal
+cargo build -p cortex --bin cortex --release --features metal
 cd "$WORK_DIR"
 
 if [ ! -f "$BINARY_SOURCE" ]; then

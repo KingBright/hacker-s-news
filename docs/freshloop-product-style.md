@@ -1,6 +1,8 @@
 # FreshLoop Product And Style Notes
 
-FreshLoop should feel like one product with two modes, not two separate apps.
+FreshLoop is one product ecosystem with two content lines and four navigation
+modes. `Radio` and `Reading` are the content lines. `Loop` and `Focus` are the
+personalization modes shared by both content lines.
 
 ## Product Lines
 
@@ -21,11 +23,11 @@ FreshLoop should feel like one product with two modes, not two separate apps.
 
 ## Visual Baseline
 
-Use the existing app language:
+Use the shared brand tokens:
 
-- Dark background: `#111111` / near black.
-- Surface: `#1E1E1E`.
-- Highlight surface: `#2A2A2A` or dark green `#244732`.
+- Dark background: `#050A07`.
+- Primary surface: `#1A3224`.
+- Highlight surface: `#244732`.
 - Accent: `#19E66B`.
 - Muted green text: `#93C8A8`.
 - Cards: rounded, compact, content-dense, no marketing hero layout.

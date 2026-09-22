@@ -125,7 +125,7 @@ class WeeklyDigest {
   factory WeeklyDigest.fromJson(Map<String, dynamic> json) {
     return WeeklyDigest(
       id: json['id'] as String,
-      title: json['title'] as String? ?? 'FreshLoop Weekly',
+      title: json['title'] as String? ?? '周汇总',
       weekStart: _asInt(json['week_start']) ?? 0,
       weekEnd: _asInt(json['week_end']) ?? 0,
       digestMarkdown: json['digest_markdown'] as String?,

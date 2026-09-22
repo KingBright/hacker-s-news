@@ -2,8 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import Image from "next/image";
-import { FreshLoopNav } from "../../components/FreshLoopNav";
+import { BrandHeader } from "../../components/BrandHeader";
 import { focusBucketLabel, saveLoopDraft, type WhyRecommended } from "../../src/loop";
 import { buildDayPlaylists } from "../../src/day-playlists";
 
@@ -17,6 +16,7 @@ type MarkdownBlock =
   | { type: "quote"; text: string }
   | { type: "code"; code: string; language?: string }
   | { type: "image"; src: string; alt: string }
+  | { type: "audio"; src: string; label: string }
   | { type: "rule" };
 
 interface FeedItem {
@@ -68,6 +68,13 @@ interface WeeklyDigest {
 interface StoredUser {
   id: string;
   username: string;
+}
+
+function pauseOtherAudio(current: HTMLAudioElement | null) {
+  if (!current) return;
+  current.ownerDocument.querySelectorAll("audio").forEach((audio) => {
+    if (audio !== current) audio.pause();
+  });
 }
 
 function formatDate(ts?: number | null) {
@@ -364,7 +371,7 @@ function parseMarkdownBlocks(markdown: string, variant: DocumentVariant): Markdo
       continue;
     }
 
-    if (!text) {
+    if (!text || /^(?:>\s*)+$/.test(text)) {
       flushAll();
       continue;
     }
@@ -372,6 +379,13 @@ function parseMarkdownBlocks(markdown: string, variant: DocumentVariant): Markdo
     if (/^(-{3,}|_{3,}|\*{3,})$/.test(text)) {
       flushAll();
       blocks.push({ type: "rule" });
+      continue;
+    }
+
+    const audioLink = text.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+\.(?:mp3|m4a|ogg|wav|aac)(?:\?[^\s)]*)?)\)$/i);
+    if (audioLink) {
+      flushAll();
+      blocks.push({ type: "audio", src: audioLink[2], label: audioLink[1] });
       continue;
     }
 
@@ -471,6 +485,17 @@ function renderDocument(blocks: MarkdownBlock[], variant: DocumentVariant) {
             <pre key={`code-${index}`} className="reader-block reader-code">
               <code>{block.code}</code>
             </pre>
+          );
+        }
+
+        if (block.type === "audio") {
+          return (
+            <figure key={`audio-${index}`} className="reader-block">
+              <audio controls preload="none" src={block.src} aria-label={block.label} onPlay={(event) => pauseOtherAudio(event.currentTarget)} style={{ width: "100%" }} />
+              <figcaption className="reader-caption">
+                <a href={block.src} target="_blank" rel="noopener noreferrer">{block.label}</a>
+              </figcaption>
+            </figure>
           );
         }
 
@@ -844,7 +869,7 @@ export default function FeedPage() {
       <audio
         ref={audioRef}
         onPause={() => setIsAudioPlaying(false)}
-        onPlaying={() => setIsAudioPlaying(true)}
+        onPlaying={() => { pauseOtherAudio(audioRef.current); setIsAudioPlaying(true); }}
         onTimeUpdate={() => setAudioProgress(audioRef.current?.currentTime || 0)}
         onLoadedMetadata={() => setAudioDuration(audioRef.current?.duration || 0)}
         onEnded={() => {
@@ -853,32 +878,17 @@ export default function FeedPage() {
         className="hidden"
       />
 
-      <header className="sticky top-0 z-30 border-b border-white/5 bg-background-dark/95 px-4 pb-4 pt-12 backdrop-blur-md">
-        <div className="mx-auto flex max-w-6xl flex-col gap-4 md:flex-row md:items-center md:justify-between">
-          <div className="flex items-center gap-3">
-            <Image src="/logo.png" alt="FreshLoop" width={40} height={40} className="rounded-xl shadow-lg ring-1 ring-white/10" />
-            <div>
-              <div className="text-xl font-bold leading-none tracking-tight text-white">FreshLoop</div>
-              <div className="mt-1 text-[10px] font-bold uppercase tracking-[0.18em] text-[#93c8a8]">
-                Curated Reading
-              </div>
-            </div>
-          </div>
-          <div className="w-full md:max-w-md">
-            <FreshLoopNav />
-          </div>
-        </div>
-      </header>
+      <BrandHeader contentClassName="max-w-6xl" />
 
       <main className="mx-auto grid max-w-6xl gap-4 px-4 py-5 lg:grid-cols-[340px_minmax(0,1fr)]">
         <aside className="space-y-4">
           <section className="rounded-2xl bg-surface-dark p-4 shadow-lg ring-1 ring-white/5">
             <div className="flex items-center justify-between">
-              <h2 className="text-sm font-black uppercase tracking-[0.16em] text-[#93c8a8]">Daily</h2>
+              <h2 className="text-sm font-black tracking-[0.12em] text-[#93c8a8]">精选</h2>
               <button
                 onClick={() => void loadFeed()}
                 className="flex size-9 items-center justify-center rounded-full bg-white/10 text-white hover:bg-white/20 disabled:opacity-50"
-                title="Refresh"
+                title="刷新精选"
               >
                 <span className={`material-symbols-outlined text-[20px] ${loading ? "animate-spin" : ""}`}>refresh</span>
               </button>
@@ -955,7 +965,7 @@ export default function FeedPage() {
           </section>
 
           <section className="rounded-2xl bg-[#102b36] p-4 shadow-lg ring-1 ring-white/5">
-            <h2 className="text-sm font-black uppercase tracking-[0.16em] text-[#93c8a8]">Weekly Brief</h2>
+            <h2 className="text-sm font-black tracking-[0.12em] text-[#93c8a8]">周汇总</h2>
             <div className="mt-4 space-y-2">
               {weeklies.map((weekly) => (
                 <div
@@ -986,10 +996,10 @@ export default function FeedPage() {
                       <button
                         onClick={(event) => {
                           event.stopPropagation();
-                          void toggleAudioPlayback(weekly.id, [weekly.id], "Weekly Brief");
+                          void toggleAudioPlayback(weekly.id, [weekly.id], "周汇总");
                         }}
                         className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary text-black"
-                        title="Play weekly audio"
+                        title="播放周汇总"
                       >
                         <span className="material-symbols-outlined text-[22px]">
                           {activeAudioId === weekly.id && isAudioPlaying ? "pause" : "play_arrow"}
@@ -1017,7 +1027,7 @@ export default function FeedPage() {
             <div className="flex h-full flex-col">
               <div className="border-b border-white/5 p-5">
                 <div className="flex flex-wrap items-center gap-2 text-xs font-bold uppercase tracking-[0.16em] text-[#93c8a8]">
-                  <span>FreshLoop Weekly</span>
+                  <span>周汇总</span>
                   <span>·</span>
                   <span>
                     {formatDate(selectedWeekly.week_start)} - {formatDate(selectedWeekly.week_end)}
@@ -1035,7 +1045,7 @@ export default function FeedPage() {
                   </h1>
                   {selectedWeekly.audio_url ? (
                     <button
-                      onClick={() => void toggleAudioPlayback(selectedWeekly.id, [selectedWeekly.id], "Weekly Brief")}
+                      onClick={() => void toggleAudioPlayback(selectedWeekly.id, [selectedWeekly.id], "周汇总")}
                       className="flex h-11 shrink-0 items-center justify-center gap-2 rounded-full bg-primary px-4 text-sm font-black text-black hover:bg-primary/90"
                     >
                       <span className="material-symbols-outlined text-[21px]">
@@ -1052,7 +1062,7 @@ export default function FeedPage() {
                   <div className="mx-auto max-w-4xl pb-24">
                     <div className="rounded-[28px] border border-white/7 bg-[linear-gradient(180deg,rgba(15,31,24,0.95),rgba(10,17,14,0.98))] px-5 py-6 shadow-[0_28px_90px_rgba(0,0,0,0.28)] md:px-8 md:py-8">
                       <div className="mb-5 flex flex-wrap items-center gap-2 text-[11px] font-black uppercase tracking-[0.18em] text-[#93c8a8]">
-                        <span>Weekly Brief</span>
+                        <span>周汇总</span>
                         <span>·</span>
                         <span>交叉主题梳理</span>
                       </div>
@@ -1248,7 +1258,7 @@ export default function FeedPage() {
               <div className="min-w-0">
                 <div className="truncate text-sm font-black text-white">{audioTitle}</div>
                 <div className="mt-1 text-xs font-medium text-[#93c8a8]">
-                  {audioQueueLabel || "FreshLoop Listening"}
+                  {audioQueueLabel || "FreshLoop Reading"}
                 </div>
                 <div className="mt-1 text-[11px] text-white/35">
                   {formatDuration(Math.floor(audioProgress))} / {formatDuration(Math.floor(audioDuration))}

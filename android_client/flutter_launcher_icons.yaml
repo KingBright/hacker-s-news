@@ -1,6 +1,8 @@
 flutter_launcher_icons:
   android: true
   ios: false
-  image_path: "../frontend/public/logo.png"
-  adaptive_icon_background: "#111111"
-  adaptive_icon_foreground: "../frontend/public/logo.png"
+  image_path: "assets/brand/freshloop-app-icon.png"
+  adaptive_icon_background: "#050A07"
+  adaptive_icon_foreground: "assets/brand/freshloop-app-foreground.png"
+  adaptive_icon_foreground_inset: 12
+  adaptive_icon_monochrome: "assets/brand/freshloop-app-monochrome.png"

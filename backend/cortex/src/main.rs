@@ -6,6 +6,9 @@ use cortex::core::config::load_config;
 
 /// Get the application data directory (cross-platform)
 fn get_app_data_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("CORTEX_DATA_DIR") {
+        return PathBuf::from(path);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".freshloop")
@@ -140,13 +143,19 @@ async fn run_service() -> Result<()> {
     // Create a dummy config if not exists for first run ease
     if !std::path::Path::new(config_path).exists() {
         let dummy_config = r#"
+interval_min = 60
+schedule_times = ["07:30", "18:00"]
+timezone_offset = 8
+rss_feeds = ["https://news.ycombinator.com/rss"]
+
 [nexus]
 api_url = "http://localhost:8899"
 auth_key = "CHANGE_ME_NEXUS_KEY"
 
 [llm]
-model = "llama3"
-api_url = "http://localhost:11434"
+model = "google/gemma-4-26b-a4b-qat"
+api_url = "http://127.0.0.1:1234/v1"
+json_mode = "none"
 
 [tts]
 engine = "voxcpm_metal"
@@ -156,16 +165,18 @@ memory_pressure_relief = true
 process_isolation = true
 worker_memory_limit_mb = 24576
 worker_idle_timeout_secs = 1200
-
-rss_feeds = ["https://news.ycombinator.com/rss"]
+worker_max_processes = 1
 
 [[categories]]
 name = "Tech"
 description = "Technology news"
 
+[content_generation]
+enabled = true
+
 [curated_feed]
 enabled = true
-schedule_times = ["08:00"]
+schedule_times = ["07:30", "18:00"]
 source_group = "karpathy_hn"
 max_items_per_cycle = 20
 max_age_days = 2
@@ -179,11 +190,21 @@ weekly_digest_max_items = 12
 
 [loop_preferences]
 enabled = true
-schedule_times = ["09:00", "21:00"]
+schedule_times = ["07:30", "18:00"]
 max_posts_per_cycle = 20
 # Set this to a FreshLoop user id to personalize Reading and weekly digests.
 # personalization_user_id = "USER_ID"
 profile_context_max_chars = 3200
+
+[voice_worker]
+enabled = true
+poll_interval_secs = 30
+concurrency = 1
+max_jobs_per_tick = 1
+lease_seconds = 1800
+repair_missing_audio = true
+repair_interval_secs = 600
+repair_limit = 20
 
 [[curated_feed.feeds]]
 name = "Karpathy Blog"

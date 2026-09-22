@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 
 class AppTheme {
-  static const Color darkBackground = Color(0xFF111111);
-  static const Color surfaceDark = Color(0xFF1E1E1E);
-  static const Color surfaceHighlight = Color(0xFF2A2A2A);
+  static const Color darkBackground = Color(0xFF050A07);
+  static const Color surfaceDark = Color(0xFF1A3224);
+  static const Color surfaceHighlight = Color(0xFF244732);
   static const Color primaryGreen = Color(0xFF19E66B);
   static const Color textWhite = Colors.white;
   static const Color textFaded = Colors.white54;

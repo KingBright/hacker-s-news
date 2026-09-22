@@ -721,10 +721,10 @@ public class AudioService extends MediaBrowserServiceCompat {
                 : "FreshLoop";
         CharSequence subtitle = description != null && description.getSubtitle() != null
                 ? description.getSubtitle()
-                : "Audio briefing";
+                : "Radio";
         CharSequence summary = description != null && description.getDescription() != null
                 ? description.getDescription()
-                : "FreshLoop audio briefing";
+                : "FreshLoop Radio";
 
         setTextIfExists(views, "fln_title", title);
         setTextIfExists(views, "fln_subtitle", subtitle);

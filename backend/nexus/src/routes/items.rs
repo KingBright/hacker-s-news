@@ -59,6 +59,7 @@ pub struct Pagination {
     pub page: Option<i64>,
     pub limit: Option<i64>,
     pub category: Option<String>,
+    pub edition_pages: Option<bool>,
 }
 
 const ITEM_COLUMNS_WITH_ALIAS: &str = r#"
@@ -183,11 +184,48 @@ fn sort_items_newest_first(items: &mut [Item]) {
     });
 }
 
+// Edition pagination keeps a card complete, even when one edition exceeds an item page.
+// Derive historical agent editions from the leased job, never from TTS completion time.
+async fn fetch_radio_editions(db: &DbPool, page: i64) -> Result<Vec<Item>, sqlx::Error> {
+    sqlx::query_as::<_, Item>(r#"
+        WITH annotated AS (
+          SELECT i.*,
+            CASE WHEN json_valid(i.tags) THEN EXISTS(SELECT 1 FROM json_each(i.tags) WHERE value='radio:program') ELSE 0 END AS is_program,
+            COALESCE(json_extract(j.context_json, '$.run_date'),
+              strftime('%Y-%m-%d', COALESCE(i.publish_time,i.created_at,0), 'unixepoch', '+8 hours')) AS edition_date,
+            CASE WHEN json_extract(j.context_json, '$.slot') LIKE 'morning-%' THEN 'morning'
+                 WHEN json_extract(j.context_json, '$.slot') LIKE 'evening-%' THEN 'evening'
+                 WHEN CAST(strftime('%H', COALESCE(i.publish_time,i.created_at,0), 'unixepoch', '+8 hours') AS INT) < 12 THEN 'morning'
+                 ELSE 'evening' END AS edition
+          FROM items i LEFT JOIN agent_jobs j ON j.result_ref='radio_item:' || i.id AND j.status='completed'
+          WHERE COALESCE(i.is_deleted,0)=0
+        ), availability AS (
+          SELECT *, MAX(CASE WHEN is_program=1 AND LENGTH(TRIM(COALESCE(audio_url,'')))>0 THEN 1 ELSE 0 END)
+            OVER (PARTITION BY edition_date,edition) AS ready_program FROM annotated
+        ), ranked AS (
+          SELECT *, DENSE_RANK() OVER (ORDER BY edition_date DESC, edition ASC) AS edition_rank FROM availability
+          WHERE ready_program=0 OR is_program=1
+        )
+        SELECT id,title,summary,original_url,cover_image_url,audio_url,publish_time,created_at,rating,
+          json_insert(CASE WHEN json_valid(tags) AND json_type(tags)='array' THEN tags ELSE '[]' END,
+            '$[#]', 'radio:date:' || edition_date, '$[#]', 'radio:edition:' || edition) AS tags,
+          is_deleted,duration_sec,status,category
+        FROM ranked WHERE edition_rank > ? AND edition_rank <= ?
+        ORDER BY edition_date DESC, edition ASC, COALESCE(publish_time,created_at,0), id
+    "#).bind((page-1)*6).bind(page*6).fetch_all(db).await
+}
+
 pub async fn list_items(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(pagination): Query<Pagination>,
 ) -> impl IntoResponse {
+    if pagination.edition_pages.unwrap_or(false) {
+        return match fetch_radio_editions(&state.db, pagination.page.unwrap_or(1).max(1)).await {
+            Ok(items) => Json(items).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
     let (limit, offset) = sanitize_pagination(pagination.page, pagination.limit);
     let category_filter = pagination.category.as_deref();
 
@@ -669,6 +707,70 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn edition_pages_keep_large_editions_whole_and_use_logical_slot() {
+        let pool = test_pool().await;
+        sqlx::query("CREATE TABLE agent_jobs (result_ref TEXT, status TEXT, context_json TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for n in 0..61 {
+            insert_item(&pool, &format!("morning-{n}"), 1790006400, "Tech").await;
+            sqlx::query("INSERT INTO agent_jobs VALUES (?, 'completed', ?)")
+                .bind(format!("radio_item:morning-{n}"))
+                .bind(r#"{"run_date":"2026-09-21","slot":"morning-Tech"}"#)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        insert_item(&pool, "evening", 1790006400, "Tech").await;
+        sqlx::query("INSERT INTO agent_jobs VALUES ('radio_item:evening','completed',?)")
+            .bind(r#"{"run_date":"2026-09-21","slot":"evening-Tech"}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for n in 1..8 {
+            insert_item(&pool, &format!("old-{n}"), 1790006400 - n * 86400, "Tech").await;
+        }
+        let first = fetch_radio_editions(&pool, 1).await.unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .filter(|i| i.id.starts_with("morning-"))
+                .count(),
+            61
+        );
+        let morning = first.iter().find(|i| i.id == "morning-0").unwrap();
+        assert!(morning
+            .tags
+            .as_ref()
+            .unwrap()
+            .contains("radio:date:2026-09-21"));
+        assert!(morning
+            .tags
+            .as_ref()
+            .unwrap()
+            .contains("radio:edition:morning"));
+        mark_played(&pool, "listener", "morning-0").await;
+        insert_item(&pool, "program", 1790006400, "完整节目").await;
+        sqlx::query("UPDATE items SET tags='[\"radio:program\"]',audio_url='/audio/full.mp3' WHERE id='program'").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO agent_jobs VALUES ('radio_item:program','completed',?)")
+            .bind(r#"{"run_date":"2026-09-21","slot":"morning-program"}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let consolidated = fetch_radio_editions(&pool, 1).await.unwrap();
+        assert!(!consolidated.iter().any(|i| i.id.starts_with("morning-")));
+        assert!(consolidated.iter().any(|i| i.id == "program"));
+        let second = fetch_radio_editions(&pool, 2).await.unwrap();
+        assert!(!second.is_empty());
+        assert!(second.iter().all(|i| !first.iter().any(|j| i.id == j.id)));
+        assert_eq!(
+            fetch_radio_editions(&pool, 1).await.unwrap().len(),
+            consolidated.len()
+        );
     }
 
     #[tokio::test]

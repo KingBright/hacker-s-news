@@ -14,3 +14,12 @@ scripts/deploy.sh
 .secrets/
 DIAG_*.md
 backend/target-local/
+
+# Local acceptance evidence, runtime credentials and isolated builds
+.task-work/
+skills/**/__pycache__/
+
+# Temporary deployment credentials and Python bytecode
+/config.env
+/nexus.service
+scripts/__pycache__/

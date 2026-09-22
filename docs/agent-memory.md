@@ -8,7 +8,9 @@ context before changing code:
 2. `task.md`: the active implementation checklist and verification state.
 3. `docs/build-and-deploy.md`: authoritative deploy and packaging behavior.
 4. `docs/freshloop-product-style.md`: UI/product language for Web and Android.
-5. `~/.happy_coding/knowledge/`: long-term lessons from mistakes and debugging.
+5. `docs/agent-content-workflow.md`: scheduled agent architecture and voice job flow.
+6. `docs/scheduled-agent-runbook.md`: exact runtime instructions for Codex/Antigravity agents.
+7. `~/.happy_coding/knowledge/`: long-term lessons from mistakes and debugging.
 
 ## Recovery Command
 

@@ -4,10 +4,10 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const tabs = [
-  { href: "/", label: "Radio", compactLabel: "Radio" },
-  { href: "/feed", label: "Reading", compactLabel: "Read" },
-  { href: "/loop", label: "Loop", compactLabel: "Loop" },
-  { href: "/focus", label: "Focus", compactLabel: "Focus" },
+  { href: "/", label: "Radio", compactLabel: "Radio", icon: "radio" },
+  { href: "/feed", label: "Reading", compactLabel: "Reading", icon: "menu_book" },
+  { href: "/loop", label: "Loop", compactLabel: "Loop", icon: "repeat" },
+  { href: "/focus", label: "Focus", compactLabel: "Focus", icon: "adjust" },
 ];
 
 export function FreshLoopNav() {
@@ -25,10 +25,13 @@ export function FreshLoopNav() {
             aria-label={tab.label}
             className={
               selected
-                ? "flex min-w-0 items-center justify-center overflow-hidden rounded-lg bg-primary px-1 py-2 text-center text-[10px] font-black leading-none whitespace-nowrap text-black sm:px-3 sm:text-sm"
-                : "flex min-w-0 items-center justify-center overflow-hidden rounded-lg px-1 py-2 text-center text-[10px] font-black leading-none whitespace-nowrap text-white/70 hover:bg-white/10 hover:text-white sm:px-3 sm:text-sm"
+                ? "flex min-w-0 items-center justify-center gap-1 overflow-hidden rounded-lg bg-primary px-0.5 py-2 text-center text-[9px] font-black leading-none whitespace-nowrap text-black sm:gap-1.5 sm:px-3 sm:text-sm"
+                : "flex min-w-0 items-center justify-center gap-1 overflow-hidden rounded-lg px-0.5 py-2 text-center text-[9px] font-black leading-none whitespace-nowrap text-white/70 hover:bg-white/10 hover:text-white sm:gap-1.5 sm:px-3 sm:text-sm"
             }
           >
+            <span className={`material-symbols-outlined !text-[15px] sm:!text-[17px] ${selected ? "filled" : ""}`} aria-hidden="true">
+              {tab.icon}
+            </span>
             <span className="block min-w-0 truncate sm:hidden">
               {tab.compactLabel}
             </span>

@@ -20,6 +20,7 @@ class ReadingFeedProvider extends ChangeNotifier {
   List<WeeklyDigest> weeklies = [];
   final Map<String, CuratedFeedContent> _contentCache = {};
   bool isLoading = false;
+  bool hasLoadedItems = false;
   String? error;
   String? userId;
 
@@ -33,14 +34,25 @@ class ReadingFeedProvider extends ChangeNotifier {
     error = null;
     notifyListeners();
 
+    final errors = <String>[];
+
     try {
-      final itemsFuture = api.fetchItems(userId: userId);
-      final weekliesFuture = api.fetchWeeklies();
-      items = await itemsFuture;
-      weeklies = await weekliesFuture;
+      items = await api.fetchItems(userId: userId);
     } catch (e) {
-      error = e.toString();
+      errors.add(e.toString());
+    }
+
+    try {
+      weeklies = await api.fetchWeeklies();
+    } catch (e) {
+      errors.add(e.toString());
     } finally {
+      if (errors.isEmpty) {
+        error = null;
+      } else {
+        error = errors.join('\n');
+      }
+      hasLoadedItems = true;
       isLoading = false;
       notifyListeners();
     }
@@ -113,13 +125,20 @@ class ReadingScreen extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 12),
-              if (provider.error != null)
+              if (provider.error != null && provider.items.isNotEmpty)
+                _InlineLoadWarning(
+                  detail: provider.error,
+                  onRetry: provider.refresh,
+                ),
+              if (provider.error != null && provider.items.isEmpty)
                 _EmptyPanel(
                   icon: Icons.cloud_off_outlined,
                   text: '精选频道暂时不可用',
                   detail: provider.error,
                 )
-              else if (provider.items.isEmpty && !provider.isLoading)
+              else if (provider.items.isEmpty &&
+                  !provider.isLoading &&
+                  provider.hasLoadedItems)
                 const _EmptyPanel(icon: Icons.article_outlined, text: '暂无精选文章')
               else ...[
                 ...provider.dayGroups.map(
@@ -130,6 +149,59 @@ class ReadingScreen extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+class _InlineLoadWarning extends StatelessWidget {
+  final String? detail;
+  final VoidCallback onRetry;
+
+  const _InlineLoadWarning({required this.detail, required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    final message = detail?.trim();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(
+            Icons.cloud_off_outlined,
+            color: AppTheme.primaryGreen,
+            size: 18,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '刷新暂时失败，已保留现有内容',
+                  style: TextStyle(fontWeight: FontWeight.w800),
+                ),
+                if (message != null && message.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    message,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          TextButton(onPressed: onRetry, child: const Text('重试')),
+        ],
+      ),
     );
   }
 }
@@ -156,7 +228,7 @@ class _WeeklySection extends StatelessWidget {
               Icon(Icons.graphic_eq, color: AppTheme.primaryGreen, size: 18),
               SizedBox(width: 8),
               Text(
-                '本周精选汇总',
+                '周汇总',
                 style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16),
               ),
             ],
@@ -258,7 +330,7 @@ class WeeklyDigestPage extends StatelessWidget {
         backgroundColor: AppTheme.darkBackground,
         foregroundColor: Colors.white,
         title: const Text(
-          '本周精选汇总',
+          '周汇总',
           style: TextStyle(fontSize: 15, fontWeight: FontWeight.w900),
         ),
         actions: [
@@ -313,7 +385,7 @@ class WeeklyDigestPage extends StatelessWidget {
                           text:
                               '${_formatDate(weekly.weekStart)} - ${_formatDate(weekly.weekEnd)}',
                         ),
-                        const _ReaderChip(text: 'Weekly Brief'),
+                        const _ReaderChip(text: '周汇总'),
                         if (hasAudio)
                           _ReaderChip(text: _duration(weekly.durationSec)),
                       ],
@@ -1124,7 +1196,7 @@ List<_MarkdownBlock> _parseMarkdownBlocks(
       continue;
     }
 
-    if (trimmed.isEmpty) {
+    if (trimmed.isEmpty || RegExp(r'^(?:>\s*)+$').hasMatch(trimmed)) {
       flushAll();
       continue;
     }
@@ -1560,16 +1632,37 @@ List<InlineSpan> _inlineSpans(String text, TextStyle baseStyle) {
       );
     } else {
       final link = RegExp(r'^\[([^\]]+)\]\(([^)]+)\)$').firstMatch(token);
-      spans.add(
-        TextSpan(
-          text: link?.group(1) ?? token,
-          style: baseStyle.copyWith(
-            color: AppTheme.primaryGreen,
-            decoration: TextDecoration.underline,
-            decorationColor: AppTheme.primaryGreen.withValues(alpha: 0.42),
-          ),
-        ),
+      final uri = Uri.tryParse(link?.group(2) ?? '');
+      final label = link?.group(1) ?? token;
+      final linkStyle = baseStyle.copyWith(
+        color: AppTheme.primaryGreen,
+        decoration: TextDecoration.underline,
+        decorationColor: AppTheme.primaryGreen.withValues(alpha: 0.42),
       );
+      if (uri != null &&
+          (uri.scheme == 'https' || uri.scheme == 'http') &&
+          uri.host.isNotEmpty) {
+        spans.add(WidgetSpan(
+          alignment: PlaceholderAlignment.baseline,
+          baseline: TextBaseline.alphabetic,
+          child: Builder(builder: (context) => Semantics(
+            link: true,
+            child: InkWell(
+              onTap: () async {
+                final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+                if (!opened && context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('暂时无法打开链接')),
+                  );
+                }
+              },
+              child: Text(label, style: linkStyle),
+            ),
+          )),
+        ));
+      } else {
+        spans.add(TextSpan(text: label, style: baseStyle));
+      }
     }
     cursor = match.end;
   }

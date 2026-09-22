@@ -13,6 +13,7 @@ import dataclasses
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ DEFAULT_LONG_TEXT = """
 国际时政方面，监管机构开始要求更清晰的模型使用披露。尤其是在新闻、教育、医疗和金融场景，系统必须说明生成内容的边界，也要保留可审计的证据链。对个人信息产品来说，这意味着推荐理由、评价记录和历史偏好都应该可以追溯。
 最后回到产品体验，真正有用的个人信息流不应该让用户被动刷新，而应该把阅读、标注、评价和后续行动连在一起。用户可以发布自己的心得，也可以对系统推荐的内容写下个人判断。系统再从这些判断里学习，而不是只收集一个简单的喜欢或者不喜欢。
 这段测试的后半部分故意保持连续叙事，因为我们要捕获一种很隐蔽的问题：音频开头听起来正常，但模型在后续分块里逐渐退化，出现杂音、乱读、重复或和原文无关的声音。部署前必须把这种问题挡住，而不是上线后再让用户用耳朵发现。
+专项发音检查中，GPU 的主频为3.5GHz，应用程序编程接口的延迟为10ms，温度为25℃，增幅为12.5%。CPU 和 USB 使用规范中文名称。重庆银行的行长强调，重新加载网页和重载卡车含义不同。版本号分三段，第一段是一，第二段是三，第三段是三十二。
 如果整个闭环通过，说明当前生产配置至少能稳定读完一段较长文本，并且后半段没有明显掉线。如果失败，报告会指出具体 chunk、原文、识别文本和相似度，方便直接打开对应音频定位问题。
 """.strip()
 
@@ -50,11 +52,43 @@ def configure_proxy(proxy: str | None) -> None:
     os.environ.setdefault("https_proxy", proxy)
 
 
+def normalize_asr_numbers(text: str) -> str:
+    """Compare ASR Arabic numbers with spoken Chinese without deleting values/units.
+
+    Only ordinary numbers below 10,000 are expanded. Multi-dot versions and long
+    identifiers stay literal; this is a similarity aid, not a factual validator.
+    """
+    digits = "零一二三四五六七八九"
+    def integer(raw: str) -> str:
+        if len(raw) > 1 and raw.startswith('0'):
+            return ''.join(digits[int(c)] for c in raw)
+        value = int(raw)
+        if value == 0:
+            return digits[0]
+        out = ''
+        zero = False
+        for unit, label in ((1000, '千'), (100, '百'), (10, '十'), (1, '')):
+            number, value = divmod(value, unit)
+            if number:
+                if zero:
+                    out += '零'
+                out += ('' if unit == 10 and number == 1 and not out else digits[number]) + label
+                zero = False
+            elif out and value:
+                zero = True
+        return out
+    text = re.sub(r'(-?\d+(?:\.\d+)?)\s*[%％]', lambda m: ('负百分之' + m[1][1:]) if m[1].startswith('-') else '百分之' + m[1], text)
+    def number(match: re.Match[str]) -> str:
+        whole, dot, fraction = match[0].partition('.')
+        return integer(whole) + ('点' + ''.join(digits[int(c)] for c in fraction) if dot else '')
+    return re.sub(r'(?<![.\d])\d{1,4}(?:\.\d+)?(?![.\d])', number, text)
+
+
 def get_pinyin_chars(text: str) -> list[str]:
     import pypinyin
 
     chars: list[str] = []
-    for word in pypinyin.pinyin(text, style=pypinyin.Style.NORMAL, errors="default"):
+    for word in pypinyin.pinyin(normalize_asr_numbers(text), style=pypinyin.Style.NORMAL, errors="default"):
         token = "".join(ch for ch in word[0].lower() if ch.isalnum())
         chars.extend(token)
     return chars
@@ -187,7 +221,7 @@ def evaluate_results(results: list[dict[str, Any]], thresholds: Thresholds) -> d
     first_half = similarities[:midpoint]
     late_half = similarities[midpoint:]
     first_average = average(first_half)
-    late_average = average(late_half)
+    late_average = average(late_half) if late_half else first_average
     overall_average = average(similarities)
     minimum_similarity = min(similarities) if similarities else 0.0
     late_drop = max(0.0, first_average - late_average)
@@ -219,11 +253,11 @@ def evaluate_results(results: list[dict[str, Any]], thresholds: Thresholds) -> d
         failures.append(
             f"overall similarity {overall_average:.2%} < {thresholds.min_average_similarity:.2%}"
         )
-    if late_average < thresholds.min_late_average_similarity:
+    if late_half and late_average < thresholds.min_late_average_similarity:
         failures.append(
             f"late-half similarity {late_average:.2%} < {thresholds.min_late_average_similarity:.2%}"
         )
-    if late_drop > thresholds.max_late_drop:
+    if late_half and late_drop > thresholds.max_late_drop:
         failures.append(
             f"late-half drop {late_drop:.2%} > {thresholds.max_late_drop:.2%} "
             f"(first={first_average:.2%}, late={late_average:.2%})"
@@ -234,6 +268,7 @@ def evaluate_results(results: list[dict[str, Any]], thresholds: Thresholds) -> d
         "failures": failures,
         "summary": {
             "chunk_count": len(results),
+            "late_degradation_tested": bool(late_half),
             "overall_average_similarity": overall_average,
             "first_half_average_similarity": first_average,
             "late_half_average_similarity": late_average,
@@ -303,6 +338,12 @@ def run_self_test() -> None:
     leak_eval = evaluate_results(prompt_leak, thresholds)
     assert not leak_eval["passed"]
     assert any("prompt leakage" in failure for failure in leak_eval["failures"])
+    assert normalize_asr_numbers("12.5% 25 10 101 1010 1000 0") == "百分之十二点五 二十五 十 一百零一 一千零一十 一千 零"
+    assert normalize_asr_numbers("1.3.32 10000") == "1.3.32 10000"
+    assert pinyin_similarity("增幅12.5%", "增幅百分之十二点五") > 0.99
+    assert pinyin_similarity("增幅2%", "增幅百分之十二点五") < 0.95
+    single = evaluate_results([dict(good[0], pinyin_similarity=0.99)], dataclasses.replace(thresholds, min_chunks=1))
+    assert single["passed"] and not single["summary"]["late_degradation_tested"]
     print("self-test passed")
 
 

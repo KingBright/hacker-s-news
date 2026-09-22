@@ -57,7 +57,7 @@ impl FreshLoopClient {
 
     pub async fn fetch_items(&self, page: u32, limit: u32) -> anyhow::Result<Vec<Item>> {
         let mut req = self.client.get(format!(
-            "{}/api/items?page={}&limit={}",
+            "{}/api/items?edition_pages=true&page={}&limit={}",
             self.base_url, page, limit
         ));
 

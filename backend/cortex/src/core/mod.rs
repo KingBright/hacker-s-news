@@ -10,4 +10,8 @@ pub mod products;
 pub mod retry;
 pub mod topic_registry;
 pub mod tts;
+pub mod speech_text;
 pub mod utils;
+pub mod voice_jobs;
+
+pub mod radio_program;

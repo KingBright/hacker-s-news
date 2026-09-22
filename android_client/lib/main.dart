@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'app_shell.dart';
 import 'audio_handler.dart';
 import 'day_playlist.dart';
+import 'radio_editions.dart';
 import 'feed_api.dart';
 import 'ui/theme.dart';
 import 'ui/feed_screen.dart';
@@ -40,9 +41,8 @@ Future<void> main() async {
       builder: () => FreshLoopAudioHandler(client, baseUrl),
       config: const AudioServiceConfig(
         androidNotificationChannelId: 'fun.hackerlife.freshloop.playback',
-        androidNotificationChannelName: 'FreshLoop Playback',
-        androidNotificationChannelDescription:
-            'Beautiful background playback controls for FreshLoop briefings',
+        androidNotificationChannelName: 'FreshLoop 播放',
+        androidNotificationChannelDescription: 'FreshLoop 音频播放控制',
         androidNotificationIcon: 'drawable/ic_stat_freshloop',
         notificationColor: AppTheme.primaryGreen,
         androidNotificationOngoing: false,
@@ -219,6 +219,8 @@ class FeedProvider extends ChangeNotifier {
   final FreshLoopClient client;
   List<Item> items = [];
   bool isLoading = false;
+  bool hasLoadedItems = false;
+  String? error;
   int page = 1;
   String? userId;
   static const int maxQueueSize = 50;
@@ -233,22 +235,62 @@ class FeedProvider extends ChangeNotifier {
     unawaited(_initialize());
   }
 
-  List<DayPlaylistGroup<Item>> get dayGroups => buildDayPlaylists<Item>(
-    items: items,
-    idOf: (item) => item.id,
-    timestampSecondsOf: (item) =>
-        item.publishTime?.toInt() ?? item.createdAt?.toInt(),
-    isPlayable: (item) => (item.audioUrl?.trim().isNotEmpty ?? false),
-    durationSecondsOf: (item) => item.durationSec?.toInt(),
-    dayOrder: DayPlaylistSortOrder.descending,
-    itemOrder: DayPlaylistSortOrder.descending,
-    playbackOrder: DayPlaylistSortOrder.ascending,
-  );
+  List<DayPlaylistGroup<Item>> get dayGroups => buildRadioEditions(items);
+  final Set<String> newAudioIds = {};
+  Timer? _refreshTimer;
+  bool _polling = false;
+  int _dataRevision = 0;
+  bool _disposed = false;
+
+  Future<void> pollUpdates() async {
+    if (_polling || isLoading || !hasLoadedItems || _disposed) return;
+    _polling = true;
+    final expectedUser = userId;
+    final expectedRevision = _dataRevision;
+    try {
+      final fresh = await client.fetchItems(page: 1, limit: maxQueueSize);
+      if (_disposed ||
+          userId != expectedUser ||
+          expectedRevision != _dataRevision) {
+        return;
+      }
+      final previous = {for (final i in items) i.id: i};
+      for (final i in fresh) {
+        if ((i.audioUrl?.trim().isNotEmpty ?? false) &&
+            !(previous[i.id]?.audioUrl?.trim().isNotEmpty ?? false)) {
+          newAudioIds.add(i.id);
+        }
+        previous[i.id] = i;
+      }
+      items = previous.values.toList();
+      _normalizeQueue();
+      // A quiet refresh must not replace the audio handler's current playlist.
+      error = null;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Radio update retry on next poll: $e');
+    } finally {
+      _polling = false;
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _refreshTimer?.cancel();
+    super.dispose();
+  }
 
   Future<void> _initialize() async {
     await _loadPendingPlayedIds();
     await _syncPendingPlayedIds();
     await fetchItems();
+    if (!_disposed) {
+      _refreshTimer = Timer.periodic(
+        const Duration(seconds: 30),
+        (_) => unawaited(pollUpdates()),
+      );
+    }
   }
 
   Future<void> _loadPendingPlayedIds() async {
@@ -303,11 +345,11 @@ class FeedProvider extends ChangeNotifier {
 
   Future<void> _onTrackCompleted(String itemId) async {
     await _rememberPlayed(itemId);
-    items.removeWhere((item) => item.id == itemId);
+    newAudioIds.remove(itemId);
     notifyListeners();
 
     await audioHandler.updateQueueWithItems(
-      items,
+      items.where((i) => !_playedIds.contains(i.id)).toList(),
       onTrackCompleted: _onTrackCompleted,
       playbackMode: QueuePlaybackMode.dynamicContinuous,
     );
@@ -319,7 +361,7 @@ class FeedProvider extends ChangeNotifier {
 
   Future<void> markAsPlayed(String itemId) async {
     await _rememberPlayed(itemId);
-    items.removeWhere((item) => item.id == itemId);
+    newAudioIds.remove(itemId);
     notifyListeners();
 
     unawaited(_syncQueueAndBackfill());
@@ -327,7 +369,7 @@ class FeedProvider extends ChangeNotifier {
 
   Future<void> _syncQueueAndBackfill() async {
     await audioHandler.updateQueueWithItems(
-      items,
+      items.where((i) => !_playedIds.contains(i.id)).toList(),
       onTrackCompleted: _onTrackCompleted,
       playbackMode: QueuePlaybackMode.dynamicContinuous,
     );
@@ -371,13 +413,14 @@ class FeedProvider extends ChangeNotifier {
 
   void refresh() {
     page = 1;
-    items.clear();
-    fetchItems();
+    fetchItems(replace: true);
   }
 
-  Future<void> fetchItems() async {
+  Future<void> fetchItems({bool replace = false}) async {
     if (isLoading) return;
+    _dataRevision++;
     isLoading = true;
+    error = null;
     notifyListeners();
 
     try {
@@ -388,31 +431,40 @@ class FeedProvider extends ChangeNotifier {
         page: requestedPage,
         limit: maxQueueSize,
       );
-      items.addAll(newItems);
+      if (replace) {
+        items = [...newItems];
+      } else {
+        items.addAll(newItems);
+      }
       _normalizeQueue();
       page = requestedPage + 1;
-      await audioHandler.updateQueueWithItems(
-        items,
-        onTrackCompleted: _onTrackCompleted,
-        playbackMode: QueuePlaybackMode.dynamicContinuous,
-      );
+      if (audioHandler.mediaItem.value == null) {
+        await audioHandler.updateQueueWithItems(
+          items
+              .where(
+                (i) =>
+                    !_playedIds.contains(i.id) &&
+                    (i.audioUrl?.trim().isNotEmpty ?? false),
+              )
+              .toList(),
+          onTrackCompleted: _onTrackCompleted,
+          playbackMode: QueuePlaybackMode.dynamicContinuous,
+        );
+      }
     } catch (e) {
+      error = e.toString();
       debugPrint("Error fetching items: $e");
     } finally {
       isLoading = false;
+      hasLoadedItems = true;
       notifyListeners();
     }
   }
 
   void _normalizeQueue({bool trimToMax = false}) {
     final seen = <String>{};
-    items.retainWhere(
-      (item) => seen.add(item.id) && !_playedIds.contains(item.id),
-    );
+    items.retainWhere((item) => seen.add(item.id));
     items.sort(_compareItemsByDisplayOrder);
-    if (trimToMax && items.length > maxQueueSize) {
-      items.removeRange(maxQueueSize, items.length);
-    }
   }
 
   int _compareItemsByDisplayOrder(Item a, Item b) {
@@ -437,6 +489,8 @@ class FeedProvider extends ChangeNotifier {
           ..sort(_compareItemsByPlaybackOrder);
     if (queueItems.isEmpty) return;
 
+    newAudioIds.removeAll(queueItems.map((i) => i.id));
+    notifyListeners();
     final startIndex = startItemId == null
         ? 0
         : queueItems.indexWhere((item) => item.id == startItemId);
@@ -453,7 +507,8 @@ class FeedProvider extends ChangeNotifier {
 
   Future<void> playWholeQueue({String? startItemId}) async {
     if (items.isEmpty) return;
-    final queueItems = [...items]..sort(_compareItemsByPlaybackOrder);
+    final queueItems = items.where((i) => !_playedIds.contains(i.id)).toList()
+      ..sort(_compareItemsByPlaybackOrder);
     final startIndex = startItemId == null
         ? 0
         : queueItems.indexWhere((item) => item.id == startItemId);
@@ -470,11 +525,7 @@ class FeedProvider extends ChangeNotifier {
 
   Future<void> _onDayPlaylistTrackCompleted(String itemId) async {
     await _rememberPlayed(itemId);
-    items.removeWhere((item) => item.id == itemId);
+    newAudioIds.remove(itemId);
     notifyListeners();
-
-    if (items.length < maxQueueSize) {
-      unawaited(_backfill());
-    }
   }
 }

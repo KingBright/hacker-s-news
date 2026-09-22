@@ -1,8 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Image from "next/image";
-import { FreshLoopNav } from "../../components/FreshLoopNav";
+import { BrandHeader } from "../../components/BrandHeader";
 import { LoginModal } from "../../components/LoginModal";
 import { focusKindLabel, type BalanceRule, type FocusCard, type FocusSummary } from "../../src/loop";
 
@@ -146,25 +145,8 @@ export default function FocusPage() {
         onLogin={handleLogin}
       />
 
-      <header className="sticky top-0 z-20 bg-background-dark/95 px-1 pt-8 pb-4 backdrop-blur-md">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <Image
-              src="/logo.png"
-              alt="FreshLoop"
-              width={40}
-              height={40}
-              className="rounded-xl shadow-lg ring-1 ring-white/10"
-            />
-            <div>
-              <div className="text-xl font-bold leading-none tracking-tight text-white">
-                FreshLoop
-              </div>
-              <div className="mt-1 text-xs font-medium uppercase tracking-[0.22em] text-[#93c8a8]">
-                Attention Mix
-              </div>
-            </div>
-          </div>
+      <BrandHeader
+        actions={
           <button
             onClick={() =>
               user ? window.confirm("退出登录？") && handleLogout() : setShowLogin(true)
@@ -173,9 +155,8 @@ export default function FocusPage() {
           >
             {user ? user.username : "登录"}
           </button>
-        </div>
-        <FreshLoopNav />
-      </header>
+        }
+      />
 
       <main className="space-y-6 pt-4">
         <section className="rounded-3xl bg-surface-dark p-6 shadow-lg ring-1 ring-white/6">

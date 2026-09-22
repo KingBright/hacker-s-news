@@ -169,6 +169,58 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
             end_ms INTEGER,
             created_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS agent_jobs (
+            id TEXT PRIMARY KEY,
+            job_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            priority INTEGER DEFAULT 0,
+            run_after INTEGER,
+            lease_owner TEXT,
+            lease_token TEXT,
+            lease_expires_at INTEGER,
+            attempt_count INTEGER DEFAULT 0,
+            max_attempts INTEGER DEFAULT 3,
+            context_json TEXT,
+            input_json TEXT,
+            artifact_json TEXT,
+            result_ref TEXT,
+            last_error TEXT,
+            created_at INTEGER,
+            updated_at INTEGER,
+            completed_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS agent_job_events (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            actor TEXT,
+            message TEXT,
+            payload_json TEXT,
+            created_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS voice_jobs (
+            id TEXT PRIMARY KEY,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            product_line TEXT NOT NULL,
+            voice_kind TEXT NOT NULL,
+            text TEXT NOT NULL,
+            file_prefix TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            priority INTEGER DEFAULT 0,
+            run_after INTEGER,
+            lease_owner TEXT,
+            lease_token TEXT,
+            lease_expires_at INTEGER,
+            attempt_count INTEGER DEFAULT 0,
+            max_attempts INTEGER DEFAULT 5,
+            audio_url TEXT,
+            duration_sec INTEGER,
+            last_error TEXT,
+            created_at INTEGER,
+            updated_at INTEGER,
+            completed_at INTEGER
+        );
         "#,
     )
     .execute(&pool)
@@ -204,31 +256,11 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
         .execute(&pool)
         .await;
 
-    // Add unique index on original_url for deduplication (idempotent)
-    // First, clean up existing data to prevent index creation failures
-    // 1. Remove duplicate original_urls (keep the newest by publish_time)
-    let _ = sqlx::query(
-        r#"
-        DELETE FROM items WHERE id NOT IN (
-            SELECT id FROM (
-                SELECT id, ROW_NUMBER() OVER (
-                    PARTITION BY original_url ORDER BY publish_time DESC, created_at DESC
-                ) as rn
-                FROM items
-                WHERE original_url IS NOT NULL AND original_url != ''
-            ) WHERE rn = 1
-        ) AND original_url IS NOT NULL AND original_url != ''
-        "#,
-    )
-    .execute(&pool)
-    .await;
-
-    // 2. Create the unique index (IF NOT EXISTS makes this idempotent)
-    let _ = sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_original_url ON items(original_url)",
-    )
-    .execute(&pool)
-    .await;
+    // Never delete published history merely because two programs cite one source.
+    repair_radio_program_sources(&pool).await?;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_items_original_url ON items(original_url)")
+        .execute(&pool)
+        .await;
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_items_publish_queue ON items(publish_time ASC, created_at ASC, id ASC)",
     )
@@ -298,6 +330,139 @@ pub async fn init_db() -> Result<DbPool, sqlx::Error> {
     )
     .execute(&pool)
     .await;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_agent_jobs_result_ref ON agent_jobs(result_ref)")
+        .execute(&pool)
+        .await?;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_agent_jobs_status_run ON agent_jobs(status, run_after, priority DESC, created_at ASC)"
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_agent_jobs_lease ON agent_jobs(lease_token, lease_expires_at)"
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_agent_job_events_job ON agent_job_events(job_id, created_at ASC)"
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_voice_jobs_status_run ON voice_jobs(status, run_after, priority DESC, created_at ASC)"
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_voice_jobs_target ON voice_jobs(target_type, target_id)",
+    )
+    .execute(&pool)
+    .await;
 
     Ok(pool)
+}
+
+async fn repair_radio_program_sources(pool: &DbPool) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // Repair only missing category items whose source was taken by a remastered
+    // program. Their original IDs, audio and timestamps are retained in job audit.
+    sqlx::query(r#"
+        CREATE TEMP TABLE radio_program_recovery AS
+        SELECT substr(j.result_ref,12) AS id,json_extract(j.artifact_json,'$.title') AS title,json_extract(j.artifact_json,'$.script') AS summary,
+          COALESCE(json_extract(j.artifact_json,'$.original_url'),json_extract(j.artifact_json,'$.sources[0].url')) AS original_url,
+          (SELECT audio_url FROM voice_jobs v WHERE v.target_id=substr(j.result_ref,12) AND v.target_type='radio_item' AND v.status='completed' ORDER BY v.completed_at DESC LIMIT 1) AS audio_url,
+          COALESCE(json_extract(j.artifact_json,'$.publish_time'),j.completed_at) AS publish_time,j.completed_at AS created_at,
+          (SELECT duration_sec FROM voice_jobs v WHERE v.target_id=substr(j.result_ref,12) AND v.target_type='radio_item' AND v.status='completed' ORDER BY v.completed_at DESC LIMIT 1) AS duration_sec,
+          'published' AS status,json_extract(j.artifact_json,'$.category') AS category,json_extract(j.artifact_json,'$.tags') AS tags
+        FROM agent_jobs j WHERE j.job_type='radio_episode' AND j.status='completed' AND json_valid(j.artifact_json)
+          AND j.result_ref LIKE 'radio_item:%'
+          AND NOT EXISTS(SELECT 1 FROM items WHERE id=substr(j.result_ref,12))
+          AND EXISTS(SELECT 1 FROM items p WHERE p.original_url=COALESCE(json_extract(j.artifact_json,'$.original_url'),json_extract(j.artifact_json,'$.sources[0].url'))
+            AND EXISTS(SELECT 1 FROM json_each(CASE WHEN json_valid(p.tags) THEN p.tags ELSE '[]' END) WHERE value='radio:program'))
+    "#).execute(&mut *tx).await?;
+    // Snapshot candidates first, then release the URL before restoring its owner.
+    // Fresh databases enforce UNIQUE(original_url); older installations may not.
+    sqlx::query("UPDATE items SET original_url=NULL WHERE EXISTS(SELECT 1 FROM json_each(CASE WHEN json_valid(items.tags) THEN items.tags ELSE '[]' END) WHERE value='radio:program')").execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO items (id,title,summary,original_url,audio_url,publish_time,created_at,duration_sec,status,category,tags) SELECT id,title,summary,original_url,audio_url,publish_time,created_at,duration_sec,status,category,tags FROM radio_program_recovery")
+        .execute(&mut *tx).await?;
+    sqlx::query("DROP TABLE radio_program_recovery")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn program_repair_restores_originals_with_unique_urls_and_is_idempotent() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(r#"
+            CREATE TABLE items (id TEXT PRIMARY KEY, title TEXT, summary TEXT, original_url TEXT UNIQUE,
+                audio_url TEXT, publish_time INTEGER, created_at INTEGER, duration_sec INTEGER,
+                status TEXT, category TEXT, tags TEXT);
+            CREATE TABLE agent_jobs (job_type TEXT, status TEXT, result_ref TEXT, artifact_json TEXT, completed_at INTEGER);
+            CREATE TABLE voice_jobs (target_id TEXT, target_type TEXT, status TEXT, audio_url TEXT, duration_sec INTEGER, completed_at INTEGER);
+            CREATE TABLE item_sources (item_id TEXT, source_url TEXT);
+            INSERT INTO items (id,title,original_url,tags) VALUES
+                ('program','节目','https://example.com/story','["radio:program"]'),
+                ('untouched','历史节目','https://example.com/older','[]');
+            INSERT INTO agent_jobs VALUES ('radio_episode','completed','radio_item:original',
+                '{"title":"原节目","script":"原文稿","category":"AI前沿","tags":["radio:edition:morning"],"publish_time":123,"sources":[{"url":"https://example.com/story"}]}',124);
+            INSERT INTO voice_jobs VALUES ('original','radio_item','completed','/audio/original.mp3',88,125);
+            INSERT INTO item_sources VALUES ('original','https://example.com/story'),('program','https://example.com/story');
+        "#).execute(&pool).await.unwrap();
+
+        for _ in 0..2 {
+            repair_radio_program_sources(&pool).await.unwrap();
+            let original: (String,String,String,i64,i64,String) = sqlx::query_as(
+                "SELECT title,summary,audio_url,publish_time,duration_sec,tags FROM items WHERE id='original'")
+                .fetch_one(&pool).await.unwrap();
+            assert_eq!(
+                original,
+                (
+                    "原节目".into(),
+                    "原文稿".into(),
+                    "/audio/original.mp3".into(),
+                    123,
+                    88,
+                    "[\"radio:edition:morning\"]".into()
+                )
+            );
+            let program_url: Option<String> =
+                sqlx::query_scalar("SELECT original_url FROM items WHERE id='program'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(program_url.is_none());
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                3
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM item_sources")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT original_url FROM items WHERE id='untouched'"
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                "https://example.com/older"
+            );
+        }
+    }
 }

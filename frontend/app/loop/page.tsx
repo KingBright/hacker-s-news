@@ -1,8 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import Image from "next/image";
-import { FreshLoopNav } from "../../components/FreshLoopNav";
+import { BrandHeader } from "../../components/BrandHeader";
 import { LoginModal } from "../../components/LoginModal";
 import {
   clearLoopDraft,
@@ -229,25 +228,8 @@ export default function LoopPage() {
         onLogin={handleLogin}
       />
 
-      <header className="sticky top-0 z-20 bg-background-dark/95 px-1 pt-8 pb-4 backdrop-blur-md">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <Image
-              src="/logo.png"
-              alt="FreshLoop"
-              width={40}
-              height={40}
-              className="rounded-xl shadow-lg ring-1 ring-white/10"
-            />
-            <div>
-              <div className="text-xl font-bold leading-none tracking-tight text-white">
-                FreshLoop
-              </div>
-              <div className="mt-1 text-xs font-medium uppercase tracking-[0.22em] text-[#93c8a8]">
-                My Loop
-              </div>
-            </div>
-          </div>
+      <BrandHeader
+        actions={
           <button
             onClick={() =>
               user ? window.confirm("退出登录？") && handleLogout() : setShowLogin(true)
@@ -256,9 +238,8 @@ export default function LoopPage() {
           >
             {user ? user.username : "登录"}
           </button>
-        </div>
-        <FreshLoopNav />
-      </header>
+        }
+      />
 
       <main className="grid gap-6 pt-4 lg:grid-cols-[1.1fr_0.9fr]">
         <section className="rounded-3xl bg-surface-dark p-5 shadow-lg ring-1 ring-white/6">
@@ -375,7 +356,7 @@ export default function LoopPage() {
         <section className="rounded-3xl bg-surface-dark p-5 shadow-lg ring-1 ring-white/6">
           <div className="flex items-center justify-between">
             <div>
-              <h2 className="text-xl font-black">My Loop</h2>
+              <h2 className="text-xl font-black">表达记录</h2>
               <p className="mt-1 text-sm text-white/55">
                 原始表达会一直保留，偏好只是它的衍生信号。
               </p>

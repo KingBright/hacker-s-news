@@ -65,8 +65,11 @@ pub async fn create_user(
     });
 
     // 3. Hash Password
-    let password_hash =
-        hash(&password_plain, DEFAULT_COST).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let hash_input = password_plain.clone();
+    let password_hash = tokio::task::spawn_blocking(move || hash(&hash_input, DEFAULT_COST))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let user_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
@@ -108,7 +111,11 @@ pub async fn login(
         let stored_hash: String = row.try_get("password_hash").unwrap_or_default();
         let username: String = row.try_get("username").unwrap_or_default();
 
-        if verify(&payload.password, &stored_hash).unwrap_or(false) {
+        let valid = tokio::task::spawn_blocking(move || verify(&payload.password, &stored_hash))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .unwrap_or(false);
+        if valid {
             return Ok(Json(LoginResponse { id, username }));
         }
     }

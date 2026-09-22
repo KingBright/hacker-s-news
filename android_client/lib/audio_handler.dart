@@ -412,7 +412,7 @@ class FreshLoopAudioHandler extends BaseAudioHandler
             id: item.id,
             title: _cleanTitle(item),
             artist: _notificationSubtitle(item),
-            album: 'FreshLoop Audio Briefing',
+            album: 'FreshLoop Radio',
             genre: item.category,
             artUri: _artUriFor(item),
             duration: item.durationSec != null
@@ -654,7 +654,7 @@ class FreshLoopAudioHandler extends BaseAudioHandler
         coverUrl.startsWith('http') ? coverUrl : '$baseUrl$coverUrl',
       );
     }
-    return Uri.parse('$baseUrl/icon.png');
+    return Uri.parse('$baseUrl/icon-512.png');
   }
 
   Uri? _audioUriFor(MediaItem item) {
@@ -703,7 +703,7 @@ class FreshLoopAudioHandler extends BaseAudioHandler
     if (summary != null && summary.isNotEmpty) {
       return summary.length > 140 ? '${summary.substring(0, 140)}...' : summary;
     }
-    return 'FreshLoop audio briefing';
+    return 'FreshLoop Radio';
   }
 
   Map<String, dynamic> _extrasFor(Item item) {

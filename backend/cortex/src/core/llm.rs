@@ -93,6 +93,34 @@ impl LlmClient {
         let _ = self.shutdown_tx.send(());
     }
 
+    fn cache_key(&self, prompt: &str, namespace: &str, schema_name: Option<&str>) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"freshloop-llm-cache-v2\0");
+        hasher.update(namespace.as_bytes());
+        hasher.update(b"\0");
+        if let Some(schema_name) = schema_name {
+            hasher.update(schema_name.as_bytes());
+        }
+        hasher.update(b"\0");
+        hasher.update(self.config.model.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.config.api_url.trim_end_matches('/').as_bytes());
+        hasher.update(b"\0");
+        hasher.update(
+            self.config
+                .fallback_url
+                .as_deref()
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .as_bytes(),
+        );
+        hasher.update(b"\0");
+        hasher.update(self.config.json_mode.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(prompt.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     fn log_audit(&self, stage: &str, content: &str) {
         if let Some(base_path) = &self.audit_log_path {
             let now = Local::now();
@@ -165,9 +193,7 @@ impl LlmClient {
     pub async fn chat(&self, prompt: &str, skip_cache: bool) -> Result<String> {
         // 1. Check Cache
         let cache_key = if !skip_cache {
-            let mut hasher = Sha256::new();
-            hasher.update(prompt);
-            Some(hex::encode(hasher.finalize()))
+            Some(self.cache_key(prompt, "chat", None))
         } else {
             None
         };
@@ -358,11 +384,7 @@ impl LlmClient {
     ) -> Result<T> {
         // 1. Check cache (same key scheme as chat())
         let cache_key = if !skip_cache {
-            let mut hasher = Sha256::new();
-            hasher.update(prompt);
-            hasher.update(b"__json__");
-            hasher.update(schema_name.as_bytes());
-            Some(hex::encode(hasher.finalize()))
+            Some(self.cache_key(prompt, "json", Some(schema_name)))
         } else {
             None
         };
@@ -375,8 +397,31 @@ impl LlmClient {
                         if now - entry.created_at < CACHE_TTL_SECS {
                             log::info!("LLM Cache Hit (JSON)! Key: {}", key);
                             self.log_audit("CACHE HIT (JSON)", &entry.content);
-                            return serde_json::from_str::<T>(&entry.content)
-                                .map_err(|e| anyhow::anyhow!("Cached JSON parse error: {}", e));
+                            match Self::try_parse_structured_json::<T>(&entry.content) {
+                                Ok((value, normalized_content)) => {
+                                    if normalized_content != entry.content {
+                                        let normalized_entry = CacheEntry {
+                                            created_at: entry.created_at,
+                                            content: normalized_content,
+                                        };
+                                        if let Ok(bytes) = serde_json::to_vec(&normalized_entry) {
+                                            let _ = db.insert(key, bytes);
+                                            let _ = db.flush();
+                                        }
+                                    }
+                                    return Ok(value);
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Cached structured JSON parse failed (schema: {}, key: {}): {}. Refreshing from LLM.",
+                                        schema_name,
+                                        key,
+                                        e
+                                    );
+                                    let _ = db.remove(key);
+                                    let _ = db.flush();
+                                }
+                            }
                         }
                     }
                 }
@@ -560,49 +605,17 @@ impl LlmClient {
 
         self.log_audit("OUTPUT (JSON)", json_content);
 
-        // 6. Deserialize — try direct parse first, fall back to JSON extraction for "none" mode
-        let result: T = match serde_json::from_str(json_content) {
-            Ok(v) => v,
-            Err(e) => {
-                // Fallback: try to extract JSON from response (for "none" mode or imperfect output)
-                let extracted = if let (Some(s), Some(e_pos)) =
-                    (json_content.find('{'), json_content.rfind('}'))
-                {
-                    if e_pos >= s {
-                        &json_content[s..=e_pos]
-                    } else {
-                        json_content
-                    }
-                } else if let (Some(s), Some(e_pos)) =
-                    (json_content.find('['), json_content.rfind(']'))
-                {
-                    if e_pos >= s {
-                        &json_content[s..=e_pos]
-                    } else {
-                        json_content
-                    }
-                } else {
-                    json_content
-                };
-
-                serde_json::from_str(extracted).map_err(|_| {
-                    log::error!(
-                        "Structured JSON parse failed (schema: {}): {}. Content: {}",
-                        schema_name,
-                        e,
-                        json_content
-                    );
-                    anyhow::anyhow!("Structured JSON parse error: {}", e)
-                })?
-            }
-        };
+        // 6. Deserialize — local models often return fenced JSON or literal newlines
+        // inside string values, so parse through the relaxed JSON cleanup path.
+        let (result, cache_content) =
+            Self::parse_structured_json_with_normalized(json_content, schema_name)?;
 
         // 7. Write to cache
         if let Some(key) = &cache_key {
             if let Some(db) = &self.cache {
                 let entry = CacheEntry {
                     created_at: Local::now().timestamp(),
-                    content: json_content.to_string(),
+                    content: cache_content,
                 };
                 if let Ok(bytes) = serde_json::to_vec(&entry) {
                     if let Err(e) = db.insert(key, bytes) {
@@ -631,5 +644,258 @@ impl LlmClient {
         } else {
             Ok((0, 0))
         }
+    }
+
+    fn parse_structured_json<T: serde::de::DeserializeOwned>(
+        content: &str,
+        schema_name: &str,
+    ) -> Result<T> {
+        Self::parse_structured_json_with_normalized(content, schema_name).map(|(value, _)| value)
+    }
+
+    fn parse_structured_json_with_normalized<T: serde::de::DeserializeOwned>(
+        content: &str,
+        schema_name: &str,
+    ) -> Result<(T, String)> {
+        Self::try_parse_structured_json(content).map_err(|error_summary| {
+            log::error!(
+                "Structured JSON parse failed (schema: {}): {}. Content: {}",
+                schema_name,
+                error_summary,
+                content
+            );
+            anyhow::anyhow!(
+                "Structured JSON parse error for {}: {}",
+                schema_name,
+                error_summary
+            )
+        })
+    }
+
+    fn try_parse_structured_json<T: serde::de::DeserializeOwned>(
+        content: &str,
+    ) -> std::result::Result<(T, String), String> {
+        let mut errors = Vec::new();
+
+        for candidate in structured_json_candidates(content) {
+            match serde_json::from_str::<T>(&candidate) {
+                Ok(value) => return Ok((value, candidate)),
+                Err(e) => errors.push(e.to_string()),
+            }
+
+            let relaxed = escape_control_chars_in_json_strings(&candidate);
+            if relaxed != candidate {
+                match serde_json::from_str::<T>(&relaxed) {
+                    Ok(value) => return Ok((value, relaxed)),
+                    Err(e) => errors.push(e.to_string()),
+                }
+            }
+        }
+
+        Err(errors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "unknown JSON parse error".to_string()))
+    }
+}
+
+fn structured_json_candidates(content: &str) -> Vec<String> {
+    let stripped = strip_markdown_code_fence(content);
+    let mut candidates = vec![stripped.to_string()];
+
+    if let (Some(start), Some(end)) = (stripped.find('{'), stripped.rfind('}')) {
+        if end >= start {
+            let extracted = stripped[start..=end].trim().to_string();
+            if !candidates.iter().any(|candidate| candidate == &extracted) {
+                candidates.push(extracted);
+            }
+        }
+    }
+
+    if let (Some(start), Some(end)) = (stripped.find('['), stripped.rfind(']')) {
+        if end >= start {
+            let extracted = stripped[start..=end].trim().to_string();
+            if !candidates.iter().any(|candidate| candidate == &extracted) {
+                candidates.push(extracted);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn strip_markdown_code_fence(content: &str) -> &str {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed;
+    }
+
+    let body = trimmed
+        .find('\n')
+        .map(|idx| &trimmed[idx + 1..])
+        .unwrap_or(trimmed);
+    let body = body.trim();
+
+    if let Some(end) = body.rfind("```") {
+        body[..end].trim()
+    } else {
+        body
+    }
+}
+
+fn escape_control_chars_in_json_strings(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if in_string {
+            if escaped {
+                output.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            match ch {
+                '\\' => {
+                    output.push(ch);
+                    escaped = true;
+                }
+                '"' => {
+                    output.push(ch);
+                    in_string = false;
+                }
+                '\n' => output.push_str("\\n"),
+                '\r' => output.push_str("\\r"),
+                '\t' => output.push_str("\\t"),
+                value if value.is_control() => {
+                    output.push_str(&format!("\\u{:04x}", value as u32));
+                }
+                value => output.push(value),
+            }
+        } else {
+            output.push(ch);
+            if ch == '"' {
+                in_string = true;
+            }
+        }
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    fn test_client(model: &str, api_url: &str, json_mode: &str) -> LlmClient {
+        LlmClient::new(
+            LlmConfig {
+                model: model.to_string(),
+                api_url: api_url.to_string(),
+                fallback_url: None,
+                json_mode: json_mode.to_string(),
+            },
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn cache_key_includes_model_and_endpoint_identity() {
+        let client = test_client(
+            "google/gemma-4-26b-a4b-qat",
+            "http://127.0.0.1:1234/v1",
+            "none",
+        );
+        let same = test_client(
+            "google/gemma-4-26b-a4b-qat",
+            "http://127.0.0.1:1234/v1/",
+            "none",
+        );
+        let old_model = test_client("qwen/qwen3.6-35b-a3b", "http://127.0.0.1:1234/v1", "none");
+        let other_endpoint = test_client(
+            "google/gemma-4-26b-a4b-qat",
+            "http://127.0.0.1:4321/v1",
+            "none",
+        );
+
+        let prompt = "summarize this source";
+
+        assert_eq!(
+            client.cache_key(prompt, "chat", None),
+            same.cache_key(prompt, "chat", None)
+        );
+        assert_ne!(
+            client.cache_key(prompt, "chat", None),
+            old_model.cache_key(prompt, "chat", None)
+        );
+        assert_ne!(
+            client.cache_key(prompt, "chat", None),
+            other_endpoint.cache_key(prompt, "chat", None)
+        );
+    }
+
+    #[test]
+    fn json_cache_key_includes_schema_and_json_mode() {
+        let client = test_client(
+            "google/gemma-4-26b-a4b-qat",
+            "http://127.0.0.1:1234/v1",
+            "none",
+        );
+        let json_schema_client = test_client(
+            "google/gemma-4-26b-a4b-qat",
+            "http://127.0.0.1:1234/v1",
+            "json_schema",
+        );
+
+        let prompt = "classify this item";
+
+        assert_ne!(
+            client.cache_key(prompt, "json", Some("item_analysis")),
+            client.cache_key(prompt, "json", Some("review_result"))
+        );
+        assert_ne!(
+            client.cache_key(prompt, "json", Some("item_analysis")),
+            json_schema_client.cache_key(prompt, "json", Some("item_analysis"))
+        );
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct StructuredFixture {
+        title: String,
+        audio_script: String,
+        key_points: Vec<String>,
+    }
+
+    #[test]
+    fn parse_structured_json_accepts_fenced_json_with_literal_multiline_strings() {
+        let content = r#"```json
+{
+  "title": "Example",
+  "audio_script": "第一段。
+
+第二段。",
+  "key_points": ["第一点", "第二点"]
+}
+```"#;
+
+        let parsed: StructuredFixture =
+            LlmClient::parse_structured_json(content, "fixture").expect("parse relaxed JSON");
+
+        assert_eq!(
+            parsed,
+            StructuredFixture {
+                title: "Example".to_string(),
+                audio_script: "第一段。\n\n第二段。".to_string(),
+                key_points: vec!["第一点".to_string(), "第二点".to_string()],
+            }
+        );
+
+        let (_, normalized): (StructuredFixture, String) =
+            LlmClient::parse_structured_json_with_normalized(content, "fixture")
+                .expect("parse and normalize relaxed JSON");
+        serde_json::from_str::<StructuredFixture>(&normalized).expect("normalized cache JSON");
     }
 }
