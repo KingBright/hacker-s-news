@@ -58,6 +58,8 @@ pub struct CreateItemRequest {
 pub struct Pagination {
     pub page: Option<i64>,
     pub limit: Option<i64>,
+    /// Absolute row offset takes precedence over page when supplied.
+    pub offset: Option<i64>,
     pub category: Option<String>,
     pub edition_pages: Option<bool>,
 }
@@ -79,10 +81,10 @@ fn is_valid_url(url: &str) -> bool {
 }
 
 /// Sanitize pagination parameters
-fn sanitize_pagination(page: Option<i64>, limit: Option<i64>) -> (i64, i64) {
+fn sanitize_pagination(page: Option<i64>, limit: Option<i64>, offset: Option<i64>) -> (i64, i64) {
     let limit = limit.unwrap_or(20).clamp(MIN_LIMIT, MAX_LIMIT);
     let page = page.unwrap_or(1).max(1);
-    let offset = (page - 1) * limit;
+    let offset = offset.unwrap_or_else(|| (page - 1).saturating_mul(limit)).max(0);
     (limit, offset)
 }
 
@@ -221,12 +223,15 @@ pub async fn list_items(
     Query(pagination): Query<Pagination>,
 ) -> impl IntoResponse {
     if pagination.edition_pages.unwrap_or(false) {
+        if pagination.offset.is_some() {
+            return (StatusCode::BAD_REQUEST, "edition_pages requires page, not offset").into_response();
+        }
         return match fetch_radio_editions(&state.db, pagination.page.unwrap_or(1).max(1)).await {
             Ok(items) => Json(items).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
     }
-    let (limit, offset) = sanitize_pagination(pagination.page, pagination.limit);
+    let (limit, offset) = sanitize_pagination(pagination.page, pagination.limit, pagination.offset);
     let category_filter = pagination.category.as_deref();
 
     // Extract user_id from header for filtering listened items
@@ -637,6 +642,27 @@ pub async fn create_item_multipart(
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn explicit_offset_advances_history_and_reaches_end() {
+        let pool = test_pool().await;
+        for i in 0..5 {
+            insert_item(&pool, &format!("item-{i}"), i, "Tech").await;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (offset, expected) in [(0, 2), (2, 2), (4, 1), (6, 0)] {
+            let pagination: Pagination = serde_json::from_value(json!({"limit":2,"offset":offset})).unwrap();
+            let (limit, offset) = sanitize_pagination(pagination.page, pagination.limit, pagination.offset);
+            let items = fetch_items_for_request(&pool, None, None, limit, offset).await.unwrap();
+            assert_eq!(items.len(), expected);
+            for item in items { assert!(seen.insert(item.id), "pagination repeated an item"); }
+        }
+        assert_eq!(seen.len(), 5);
+        assert_eq!(sanitize_pagination(Some(3), Some(10), None), (10, 20));
+        assert_eq!(sanitize_pagination(Some(3), Some(10), Some(7)), (10, 7));
+        assert_eq!(sanitize_pagination(None, None, Some(-2)), (20, 0));
+        assert_eq!(sanitize_pagination(Some(i64::MAX), Some(100), None), (100, i64::MAX));
+    }
 
     async fn test_pool() -> DbPool {
         let pool = SqlitePoolOptions::new()

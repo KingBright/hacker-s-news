@@ -75,6 +75,8 @@ pub struct WeeklyDigest {
 pub struct FeedPagination {
     pub page: Option<i64>,
     pub limit: Option<i64>,
+    /// Absolute row offset takes precedence over page when supplied.
+    pub offset: Option<i64>,
     pub product_line: Option<String>,
     pub item_type: Option<String>,
     pub primary_mode: Option<String>,
@@ -139,10 +141,10 @@ pub struct UpdateReadingProgressRequest {
     pub read_at: Option<i64>,
 }
 
-fn sanitize_pagination(page: Option<i64>, limit: Option<i64>) -> (i64, i64) {
+fn sanitize_pagination(page: Option<i64>, limit: Option<i64>, offset: Option<i64>) -> (i64, i64) {
     let limit = limit.unwrap_or(20).clamp(MIN_LIMIT, MAX_LIMIT);
     let page = page.unwrap_or(1).max(1);
-    (limit, (page - 1) * limit)
+    (limit, offset.unwrap_or_else(|| (page - 1).saturating_mul(limit)).max(0))
 }
 
 fn is_valid_url(url: &str) -> bool {
@@ -796,7 +798,7 @@ pub async fn list_feed_items(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let (limit, offset) = sanitize_pagination(pagination.page, pagination.limit);
+    let (limit, offset) = sanitize_pagination(pagination.page, pagination.limit, pagination.offset);
     let (query_limit, query_offset) = if requested_user.is_some() {
         (
             personalization::recommended_candidate_limit(limit, offset),
@@ -1424,9 +1426,14 @@ mod tests {
 
     #[test]
     fn pagination_is_clamped_to_supported_range() {
-        assert_eq!(sanitize_pagination(Some(-4), Some(500)), (100, 0));
-        assert_eq!(sanitize_pagination(Some(3), Some(10)), (10, 20));
-        assert_eq!(sanitize_pagination(None, Some(0)), (1, 0));
+        assert_eq!(sanitize_pagination(Some(-4), Some(500), None), (100, 0));
+        assert_eq!(sanitize_pagination(Some(3), Some(10), None), (10, 20));
+        assert_eq!(sanitize_pagination(None, Some(0), None), (1, 0));
+        let pagination: FeedPagination = serde_json::from_value(json!({"limit":100,"offset":200})).unwrap();
+        assert_eq!(sanitize_pagination(pagination.page, pagination.limit, pagination.offset), (100, 200));
+        assert_eq!(sanitize_pagination(Some(3), Some(10), Some(7)), (10, 7));
+        assert_eq!(sanitize_pagination(None, None, Some(-2)), (20, 0));
+        assert_eq!(sanitize_pagination(Some(i64::MAX), Some(100), None), (100, i64::MAX));
     }
 
     #[test]

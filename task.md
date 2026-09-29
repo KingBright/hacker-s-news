@@ -126,3 +126,10 @@ Canonical runtime instructions: `docs/scheduled-agent-runbook.md` and the skill.
 - [x] Final Cortex pronunciation release; all three recent remasters complete (16:13 / 20:23 / 14:06), with public MP3 integrity/range checks, browser playback and handoff ASR acceptance.
 - [x] Repair startup URL deduplication without deleting published history; restore three original items and preserve older audio.
 - [x] Commit and push related FreshLoop work after final acceptance; preserve unrelated experiments.
+
+## Missing morning news — 2026-09-29
+
+- [x] Locate the stall: offset was ignored by Nexus history endpoints, causing an unbounded repeated-page scan.
+- [x] Add offset compatibility and pagination regressions; deploy backend and verify live page boundaries and Feed smoke.
+- [x] Clarify pagination and bounded background-command handling in the shared editorial skill.
+- [x] Confirm evening dispatch and the latest completed weekly digest. See `docs/missing-news-2026-09-29.md`.

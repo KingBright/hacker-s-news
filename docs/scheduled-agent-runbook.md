@@ -127,6 +127,20 @@ voice job in the submit transaction. A changed script, wrong window or already
 voiced target is rejected. This is an authorized repair path, not a way to bypass
 normal duplicate checks or silently overwrite historical audio.
 
+## Published-history pagination
+
+Use `/api/items?page=1&limit=50` and `/api/feed/items?page=1&limit=50` for
+published history. Page numbering starts at 1. Cortex source-list `offset`
+pagination is a separate contract. Nexus also accepts an explicit nonnegative
+row `offset` for compatibility; it takes precedence over `page`. Edition-card
+pagination (`edition_pages=true`) requires `page` and rejects `offset`.
+
+History scans must stop on repeated page IDs, use a bounded loop/deadline, and
+await any background command's terminal result. A scheduler's successful
+`new-conversation` call proves dispatch only, not publication. Check the run
+report, Nexus publication and voice status separately. This prevents the
+2026-09-29 failure where an ignored offset repeatedly returned the first page.
+
 ## Complete Radio programs (2026-09-22)
 
 Daily Radio now uses one `radio_program` per date and `morning-program` /
