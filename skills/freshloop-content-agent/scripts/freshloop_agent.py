@@ -17,6 +17,8 @@ import urllib.request
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from editorial_evidence import validate_evidence
+from source_pagination import collect_sources
 
 JOB_TYPES = ('radio_program', 'radio_episode', 'reading_article', 'weekly_digest', 'loop_preference_extraction')
 
@@ -127,7 +129,7 @@ def validate_radio_digest(artifact):
 
 
 def validate(artifact, job_type):
-    errors = []
+    errors = validate_evidence(artifact, job_type)
     if job_type == 'radio_program':
         for field, maximum in (('title', 160), ('opening', 400), ('closing', 200)):
             value = artifact.get(field)
@@ -310,8 +312,14 @@ def dispatch(args):
             with os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as f: f.write(data)
             print(json.dumps({'saved':args.out,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()})); return
         if args.command == 'sources':
-            path='/api/agent/sources?' + urllib.parse.urlencode({k:v for k,v in {'product_line':args.product_line,'offset':args.offset,'limit':30}.items() if v is not None})
-            result=api.call(path)
+            if getattr(args, 'all', False):
+                result=collect_sources(api,args.product_line,args.offset,getattr(args,'since',0))
+            else:
+                path='/api/agent/sources?' + urllib.parse.urlencode({k:v for k,v in {'product_line':args.product_line,'offset':args.offset,'since':getattr(args,'since',0),'limit':30}.items() if v is not None})
+                result=api.call(path)
+                batch=result.get('sources',{})
+                next_offset=args.offset+len(batch.get('items',[]))
+                result['pagination']={'complete':args.offset==0 and next_offset>=batch.get('total',0),'next_offset':next_offset,'since':getattr(args,'since',0)}
         elif args.command == 'source': result=api.call('/api/agent/sources/'+urllib.parse.quote(args.id,safe='')+'/fetch',{})
         else: result=api.call('/api/agent/sources/refresh',{},retry=False)
         save(args.out,result); print(json.dumps({'saved':args.out})); return
@@ -339,6 +347,8 @@ def dispatch(args):
     if args.command == 'heartbeat': state['lease_expires_at']=result['lease_expires_at']
     if args.command == 'submit': state.update(status='completed',result_ref=result.get('result_ref'),voice_job_ids=result.get('voice_job_ids',[]))
     if args.command == 'fail': state['status']='failed'
+    p.add_argument('--all', action='store_true', help='collect every metadata page, bounded by deadline and page count')
+    p.add_argument('--since', type=int, default=0, help='cache first-seen Unix time, not original publication date')
     save(args.state,state)
     print(json.dumps(result,ensure_ascii=False))
 

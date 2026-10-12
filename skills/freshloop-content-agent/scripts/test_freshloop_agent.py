@@ -13,7 +13,7 @@ def artifact():
             'compressed_markdown':'中文摘要','audio_script':'这是一份有来源、有明确事实和限制的中文听稿。'*8,
             'editorial':{'language':'zh-CN','ready':True,'dedup_checked':True,
                          'quality':dict.fromkeys(('fidelity','selection','listening','structure','media'),2),
-                         'claims':[{'claim':'已核实','source_url':'https://example.org/article','evidence':'原文片段'}],'media':[]}}
+                         'claims':[{'claim':'样品完成一千次循环','source_url':'https://example.org/article','evidence':'The sample completed 1000 cycles in controlled laboratory conditions.'},{'claim':'测试不涵盖低温户外条件','source_url':'https://example.org/article','evidence':'The tests did not include low-temperature outdoor conditions.'}],'media':[]}}
 
 
 def radio_artifact():
@@ -22,7 +22,7 @@ def radio_artifact():
     data.update(category='Tech',stories=stories,script='\n'.join(x['script'] for x in stories))
     data['audio_script']=data['script']
     data['sources']=[dict(url=x['source_urls'][0],title=x['title'],summary='来源证据') for x in stories]
-    data['editorial']['claims']=[dict(claim=x['title'],source_url=x['source_urls'][0],evidence='原文引文') for x in stories]
+    data['editorial']['claims']=[dict(claim=f'{x["event_key"]}事实{j}',source_url=x['source_urls'][0],evidence=f'Test source passage supports event {i}, fact {j}.') for i,x in enumerate(stories) for j in range(2)]
     data['editorial']['radio_coverage'] = dict(reviewed=True, eligible_event_keys=[x['event_key'] for x in stories])
     return data
 
