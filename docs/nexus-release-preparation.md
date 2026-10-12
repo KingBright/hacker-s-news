@@ -32,6 +32,9 @@ test evidence (at least54 passed tests; the previous8-test subset is insufficien
 Every check compares snapshot inputs against the pinned Git objects and
 manifest patches; source/fixture changes invalidate the evidence. Build creates an
 ELF64 x86_64 candidate and verified-release.json, never an upload.
+Linux build explicitly loads native-target.toml, the existing ignored local
+musl linker/strip contract made reviewable; host test configuration is unchanged.
+No Docker or server-side compilation is used.
 
 Before publication, obtain and review the current running/installed Nexus
 SHA256 through the existing authorized server route. The current health and

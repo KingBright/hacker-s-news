@@ -275,6 +275,9 @@ deploy_verified_nexus() {
     [[ "$EXPECTED_LIVE_NEXUS_SHA" =~ ^[a-f0-9]{64}$ ]] || {
         echo "--expected-live-sha must bind the reviewed running Nexus binary" >&2; return 1;
     }
+    SSH_OPTS+=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no
+        -o AddKeysToAgent=no -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
+        -o ControlMaster=no -o ControlPath=none)
     # One SSH operation; never replay an uncertain restart. The remote script
     # retains the old binary and verifies both the running hash and GET health.
     remote_command="set -eu; task_temp=\$(mktemp -d '$APP_DIR/.nexus-upload.XXXXXX'); trap 'rm -rf \"\$task_temp\"' EXIT; tar -xf - -C \"\$task_temp\"; bash \"\$task_temp/nexus_binary_release.sh\" '$APP_DIR' '$release_id' '$candidate_sha' '$EXPECTED_LIVE_NEXUS_SHA' \"\$task_temp/nexus\""

@@ -16,6 +16,7 @@ import tarfile
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = Path("/Users/jinliang/rust-target")
 SPEC = Path(__file__).parent / "nexus-release/path-manifests.json"
+NATIVE_CONFIG = SPEC.parent / "native-target.toml"
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
@@ -193,7 +194,8 @@ def build(args):
     m = load(args.snapshot)
     t = test_proof(args.snapshot, m)
     command = ["cargo", "build", "--locked", "--offline", "-p", "nexus",
-               "--target", "x86_64-unknown-linux-musl", "--release", "-j", "2"]
+               "--target", "x86_64-unknown-linux-musl", "--release", "-j", "2",
+               "--config", str(NATIVE_CONFIG)]
     log = args.snapshot / "nexus-build.log"
     m, rc = run_cargo(args.snapshot, command, log)
     if rc:
@@ -209,6 +211,7 @@ def build(args):
                     source_tree_sha256=m["source_tree_sha256"], candidate_sha256=sha(data),
                     release_id=m["source_commit"] + "-" + sha(data)[:12],
                     target="x86_64-unknown-linux-musl", build_command=command,
+                    native_config_sha256=sha(NATIVE_CONFIG.read_bytes()),
                     build_exit_code=0, build_log_sha256=sha(log.read_bytes()),
                     test_result=t, deployment_started=False)
     save(args.snapshot / "verified-release.json", evidence)
@@ -226,7 +229,9 @@ def check_release(path):
             or e["build_log_sha256"] != sha((snapshot / "nexus-build.log").read_bytes())
             or e["target"] != "x86_64-unknown-linux-musl"
             or e["build_command"] != ["cargo", "build", "--locked", "--offline", "-p", "nexus",
-                                     "--target", "x86_64-unknown-linux-musl", "--release", "-j", "2"]
+                                     "--target", "x86_64-unknown-linux-musl", "--release", "-j", "2",
+                                     "--config", str(NATIVE_CONFIG)]
+            or e["native_config_sha256"] != sha(NATIVE_CONFIG.read_bytes())
             or e["candidate_sha256"] != sha(data) or not elf_x86_64(data)
             or e["release_id"] != m["source_commit"] + "-" + sha(data)[:12]):
         raise ValueError("release evidence or candidate changed")

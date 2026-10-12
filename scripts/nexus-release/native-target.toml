@@ -1,0 +1,3 @@
+[target.x86_64-unknown-linux-musl]
+linker = "/opt/homebrew/Cellar/x86_64-unknown-linux-musl/13.3.0/bin/x86_64-unknown-linux-musl-gcc"
+rustflags = ["-C", "link-arg=-s"]

@@ -94,6 +94,9 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 prep.test_proof(Path(t), {})
 
+    def test_native_config_preserves_existing_cross_compile_contract(self):
+        self.assertEqual(prep.NATIVE_CONFIG.read_bytes(), (ROOT / "backend/.cargo/config.toml").read_bytes())
+
     def test_platform_gate_rejects_macos_and_wrong_elf_arch(self):
         self.assertFalse(prep.elf_x86_64(b"\xcf\xfa\xed\xfe" + bytes(100)))
         data = bytearray(64)
@@ -130,7 +133,9 @@ if name=='sha256sum':
  p=b/'running' if a[0].startswith('/proc/') else pathlib.Path(a[0])
  print(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+a[0])
 elif name=='systemctl':
- if a[0]=='show':print('123')
+ if a[0]=='show':
+  if '--value' in a:sys.exit('old NAS systemctl has no --value')
+  print('MainPID=123')
  elif a==['restart','nexus']:
   if (b/'interrupt_restart').exists() and (b/'app/nexus').read_bytes()==b'new binary':os.kill(os.getppid(),signal.SIGHUP)
   if (b/'fail_restart').exists() and (b/'app/nexus').read_bytes()==b'new binary':sys.exit(1)

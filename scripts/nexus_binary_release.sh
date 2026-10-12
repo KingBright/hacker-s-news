@@ -13,7 +13,7 @@ candidate=$5
 hash() { sha256sum "$1" | awk '{print $1}'; }
 running_hash() {
     local pid
-    pid=$(systemctl show nexus --property MainPID --value)
+    pid=$(systemctl show nexus --property=MainPID | sed -n 's/^MainPID=//p')
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
     hash "/proc/$pid/exe"
 }
