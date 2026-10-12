@@ -24,6 +24,9 @@ from review_comparison import EditorialError, prepare_inputs, verify_comparison,
 from editorial_selection import bind_selection
 
 JOB_TYPES = ('radio_program', 'radio_episode', 'reading_article', 'weekly_digest', 'loop_preference_extraction')
+# Matches Nexus's existing Feed body storage bound; not a model input budget.
+MAX_READING_SOURCE_BYTES = 2_000_000
+MAX_READING_MANUSCRIPT_BYTES = 80_000
 
 
 def save(path, value):
@@ -244,6 +247,17 @@ def validate(artifact, job_type):
     elif scores['fidelity'] == 0 or sum(scores[k] for k in dimensions) < 8:
         errors.append('editorial quality must total at least 8/10 with nonzero fidelity')
     if job_type == 'reading_article':
+        for field in ('reader_markdown', 'plain_text', 'compressed_markdown', 'audio_script'):
+            value = artifact.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                errors.append(f'{field} must be text')
+                continue
+            limit = MAX_READING_SOURCE_BYTES if field in ('reader_markdown', 'plain_text') else MAX_READING_MANUSCRIPT_BYTES
+            actual = len(value.encode('utf-8'))
+            if actual > limit:
+                errors.append(f'{field} exceeds {limit} bytes (actual: {actual} bytes); retain the full source and report the storage limit, never truncate it to pass validation')
         reader = artifact.get('reader_markdown', '')
         # Preserve legitimate fenced code examples; reject known page chrome
         # observed in real scheduled-run acceptance, not arbitrary code articles.

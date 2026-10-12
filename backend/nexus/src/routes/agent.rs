@@ -269,6 +269,20 @@ fn validate_text_length(value: &str, field: &str) -> Result<(), String> {
     }
 }
 
+// The original and plain-text Reading views share the existing Feed storage
+// bound. Synthesized summaries and speech retain the smaller manuscript bound.
+fn validate_reading_text_length(value: &str, field: &str) -> Result<(), String> {
+    let limit = match field {
+        "reader_markdown" | "plain_text" => super::feed::MAX_BODY_LENGTH,
+        _ => MAX_TEXT_LENGTH,
+    };
+    if value.len() > limit {
+        Err(format!("{field} exceeds {limit} bytes (actual: {} bytes)", value.len()))
+    } else {
+        Ok(())
+    }
+}
+
 fn clamp_lease_seconds(value: Option<i64>) -> i64 {
     value
         .unwrap_or(DEFAULT_LEASE_SECONDS)
@@ -396,7 +410,13 @@ pub async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> 
             },
             "reading_article": {
                 "required": ["title", "original_url"],
-                "optional": ["subtitle", "source_name", "source_url", "canonical_url", "reader_markdown", "plain_text", "compressed_markdown", "audio_script", "key_points", "quality_score", "tags"]
+                "optional": ["subtitle", "source_name", "source_url", "canonical_url", "reader_markdown", "plain_text", "compressed_markdown", "audio_script", "key_points", "quality_score", "tags"],
+                "field_limits_bytes": {
+                    "reader_markdown": super::feed::MAX_BODY_LENGTH,
+                    "plain_text": super::feed::MAX_BODY_LENGTH,
+                    "compressed_markdown": MAX_TEXT_LENGTH,
+                    "audio_script": MAX_TEXT_LENGTH
+                }
             },
             "weekly_digest": {
                 "required": ["title", "week_start", "week_end"],
@@ -1147,7 +1167,7 @@ async fn publish_reading_article(
         ("audio_script", artifact.audio_script.as_deref()),
     ] {
         if let Some(value) = value {
-            validate_text_length(value, field)?;
+            validate_reading_text_length(value, field)?;
         }
     }
 
@@ -2204,6 +2224,104 @@ mod tests {
         assert!(trim_required(&parsed.script, "script").is_ok());
     }
 
+
+    #[test]
+    fn reading_storage_limits_count_utf8_bytes_and_keep_manuscripts_bounded() {
+        let exact = "中".repeat(super::super::feed::MAX_BODY_LENGTH / 3) + "aa";
+        assert_eq!(exact.len(), super::super::feed::MAX_BODY_LENGTH);
+        for field in ["reader_markdown", "plain_text"] {
+            assert!(validate_reading_text_length(&exact, field).is_ok());
+            let oversized = exact.clone() + "x";
+            let error = validate_reading_text_length(&oversized, field).unwrap_err();
+            assert!(error.contains(field));
+            assert!(error.contains("2000000 bytes"));
+            assert!(error.contains("actual: 2000001 bytes"));
+        }
+        for field in ["compressed_markdown", "audio_script"] {
+            assert!(validate_reading_text_length(&"x".repeat(MAX_TEXT_LENGTH), field).is_ok());
+            assert!(validate_reading_text_length(&"x".repeat(MAX_TEXT_LENGTH + 1), field).is_err());
+        }
+    }
+
+    fn long_reading_fixture() -> Value {
+        // Set this to the private real-article draft for the maintenance regression.
+        // Ordinary CI exercises the same path with a complete long fixture.
+        if let Ok(path) = std::env::var("FRESHLOOP_READING_TEST_ARTIFACT") {
+            return serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        }
+        let reader = "A long article paragraph explains the experiment, its conditions and limitations.\n".repeat(1500)
+            + "FINAL LIMITATION: repeated cache scores do not measure disk throughput.";
+        json!({
+            "title": "Complete long Reading source",
+            "original_url": "https://example.com/long-reading",
+            "reader_markdown": reader,
+            "compressed_markdown": "作者区分了实验条件和缓存影响。",
+            "audio_script": "这里只使用经过编辑的中文语音稿，不朗读完整的原始文章。"
+        })
+    }
+
+    #[tokio::test]
+    async fn reading_long_source_roundtrips_without_using_original_for_voice() {
+        let state = test_state().await;
+        let mut artifact = long_reading_fixture();
+        let reader = artifact["reader_markdown"].as_str().unwrap().to_owned();
+        assert!(reader.len() > MAX_TEXT_LENGTH);
+        assert!(reader.len() <= super::super::feed::MAX_BODY_LENGTH);
+        artifact["plain_text"] = json!(reader);
+        let spoken = artifact["audio_script"].as_str().unwrap().to_owned();
+        let mut conn = state.db.acquire().await.unwrap();
+        let result = publish_reading_article(&mut conn, &artifact, DEFAULT_CONTENT_VOICE_PRIORITY).await.unwrap();
+        let item_id = result.result_ref.unwrap().strip_prefix("feed_item:").unwrap().to_owned();
+        let stored: (String, String) = sqlx::query_as(
+            "SELECT reader_markdown, plain_text FROM feed_item_contents WHERE item_id=?"
+        ).bind(&item_id).fetch_one(&mut *conn).await.unwrap();
+        assert_eq!(stored.0.as_bytes(), reader.as_bytes());
+        assert_eq!(stored.1.as_bytes(), reader.as_bytes());
+        let voice_text: String = sqlx::query_scalar("SELECT text FROM voice_jobs WHERE target_id=?")
+            .bind(&item_id).fetch_one(&mut *conn).await.unwrap();
+        assert_eq!(voice_text, spoken);
+        assert_ne!(voice_text, reader);
+    }
+
+    #[tokio::test]
+    async fn oversized_reading_submit_reports_field_bytes_without_partial_publication() {
+        let state = test_state().await;
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO agent_jobs (id,job_type,status,lease_owner,lease_token,lease_expires_at,attempt_count,max_attempts,created_at,updated_at)
+             VALUES ('oversized-reading','reading_article','leased','test','test-lease',?,1,3,?,?)"
+        ).bind(now+300).bind(now).bind(now).execute(&state.db).await.unwrap();
+        for field in ["reader_markdown", "plain_text", "compressed_markdown", "audio_script"] {
+            let mut artifact = long_reading_fixture();
+            let limit = if matches!(field, "reader_markdown" | "plain_text") {
+                super::super::feed::MAX_BODY_LENGTH
+            } else {
+                MAX_TEXT_LENGTH
+            };
+            let oversized = "中".repeat(limit / 3) + &"x".repeat(limit % 3 + 1);
+            assert_eq!(oversized.len(), limit + 1);
+            artifact[field] = json!(oversized);
+            let response = submit_agent_job(
+                State(state.clone()), authed_headers(), Path("oversized-reading".into()),
+                Json(SubmitAgentJobRequest { lease_token: "test-lease".into(), artifact })
+            ).await.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+            let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            let error = String::from_utf8(body.to_vec()).unwrap();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains(&format!("{limit} bytes")), "{error}");
+            assert!(error.contains(&format!("actual: {} bytes", limit+1)), "{error}");
+            for table in ["feed_items", "feed_item_contents", "voice_jobs"] {
+                let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                    .fetch_one(&state.db).await.unwrap();
+                assert_eq!(count, 0);
+            }
+            let status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id='oversized-reading'")
+                .fetch_one(&state.db).await.unwrap();
+            assert_eq!(status, "leased");
+        }
+    }
+
     async fn test_state() -> AppState {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -2404,6 +2522,19 @@ mod tests {
             .unwrap();
         assert_eq!(displayed, artifact["script"].as_str().unwrap());
         assert_eq!(spoken, artifact["audio_script"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn reading_capabilities_expose_storage_and_manuscript_byte_bounds() {
+        let response = capabilities(State(test_state().await), authed_headers()).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let limits = &value["artifacts"]["reading_article"]["field_limits_bytes"];
+        assert_eq!(limits["reader_markdown"], super::super::feed::MAX_BODY_LENGTH);
+        assert_eq!(limits["plain_text"], super::super::feed::MAX_BODY_LENGTH);
+        assert_eq!(limits["compressed_markdown"], MAX_TEXT_LENGTH);
+        assert_eq!(limits["audio_script"], MAX_TEXT_LENGTH);
     }
 
     #[tokio::test]

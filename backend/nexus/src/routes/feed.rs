@@ -12,7 +12,8 @@ use crate::{personalization, AppState};
 
 const MAX_TITLE_LENGTH: usize = 500;
 const MAX_URL_LENGTH: usize = 2048;
-const MAX_BODY_LENGTH: usize = 2_000_000;
+// Stored Reading bodies, not a model-context or speech budget.
+pub(super) const MAX_BODY_LENGTH: usize = 2_000_000;
 const MIN_LIMIT: i64 = 1;
 const MAX_LIMIT: i64 = 100;
 
@@ -693,17 +694,13 @@ fn validate_content(
         ("audio_script", &content.audio_script),
         ("key_points_json", &content.key_points_json),
     ] {
-        if value
-            .as_ref()
-            .is_some_and(|body| body.len() > MAX_BODY_LENGTH)
-        {
+        if let Some(body) = value.as_ref().filter(|body| body.len() > MAX_BODY_LENGTH) {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(
-                    json!({ "error": format!("{} exceeds {} characters", field, MAX_BODY_LENGTH) }),
-                ),
-            )
-                .into_response());
+                Json(json!({
+                    "error": format!("{} exceeds {} bytes (actual: {} bytes)", field, MAX_BODY_LENGTH, body.len())
+                })),
+            ).into_response());
         }
     }
 
@@ -1423,6 +1420,26 @@ pub async fn create_weekly_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reading_body_limit_reports_utf8_bytes_at_the_existing_feed_boundary() {
+        let exact = "中".repeat(MAX_BODY_LENGTH / 3) + "aa";
+        assert_eq!(exact.len(), MAX_BODY_LENGTH);
+        let content: FeedItemContentPayload = serde_json::from_value(json!({
+            "reader_markdown": exact
+        })).unwrap();
+        assert!(validate_content(&Some(content)).is_ok());
+        let content: FeedItemContentPayload = serde_json::from_value(json!({
+            "reader_markdown": "中".repeat(MAX_BODY_LENGTH / 3) + "aax"
+        })).unwrap();
+        let response = validate_content(&Some(content)).unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let error = String::from_utf8(body.to_vec()).unwrap();
+        assert!(error.contains("reader_markdown exceeds 2000000 bytes"));
+        assert!(error.contains("actual: 2000001 bytes"));
+        assert!(!error.contains("characters"));
+    }
 
     #[test]
     fn pagination_is_clamped_to_supported_range() {
