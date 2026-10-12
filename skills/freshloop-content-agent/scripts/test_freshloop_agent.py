@@ -10,7 +10,7 @@ import freshloop_agent as agent
 
 def artifact():
     return {'title':'测试','original_url':'https://example.org/article','reader_markdown':'完整原文',
-            'compressed_markdown':'中文摘要','audio_script':'这是一份有来源、有明确事实和限制的中文听稿。'*8,
+            'compressed_markdown':'中文摘要','audio_script':'科研团队公布了新的电池循环测试数据，样品在实验室完成一千次充放电。测试温度保持恒定，尚不能据此推断低温户外条件下的使用寿命，量产进度仍待确认。',
             'editorial':{'language':'zh-CN','ready':True,'dedup_checked':True,
                          'quality':dict.fromkeys(('fidelity','selection','listening','structure','media'),2),
                          'claims':[{'claim':'样品完成一千次循环','source_url':'https://example.org/article','evidence':'The sample completed 1000 cycles in controlled laboratory conditions.'},{'claim':'测试不涵盖低温户外条件','source_url':'https://example.org/article','evidence':'The tests did not include low-temperature outdoor conditions.'}],'media':[]}}
@@ -18,13 +18,42 @@ def artifact():
 
 def radio_artifact():
     data=artifact()
-    stories=[dict(event_key=f'event-{i}',tier='major',title=f'新闻{i}',script=(f'这是第{i}项独立新闻。已经核对原始报道，保留事实范围和限制。'*4),source_urls=[f'https://example.org/{i}']) for i in range(3)]
+    stories=[dict(event_key=f'event-{i}',tier='major',title=f'新闻{i}',script=['科研团队公布了新的电池循环测试数据，样品在实验室完成一千次充放电。测试温度保持恒定，尚不能据此推断低温户外条件下的使用寿命，量产进度仍待确认。', '软件维护者修复了一处权限校验漏洞，并发布升级说明。受影响的是开启远程管理的旧版本，管理员需要检查配置，官方尚未披露利用规模。', '当地交通部门宣布下周试行公交新线路，连接火车站与科技园。试运营持续一个月，票价与现有线路相同，后续将根据乘客反馈调整班次。'][i],source_urls=[f'https://example.org/{i}']) for i in range(3)]
     data.update(category='Tech',stories=stories,script='\n'.join(x['script'] for x in stories))
     data['audio_script']=data['script']
     data['sources']=[dict(url=x['source_urls'][0],title=x['title'],summary='来源证据') for x in stories]
     data['editorial']['claims']=[dict(claim=f'{x["event_key"]}事实{j}',source_url=x['source_urls'][0],evidence=f'Test source passage supports event {i}, fact {j}.') for i,x in enumerate(stories) for j in range(2)]
     data['editorial']['radio_coverage'] = dict(reviewed=True, eligible_event_keys=[x['event_key'] for x in stories])
     return data
+
+
+def reviewed_file(path, data):
+    # Synthetic comparison fixture for transport tests; no claim of semantic QA.
+    import hashlib
+    from html import escape
+    from review_comparison import prepare_inputs, read, units, DIMENSIONS
+    root=Path(path).parent
+    draft=root/'review-artifact.json'; agent.save(draft,data)
+    wanted={url for unit in units(data) for url in unit['source_urls']}
+    files=[]
+    for url in sorted(wanted):
+        ident=hashlib.sha256(url.encode()).hexdigest()
+        body='\n'.join(unit['text'] for unit in units(data) if url in unit['source_urls'])
+        source=root/(ident+'.json')
+        agent.save(source,dict(id=ident,entry=dict(link=url),original_html='<article><p>'+escape(body)+'</p></article>',fetch_error=None))
+        files.append(str(source))
+    packet_path=root/'review-inputs.json'
+    prepared=prepare_inputs(draft,files,packet_path); packet=read(packet_path)
+    comparisons=[]
+    for unit in packet['units']:
+        source=next(s for s in packet['sources'] if s['url'] in unit['source_urls'])
+        excerpt=unit['text'][:50]
+        comparisons.append(dict(unit=unit['unit'],source_ids=[s['source_id'] for s in packet['sources'] if s['url'] in unit['source_urls']],
+            checked_dimensions=sorted(DIMENSIONS),conclusion='pass',differences=[],assessment='Synthetic source/transport fixture',
+            evidence=[dict(source_id=source['source_id'],source_excerpt=excerpt,draft_excerpt=excerpt,observation='Exact fixture excerpt matches')]))
+    agent.save(path, dict(artifact_sha256=agent.artifact_digest(data),input_file=prepared['input_file'],input_sha256=prepared['input_sha256'],
+        mode='native_subagents', reviews=[dict(role=r,blocking=[],checked_artifacts=['draft.json'],summary='测试审稿输入结构',comparisons=comparisons) for r in ('facts','listening')]))
+    return str(path)
 
 
 class AgentContractTests(unittest.TestCase):
@@ -85,6 +114,27 @@ class AgentContractTests(unittest.TestCase):
         data['sections'][0]['stories']=[]
         self.assertTrue(agent.validate(data, 'radio_program'))
 
+    def test_repeated_passages_and_exact_story_occurrences(self):
+        data=radio_artifact()
+        # Today's bug: retain original section, then append all stories again.
+        data['script'] += '\n' + data['stories'][0]['script']
+        self.assertTrue(agent.validate(data, 'radio_episode'))
+        text='数字部门宣布下周试行公交新线路，连接火车站与科技园。'
+        self.assertTrue(agent.validate_narration(text * 3))
+        self.assertEqual(agent.validate_narration(text), [])
+        self.assertTrue(agent.validate_narration('这是重要新闻，影响深远且意义重大。'))
+
+    def test_review_invalidated_by_post_review_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data=radio_artifact(); path=reviewed_file(Path(directory)/'review.json', data)
+            agent.require_final_review(data, path)
+            data['script'] += '新增了一条消息。'
+            with self.assertRaisesRegex(ValueError, 'stale'): agent.require_final_review(data, path)
+            with self.assertRaisesRegex(ValueError, 'requires'): agent.require_final_review(data, None)
+            path=reviewed_file(Path(directory)/'review.json', data)
+            review=agent.read(path); review['reviews'][0]['blocking']=['未核实']; agent.save(path, review)
+            with self.assertRaisesRegex(ValueError, 'blocking'): agent.require_final_review(data, path)
+
     def test_state_is_private_and_atomic(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'state.json'
@@ -120,7 +170,7 @@ class AgentContractTests(unittest.TestCase):
             state_path=Path(directory)/'state.json'; draft=Path(directory)/'draft.json'
             agent.save(state_path,{'job_id':'j','job_type':'reading_article','lease_token':'t'})
             agent.save(draft,artifact())
-            args=argparse.Namespace(command='submit',state=str(state_path),artifact=str(draft))
+            args=argparse.Namespace(command='submit',state=str(state_path),artifact=str(draft),review_file=reviewed_file(Path(directory)/'review.json', artifact()))
             class Fake:
                 def call(self,*args,**kwargs): raise RuntimeError('unknown outcome')
             with patch.object(agent,'nexus',return_value=Fake()):
@@ -134,7 +184,7 @@ class AgentContractTests(unittest.TestCase):
             state_path=Path(directory)/'state.json'; draft=Path(directory)/'draft.json'
             agent.save(state_path,{'job_id':'j','job_type':'reading_article','lease_token':'t'})
             agent.save(draft,artifact())
-            args=argparse.Namespace(command='submit',state=str(state_path),artifact=str(draft))
+            args=argparse.Namespace(command='submit',state=str(state_path),artifact=str(draft),review_file=reviewed_file(Path(directory)/'review.json', artifact()))
             class Fake:
                 def call(self,*args,**kwargs): raise agent.ApiError(400,'invalid draft')
             with patch.object(agent,'nexus',return_value=Fake()):
@@ -143,6 +193,10 @@ class AgentContractTests(unittest.TestCase):
 
     def test_transport_rejects_plaintext_remote_credentials(self):
         with self.assertRaises(ValueError): agent.Api('http://remote.example','key','X-NEXUS-KEY')
+
+
+
+
 
 
 if __name__=='__main__': unittest.main()

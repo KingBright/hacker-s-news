@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from editorial_evidence import validate_evidence
 from source_pagination import collect_sources
 from article_view import article_view
+from review_comparison import EditorialError, prepare_inputs, verify_comparison, record_issue, approved, source_recovered, source_input, submission_reconciled
 
 JOB_TYPES = ('radio_program', 'radio_episode', 'reading_article', 'weekly_digest', 'loop_preference_extraction')
 
@@ -83,6 +84,53 @@ def job_path(state, suffix):
     return '/api/internal/agent/jobs/' + urllib.parse.quote(state['job_id'], safe='') + '/' + suffix
 
 
+def artifact_digest(artifact):
+    return hashlib.sha256(json.dumps(artifact, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def require_final_review(artifact, path):
+    if not path:
+        raise ValueError('submit requires --review-file for the final artifact; review after all edits')
+    review = read(path)
+    if review.get('artifact_sha256') != artifact_digest(artifact):
+        raise ValueError('review is stale: final artifact changed; rerun reviews before submitting')
+    mode = review.get('mode')
+    if mode not in ('native_subagents', 'self_review'):
+        raise ValueError('review mode must describe actual review execution')
+    if mode == 'self_review' and not review.get('unavailable_reason'):
+        raise ValueError('self review must disclose why independent reviewers were unavailable')
+    rows = review.get('reviews', [])
+    if not isinstance(rows, list) or {r.get('role') for r in rows if isinstance(r, dict)} != {'facts', 'listening'}:
+        raise ValueError('final facts and listening reviews are required')
+    for row in rows:
+        if not isinstance(row, dict) or row.get('blocking') != [] or not row.get('checked_artifacts') or not row.get('summary'):
+            if isinstance(row, dict) and row.get('comparisons'):
+                verify_comparison(artifact, review, path)
+            raise ValueError('final review incomplete or contains unresolved blocking findings')
+    verify_comparison(artifact, review, path)
+
+
+def validate_narration(text):
+    """Reject repeated substantial passages, independent of punctuation/spacing."""
+    sentences = set()
+    for sentence in re.split(r'[。！？!?；;\n]', text):
+        normalized = ''.join(c.lower() for c in sentence if c.isalnum())
+        if len(normalized) >= 20:
+            if normalized in sentences:
+                return ['manuscript repeats a sentence; include each news item once']
+            sentences.add(normalized)
+    compact = ''.join(c.lower() for c in text if c.isalnum())
+    seen = {}
+    for i in range(max(0, len(compact) - 39)):
+        block = compact[i:i + 40]
+        if block in seen and i - seen[block] >= 40:
+            return ['manuscript repeats a substantial passage; rewrite from evidence, never pad length']
+        seen.setdefault(block, i)
+    if '影响深远且意义重大' in compact:
+        return ['manuscript contains generic padding; replace with sourced facts or use a brief']
+    return []
+
+
 def validate_radio_digest(artifact):
     """Structural guard; semantic event independence remains the editor's duty."""
     stories = artifact.get('stories')
@@ -97,7 +145,8 @@ def validate_radio_digest(artifact):
     compact = lambda text: ''.join(text.split()) if isinstance(text, str) else ''
     manuscript = compact(artifact.get('script'))
     spoken = compact(artifact.get('audio_script', artifact.get('script')))
-    errors, keys, titles, bodies = [], set(), set(), set()
+    errors = validate_narration(manuscript) + validate_narration(spoken)
+    keys, titles, bodies = set(), set(), set()
     for story in stories:
         if not isinstance(story, dict):
             errors.append('each Radio story must be an object'); continue
@@ -107,11 +156,11 @@ def validate_radio_digest(artifact):
             errors.append('Radio stories require distinct event_key, title and body')
         keys.add(key.casefold()); titles.add(title.casefold()); bodies.add(body)
         tier = story.get('tier')
-        minimum = 10 if tier == 'brief' else 60
+        minimum = 10  # Importance is an editorial choice, not a word quota.
         if tier not in ('major', 'brief'):
             errors.append('Radio story tier must be major or brief')
-        if len(body) < minimum or len(spoken_body) < minimum or body not in manuscript or spoken_body not in spoken:
-            errors.append('each Radio story must meet its tier length and appear in displayed and spoken manuscripts')
+        if len(body) < minimum or len(spoken_body) < minimum or manuscript.count(body) != 1 or spoken.count(spoken_body) != 1:
+            errors.append('each Radio story must contain at least 10 characters and appear exactly once in displayed and spoken manuscripts; never duplicate or pad')
         refs = story.get('source_urls', [])
         if not isinstance(refs, list) or not refs or any(not valid_url(url) for url in refs):
             errors.append('each Radio story needs source_urls'); continue
@@ -130,6 +179,7 @@ def validate_radio_digest(artifact):
 
 
 def validate(artifact, job_type):
+    if not isinstance(artifact,dict): return ['artifact must be a JSON object']
     errors = validate_evidence(artifact, job_type)
     if job_type == 'radio_program':
         for field, maximum in (('title', 160), ('opening', 400), ('closing', 200)):
@@ -149,6 +199,9 @@ def validate(artifact, job_type):
             else:
                 categories.add(category)
             errors.extend(validate(section, 'radio_episode'))
+        for field in ('script', 'audio_script'):
+            text = '\n'.join(str(section.get(field, section.get('script', ''))) for section in sections if isinstance(section, dict))
+            errors.extend(validate_narration(text))
         return errors
 
     required = {
@@ -167,6 +220,7 @@ def validate(artifact, job_type):
     spoken = artifact.get('audio_script', artifact.get('script', ''))
     if not isinstance(spoken, str):
         return errors + ['spoken manuscript must be text']
+    errors.extend(validate_narration(spoken))
     chars = sum(not char.isspace() for char in spoken)
     han = sum('\u4e00' <= char <= '\u9fff' for char in spoken)
     if chars < (10 if job_type == 'radio_episode' else 60) or han * 5 < chars:
@@ -288,22 +342,74 @@ def main():
     p.add_argument('--date', default=datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()); p.add_argument('--state', required=True)
     for command in ('heartbeat', 'status', 'submit', 'fail'):
         p = sub.add_parser(command); p.add_argument('--state', required=True)
-        if command == 'submit': p.add_argument('--artifact', required=True)
+        if command == 'submit':
+            p.add_argument('--artifact', required=True); p.add_argument('--review-file')
         if command == 'fail': p.add_argument('--error', required=True)
-    p = sub.add_parser('validate'); p.add_argument('--job-type', choices=JOB_TYPES, required=True); p.add_argument('--artifact', required=True)
+    p = sub.add_parser('validate'); p.add_argument('--job-type', choices=JOB_TYPES, required=True); p.add_argument('--artifact', required=True); p.add_argument('--state')
+    p = sub.add_parser('review-inputs'); p.add_argument('--artifact', required=True); p.add_argument('--sources', nargs='+', required=True); p.add_argument('--out', required=True)
+    p = sub.add_parser('review-check'); p.add_argument('--artifact', required=True); p.add_argument('--review-file', required=True); p.add_argument('--state')
     p = sub.add_parser('sources'); p.add_argument('--product-line', choices=('radio','reading')); p.add_argument('--offset', type=int, default=0); p.add_argument('--out', required=True)
+    p.add_argument('--all', action='store_true', help='collect every metadata page, bounded by deadline and page count')
+    p.add_argument('--since', type=int, default=0, help='cache first-seen Unix time, not original publication date')
     p = sub.add_parser('source'); p.add_argument('--id', required=True); p.add_argument('--out', required=True)
     p = sub.add_parser('media'); p.add_argument('--id', required=True); p.add_argument('--index', type=int, required=True); p.add_argument('--out', required=True)
     p = sub.add_parser('refresh'); p.add_argument('--out', required=True)
+    p = sub.add_parser('finalize-run'); p.add_argument('--manifest',required=True); p.add_argument('--out',required=True); p.add_argument('--report',required=True); p.add_argument('--wait-seconds',type=int,default=5400)
     args = parser.parse_args()
     with checkpoint_lock(getattr(args,"state",None)):
         return dispatch(args)
 
 
 def dispatch(args):
+    try:
+        return dispatch_unchecked(args)
+    except Exception as exc:
+        try:
+            event = record_issue(args, exc)
+            if event: print(json.dumps(event, ensure_ascii=False), file=sys.stderr)
+        except Exception as logging_error:
+            print(json.dumps({'editorial_error': type(exc).__name__, 'issue_record_failed': type(logging_error).__name__, 'stage': args.command}), file=sys.stderr)
+        raise
+
+
+def dispatch_unchecked(args):
+    if args.command == 'finalize-run':
+        from delivery import finalize
+        return finalize(args,nexus(),Api(os.environ['NEXUS_URL'],'','X-NEXUS-KEY'),save)
     if args.command == 'begin': return begin(args)
+    if args.command == 'review-check':
+        state=read(args.state) if getattr(args,'state',None) else {}
+        if 'agent-runs' in Path(args.artifact).resolve().parts and not state:
+            raise EditorialError('review_state_missing','Production review-check requires the existing --state so rejected revisions remain bounded','review')
+        if state.get('editorial_status') == 'failed' and not state.get('pending_hash'):
+            raise EditorialError('revision_limit_reached','Three rejected drafts exhausted the editorial budget; stop and fail the existing job','review')
+        artifact=read(args.artifact)
+        if state.get('pending_hash') and state['pending_hash'] != artifact_digest(artifact):
+            raise EditorialError('pending_submission_changed','Pending submission differs; reconcile the original outcome before reviewing another draft','submit')
+        kind=state.get('job_type') or ('radio_program' if 'sections' in artifact else 'radio_episode' if 'stories' in artifact else 'reading_article' if 'compressed_markdown' in artifact else 'weekly_digest')
+        errors=validate(artifact,kind)
+        if errors: raise EditorialError('invalid_manuscript','; '.join(errors),'validation')
+        try:
+            require_final_review(artifact,args.review_file)
+        except EditorialError:
+            raise
+        except (ValueError,OSError,KeyError) as exc:
+            raise EditorialError('review_invalid',str(exc),'review') from None
+        approved(artifact,args.review_file,state)
+        print(json.dumps({'review_record_valid':True,'semantic_truth_verified_by_program':False})); return
+    if args.command == 'review-inputs':
+        result=prepare_inputs(args.artifact,args.sources,args.out)
+        print(json.dumps(result,ensure_ascii=False)); return
     if args.command == 'validate':
+        state=read(args.state) if getattr(args,'state',None) else {}
+        if 'agent-runs' in Path(args.artifact).resolve().parts and not state:
+            raise EditorialError('review_state_missing','Production validation requires the existing --state to bound draft revisions','validation')
+        if state.get('editorial_status') == 'failed' and not state.get('pending_hash'):
+            raise EditorialError('revision_limit_reached','Three rejected drafts exhausted the editorial budget; stop and fail the existing job','validation')
         errors=validate(read(args.artifact),args.job_type)
+        if errors:
+            event=record_issue(args,EditorialError('invalid_manuscript','; '.join(errors),'validation'))
+            if event: print(json.dumps(event,ensure_ascii=False),file=sys.stderr)
         print(json.dumps({'valid': not errors,'errors':errors}, ensure_ascii=False)); return bool(errors)
     if args.command in ('sources', 'source', 'refresh', 'media'):
         api=Api(os.environ.get('CORTEX_URL','http://127.0.0.1:3721'),os.environ.get('CORTEX_API_KEY',''),'X-CORTEX-KEY')
@@ -325,21 +431,37 @@ def dispatch(args):
             result=api.call('/api/agent/sources/'+urllib.parse.quote(args.id,safe='')+'/fetch',{})
             result['article_view']=article_view(result)
         else: result=api.call('/api/agent/sources/refresh',{},retry=False)
-        save(args.out,result); print(json.dumps({'saved':args.out})); return
+        save(args.out,result)
+        if args.command == 'source':
+            source_input(args.out)  # empty/failed original remains saved, but cannot exit as success
+            source_recovered(args,result)
+        print(json.dumps({'saved':args.out})); return
     state=read(args.state); api=nexus()
     if args.command == 'status':
         job=api.call(job_path(state,'context'))['job']
+        if job.get('status') == 'completed':
+            submission_reconciled(dict(state,status='completed',result_ref=job.get('result_ref')),args.state)
         print(json.dumps({k:job.get(k) for k in ('id','status','result_ref','last_error')})); return
     if 'lease_token' not in state: raise ValueError('no owned lease in checkpoint')
     body={'lease_token':state['lease_token']}
     if args.command == 'heartbeat': body['lease_seconds']=1800
     if args.command == 'fail': body['error']=args.error
     if args.command == 'submit':
+        if state.get('editorial_status') == 'failed' and not state.get('pending_hash'):
+            raise EditorialError('revision_limit_reached','Three distinct rejected drafts exhausted the editorial budget; stop and fail the existing job, never create a new ID','review')
         artifact=read(args.artifact); errors=validate(artifact,state['job_type'])
-        if errors: raise ValueError('; '.join(errors))
-        digest=hashlib.sha256(json.dumps(artifact,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+        if errors: raise EditorialError('invalid_manuscript','; '.join(errors),'validation')
+        digest=artifact_digest(artifact)
         if state.get('pending_hash') and state['pending_hash'] != digest:
             raise ValueError('pending submission differs; reconcile status before changing artifact')
+        if state['job_type'] != 'loop_preference_extraction':
+            try:
+                require_final_review(artifact, getattr(args, 'review_file', None))
+            except EditorialError:
+                raise
+            except (ValueError, OSError, KeyError) as exc:
+                raise EditorialError('review_invalid',str(exc),'review') from None
+            approved(artifact,args.review_file,state)
         state['pending_hash']=digest; save(args.state,state); body['artifact']=artifact
     try:
         result=api.call(job_path(state,args.command),body)
@@ -348,10 +470,10 @@ def dispatch(args):
             state.pop('pending_hash',None); save(args.state,state)
         raise
     if args.command == 'heartbeat': state['lease_expires_at']=result['lease_expires_at']
-    if args.command == 'submit': state.update(status='completed',result_ref=result.get('result_ref'),voice_job_ids=result.get('voice_job_ids',[]))
+    if args.command == 'submit':
+        state.update(status='completed',result_ref=result.get('result_ref'),voice_job_ids=result.get('voice_job_ids',[]))
+        submission_reconciled(state,args.state)
     if args.command == 'fail': state['status']='failed'
-    p.add_argument('--all', action='store_true', help='collect every metadata page, bounded by deadline and page count')
-    p.add_argument('--since', type=int, default=0, help='cache first-seen Unix time, not original publication date')
     save(args.state,state)
     print(json.dumps(result,ensure_ascii=False))
 
