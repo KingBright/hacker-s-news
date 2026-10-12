@@ -1,6 +1,7 @@
 """Mechanical article view for cached HTML; never invents or summarizes content."""
 from html.parser import HTMLParser
 import re
+from urllib.parse import urlparse
 
 BLOCKED = {'script', 'style', 'nav', 'header', 'footer', 'aside', 'noscript', 'template', 'svg', 'form', 'button'}
 VOID = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
@@ -8,8 +9,9 @@ BREAKS = {'p', 'div', 'section', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'tr',
 
 
 class ArticleParser(HTMLParser):
-    def __init__(self):
+    def __init__(self, prefer_article_sections=False):
         super().__init__(convert_charrefs=True)
+        self.prefer_article_sections = prefer_article_sections
         self.stack, self.active, self.candidates = [], [], []
 
     def append(self, text):
@@ -20,9 +22,12 @@ class ArticleParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attributes = dict(attrs)
         classes = attributes.get('class', '').split()
-        rank = 4 if 'blog_post' in classes else 3 if tag in {'article', 'dt-article'} else 2 if tag == 'main' else 1 if tag == 'body' else 0
+        post_body = 'post-body' in classes and 'entry-content' in classes
+        article_section = self.prefer_article_sections and tag == 'section' and self.stack and self.stack[-1] == 'article'
+        rank = 4 if 'blog_post' in classes or post_body or article_section else 3 if tag in {'article', 'dt-article'} else 2 if tag == 'main' else 1 if tag == 'body' else 0
+        root = 'post-body' if post_body else 'article-section' if article_section else 'blog_post' if rank == 4 else tag
         if rank and not any(t in BLOCKED for t in self.stack):
-            self.active.append({'rank': rank, 'root': 'blog_post' if rank == 4 else tag, 'depth': len(self.stack) + 1, 'parts': []})
+            self.active.append({'rank': rank, 'root': root, 'depth': len(self.stack) + 1, 'parts': []})
         if tag in BREAKS:
             self.append('\n')
         elif tag in {'td', 'th'}:
@@ -49,7 +54,12 @@ def article_view(record):
     raw = record.get('original_html')
     if not isinstance(raw, str) or not raw.strip():
         return {'available': False, 'reason': 'no cached HTML; verify feed excerpt separately'}
-    parser = ArticleParser()
+    entry = record.get('entry') or {}
+    link = entry.get('link', '') if isinstance(entry, dict) else ''
+    # Verified Gatsby feed template: the article's direct section contains the
+    # complete post and footnotes; recommendations are later article siblings.
+    prefer_sections = isinstance(link, str) and urlparse(link).hostname == 'seangoedecke.com'
+    parser = ArticleParser(prefer_article_sections=prefer_sections)
     parser.feed(raw); parser.close()
     candidates = parser.candidates + parser.active
     candidates = [c for c in candidates if ''.join(c['parts']).strip()]
@@ -60,7 +70,9 @@ def article_view(record):
     # Some landing pages use article for individual feature cards. Preserve
     # the whole main/body rather than dropping installation limits and dates.
     if len(selected) > 1:
-        enclosing = [c for c in candidates if c['root'] in {'main', 'body'}]
+        articles = [c for c in candidates if c['root'] == 'article']
+        roots = {'article'} if all(c['root'] == 'article-section' for c in selected) and len(articles) == 1 else {'main', 'body'}
+        enclosing = [c for c in candidates if c['root'] in roots]
         if enclosing:
             outer_rank = max(c['rank'] for c in enclosing)
             selected = [c for c in enclosing if c['rank'] == outer_rank]
