@@ -264,11 +264,32 @@ ensure_nexus_key() {
     echo ">>> Nexus key source: $key_source ($NEXUS_KEY_FILE)"
 }
 
+
+deploy_verified_nexus() {
+    local info candidate release_id candidate_sha remote_command
+    info="$(python3 -B "$SCRIPT_DIR/prepare_nexus_release.py" check --evidence "$VERIFIED_NEXUS_RELEASE")" || return 1
+    IFS=$'\t' read -r candidate release_id candidate_sha <<< "$info"
+    [[ "$APP_DIR" =~ ^/[a-zA-Z0-9_./-]+$ && "$APP_DIR" != *"/../"* ]] || {
+        echo "Unsupported app directory for verified deployment" >&2; return 1;
+    }
+    [[ "$EXPECTED_LIVE_NEXUS_SHA" =~ ^[a-f0-9]{64}$ ]] || {
+        echo "--expected-live-sha must bind the reviewed running Nexus binary" >&2; return 1;
+    }
+    # One SSH operation; never replay an uncertain restart. The remote script
+    # retains the old binary and verifies both the running hash and GET health.
+    remote_command="set -eu; task_temp=\$(mktemp -d '$APP_DIR/.nexus-upload.XXXXXX'); trap 'rm -rf \"\$task_temp\"' EXIT; tar -xf - -C \"\$task_temp\"; bash \"\$task_temp/nexus_binary_release.sh\" '$APP_DIR' '$release_id' '$candidate_sha' '$EXPECTED_LIVE_NEXUS_SHA' \"\$task_temp/nexus\""
+    COPYFILE_DISABLE=1 tar --disable-copyfile --no-xattrs -cf - \
+        -C "$(dirname "$candidate")" nexus -C "$SCRIPT_DIR" nexus_binary_release.sh |
+        ssh_remote "$remote_command"
+}
+
 # Argument Parsing
 DEPLOY_FRONTEND=false
 DEPLOY_NEXUS=false
 DEPLOY_ANDROID=false
 BUMP_TYPE=""
+VERIFIED_NEXUS_RELEASE=""
+EXPECTED_LIVE_NEXUS_SHA=""
 
 usage() {
     echo "Usage: $0 [options]"
@@ -276,6 +297,8 @@ usage() {
     echo "  -f, --frontend   Deploy Frontend only"
     echo "  -b, --nexus      Deploy Nexus Service (Backend) only"
     echo "  -a, --android    Release Android through the verified 8443 publish contract"
+    echo "  --verified-release <json>  Deploy a tested prebuilt Nexus only; retain rollback"
+    echo "  --expected-live-sha <sha>  Require the reviewed running backend baseline"
     echo "  --bump <type>    Version bump when public/local builds match (default: patch)"
     echo "  -h, --help       Show this help message"
     echo ""
@@ -305,6 +328,16 @@ else
             DEPLOY_ANDROID=true
             shift
             ;;
+            --verified-release)
+            [ "$#" -ge 2 ] || usage
+            VERIFIED_NEXUS_RELEASE=$2
+            shift 2
+            ;;
+            --expected-live-sha)
+            [ "$#" -ge 2 ] || usage
+            EXPECTED_LIVE_NEXUS_SHA=$2
+            shift 2
+            ;;
             --bump)
             if [ "$#" -lt 2 ]; then
                 echo "Missing bump type after --bump"
@@ -322,6 +355,17 @@ else
             ;;
         esac
     done
+fi
+
+if [ -n "$VERIFIED_NEXUS_RELEASE" ]; then
+    [ "$DEPLOY_NEXUS" = true ] && [ "$DEPLOY_FRONTEND" = false ] && [ "$DEPLOY_ANDROID" = false ] && [ -z "$BUMP_TYPE" ] || {
+        echo "Verified release requires only --nexus" >&2; exit 1;
+    }
+    deploy_verified_nexus
+    exit 0
+fi
+if [ -n "$EXPECTED_LIVE_NEXUS_SHA" ]; then
+    echo "--expected-live-sha requires --verified-release" >&2; exit 1
 fi
 
 if [ -n "$BUMP_TYPE" ] && [ "$DEPLOY_ANDROID" != true ]; then

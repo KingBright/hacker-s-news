@@ -1,0 +1,62 @@
+{
+  "qwen3-tts-rs": {
+    "commit": "711ceee07cad92673f86de8997bdf54c30caa49f",
+    "manifest_sha256": "abbdaf867eeb322f959997fe727c3556e7ab8e88b876530bb52af6255dae467d",
+    "replacements": [
+      [
+        "candle-core = \"0.9\"",
+        "candle-core = \"0.10\""
+      ],
+      [
+        "candle-nn = \"0.9\"",
+        "candle-nn = \"0.10\""
+      ],
+      [
+        "candle-transformers = \"0.9\"",
+        "candle-transformers = \"0.10\""
+      ],
+      [
+        "rubato = \"1.0\"",
+        "rubato = \"2.0\""
+      ],
+      [
+        "audioadapter-buffers = \"2.0.0\"",
+        "audioadapter-buffers = \"3.0.0\""
+      ],
+      [
+        "hf-hub = { version = \"0.4\",",
+        "hf-hub = { version = \"0.5\","
+      ],
+      [
+        "# Tokenization (HuggingFace tokenizers in Rust)",
+        "memmap2 = \"0.9\"\n\n# Tokenization (HuggingFace tokenizers in Rust)"
+      ]
+    ]
+  },
+  "aha": {
+    "commit": "527fd359f8248c1dfe8133d39879100ee22bdfd8",
+    "manifest_sha256": "6e910e0c850e8d14e7cdd16584b6ffca68739ac3eba6ae168f12fd63e7e6b951",
+    "replacements": [
+      [
+        "candle-core = { version = \"0.9.2\" }",
+        "candle-core = { version = \"0.10.2\" }"
+      ],
+      [
+        "candle-nn = { version = \"0.9.2\" }",
+        "candle-nn = { version = \"0.10.2\" }"
+      ],
+      [
+        "candle-transformers = { version = \"0.9.2\" }",
+        "candle-transformers = { version = \"0.10.2\" }"
+      ],
+      [
+        "sysinfo = \"0.33\"",
+        "sysinfo = \"0.38\""
+      ],
+      [
+        "zip = \"7.2.0\"",
+        "zip = \"8.5.1\""
+      ]
+    ]
+  }
+}
