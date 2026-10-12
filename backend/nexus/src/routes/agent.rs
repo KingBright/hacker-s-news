@@ -674,6 +674,29 @@ pub async fn heartbeat_agent_job(
     }
 }
 
+fn validate_narration(text: &str) -> Result<(), String> {
+    let mut sentences = std::collections::HashSet::new();
+    for sentence in text.split(['。', '！', '？', '!', '?', '；', ';', '\n']) {
+        let normalized: String = sentence.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect();
+        if normalized.chars().count() >= 20 && !sentences.insert(normalized) {
+            return Err("manuscript repeats a sentence; include each news item once".into());
+        }
+    }
+    let chars: Vec<char> = text.chars().filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase).collect();
+    let mut seen = HashMap::new();
+    for (i, block) in chars.windows(40).enumerate() {
+        let first = seen.entry(block).or_insert(i);
+        if i - *first >= 40 {
+            return Err("manuscript repeats a substantial passage; rewrite from evidence, never pad length".into());
+        }
+    }
+    if chars.iter().collect::<String>().contains("影响深远且意义重大") {
+        return Err("manuscript contains generic padding; replace with sourced facts or use a brief".into());
+    }
+    Ok(())
+}
+
 fn validate_radio_digest(artifact: &Value) -> Result<(), String> {
     use std::collections::HashSet;
     fn compact(s: &str) -> String {
@@ -705,6 +728,8 @@ fn validate_radio_digest(artifact: &Value) -> Result<(), String> {
             .as_str()
             .unwrap_or(artifact["script"].as_str().unwrap_or("")),
     );
+    validate_narration(&manuscript)?;
+    validate_narration(&spoken)?;
     let (mut keys, mut titles, mut bodies) = (HashSet::new(), HashSet::new(), HashSet::new());
     for story in stories {
         let key = compact(story["event_key"].as_str().unwrap_or("")).to_lowercase();
@@ -724,16 +749,15 @@ fn validate_radio_digest(artifact: &Value) -> Result<(), String> {
             return Err("Radio stories require distinct event_key, title and body".into());
         }
         let minimum = match story["tier"].as_str() {
-            Some("major") => 60,
-            Some("brief") => 10,
+            Some("major" | "brief") => 10,
             _ => return Err("Radio story tier must be major or brief".into()),
         };
         if body.chars().count() < minimum
             || audio.chars().count() < minimum
-            || !manuscript.contains(&body)
-            || !spoken.contains(&audio)
+            || manuscript.matches(&body).count() != 1
+            || spoken.matches(&audio).count() != 1
         {
-            return Err("each Radio story must meet its tier length and appear in displayed and spoken manuscripts".into());
+            return Err("each Radio story must contain at least 10 characters and appear exactly once in displayed and spoken manuscripts; never duplicate or pad".into());
         }
         let refs = story["source_urls"]
             .as_array()
@@ -806,6 +830,7 @@ fn validate_external_artifact(job: &AgentJob, artifact: &Value) -> Result<(), St
         }]
         .as_str()
         .unwrap_or("");
+    validate_narration(spoken)?;
     let chars = spoken.chars().filter(|c| !c.is_whitespace()).count();
     let chinese = spoken
         .chars()
@@ -1026,6 +1051,34 @@ pub async fn fail_agent_job(
         }
         Ok(_) => StatusCode::CONFLICT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RepairRadioProgramRequest {
+    pub expected_voice_job_id: String,
+    pub artifact: Value,
+}
+
+/// Maintenance repair of an existing edition, never a new content item/slot.
+pub async fn repair_radio_program(
+    State(state): State<AppState>, headers: HeaderMap, Path(id): Path<String>,
+    Json(payload): Json<RepairRadioProgramRequest>,
+) -> axum::response::Response {
+    if !has_internal_auth(&headers, &state) { return unauthorized(); }
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let result = radio_program::repair(&mut tx, &id, &payload).await;
+    match result {
+        Ok(result) => {
+            if let Err(e) = tx.commit().await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+            Json(SubmitAgentJobResponse { job_id: id, status: "completed".into(), result_ref: result.result_ref, voice_job_ids: result.voice_job_ids }).into_response()
+        }
+        Err(e) => { let _ = tx.rollback().await; bad_request(e) }
     }
 }
 
@@ -3240,7 +3293,7 @@ mod tests {
         assert_eq!(count, 0);
     }
     fn digest_fixture() -> Value {
-        let stories: Vec<Value> = (0..3).map(|i| json!({"event_key":format!("event-{i}"),"tier":"major","title":format!("新闻{i}"),"script":format!("这是第{i}项独立新闻。已经核对原始报道，保留事实范围和限制。").repeat(4),"source_urls":[format!("https://example.org/{i}")]})).collect();
+        let stories: Vec<Value> = (0..3).map(|i| json!({"event_key":format!("event-{i}"),"tier":"major","title":format!("新闻{i}"),"script":(["科研团队公布了新的电池循环测试数据，样品在实验室完成一千次充放电。测试温度保持恒定，尚不能据此推断低温户外条件下的使用寿命，量产进度仍待确认。","软件维护者修复了一处权限校验漏洞，并发布升级说明。受影响的是开启远程管理的旧版本，管理员需要检查配置，官方尚未披露利用规模。","当地交通部门宣布下周试行公交新线路，连接火车站与科技园。试运营持续一个月，票价与现有线路相同，后续将根据乘客反馈调整班次。"][i]),"source_urls":[format!("https://example.org/{i}")]})).collect();
         let script = stories
             .iter()
             .map(|v| v["script"].as_str().unwrap())
@@ -3252,6 +3305,23 @@ mod tests {
             .collect();
         let claims: Vec<Value> = stories.iter().map(|v| json!({"source_url":v["source_urls"][0],"claim":v["title"],"evidence":"原文引文"})).collect();
         json!({"title":"三项新闻汇总","category":"Tech","script":script,"stories":stories,"sources":sources,"editorial":{"ready":true,"dedup_checked":true,"language":"zh-CN","claims":claims,"radio_coverage":{"reviewed":true,"eligible_event_keys":["event-0","event-1","event-2"]}}})
+    }
+
+    #[test]
+    fn duplicate_manuscripts_are_rejected_without_word_quota() {
+        let text = "当地交通部门宣布下周试行公交新线路，连接火车站与科技园。";
+        assert!(validate_narration(&text.repeat(3)).is_err());
+        assert!(validate_narration(text).is_ok());
+        assert!(validate_narration("这是一个新闻事件，影响深远且意义重大。").is_err());
+        let mut v = digest_fixture();
+        v["script"] = json!(format!("{}\n{}", v["script"].as_str().unwrap(), v["stories"][0]["script"].as_str().unwrap()));
+        assert!(validate_radio_digest(&v).is_err());
+        let mut v = digest_fixture();
+        let text = "运营方宣布明天恢复铁路运行，具体班次以车站公告为准。";
+        v["stories"] = json!([{"event_key":"rail","title":"铁路恢复","tier":"major","script":text,"source_urls":["https://example.org/0"]}]);
+        v["script"] = json!(text);
+        v["editorial"]["radio_coverage"]["eligible_event_keys"] = json!(["rail"]);
+        assert!(validate_radio_digest(&v).is_ok());
     }
 
     #[test]
@@ -3424,5 +3494,31 @@ mod tests {
         let source_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_sources")
             .fetch_one(&state.db).await.unwrap();
         assert!(source_count > 0, "program citations must remain available");
+        let old_id: String = sqlx::query_scalar("SELECT id FROM voice_jobs").fetch_one(&state.db).await.unwrap();
+        sqlx::query("UPDATE voice_jobs SET status='completed',audio_url='/audio/old.mp3'").execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE items SET audio_url='/audio/old.mp3'").execute(&state.db).await.unwrap();
+        let mut fixed = artifact.clone();
+        fixed["opening"] = json!("这是修正后的早间新闻，欢迎收听。");
+        let mut bad = fixed.clone();
+        bad["sections"][0]["script"] = json!(format!("{} {}",bad["sections"][0]["script"].as_str().unwrap(),bad["sections"][0]["script"].as_str().unwrap()));
+        for (headers, expected, draft, status) in [
+            (HeaderMap::new(), old_id.clone(), fixed.clone(), StatusCode::UNAUTHORIZED),
+            (authed_headers(), "wrong".into(), fixed.clone(), StatusCode::BAD_REQUEST),
+            (authed_headers(), old_id.clone(), bad, StatusCode::BAD_REQUEST),
+            (authed_headers(), old_id.clone(), fixed.clone(), StatusCode::OK),
+            (authed_headers(), old_id.clone(), fixed.clone(), StatusCode::OK),
+        ] {
+            let response = repair_radio_program(State(state.clone()), headers, Path("program".into()), Json(RepairRadioProgramRequest {expected_voice_job_id:expected,artifact:draft})).await;
+            assert_eq!(response.status(), status);
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items").fetch_one(&state.db).await.unwrap();
+        assert_eq!(count, 1);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_jobs WHERE status='queued'").fetch_one(&state.db).await.unwrap();
+        assert_eq!(count, 1);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_job_events WHERE event_type='manuscript_repaired'").fetch_one(&state.db).await.unwrap();
+        assert_eq!(count, 1);
+        let audio: Option<String> = sqlx::query_scalar("SELECT audio_url FROM items").fetch_one(&state.db).await.unwrap();
+        assert!(audio.is_none(), "known defective audio must not remain served while repairing");
+
     }
 }

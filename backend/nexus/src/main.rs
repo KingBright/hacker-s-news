@@ -204,6 +204,10 @@ async fn main() {
             post(routes::agent::submit_agent_job),
         )
         .route(
+            "/api/internal/agent/jobs/{id}/repair-radio",
+            post(routes::agent::repair_radio_program),
+        )
+        .route(
             "/api/internal/agent/jobs/{id}/fail",
             post(routes::agent::fail_agent_job),
         )
