@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, quote
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
-from review_comparison import report_issues, run_root, unresolved
+from review_comparison import report_issues, run_root, unresolved, bounded_path, digest, read
 
 
 def audio_probe(base, path, context):
@@ -100,6 +100,58 @@ def render_report(manifest, outputs, weekly, ready):
     return '\n'.join(lines) + '\n'
 
 
+def daily_run(manifest, reference):
+    return 'agent-runs' in Path(reference).resolve().parts and any(
+        x in str(manifest.get('edition', '')).lower() for x in ('早间', '晚间', 'morning', 'evening'))
+
+
+def radio_scope(manifest, reference):
+    if not daily_run(manifest, reference):
+        return []
+    try:
+        from editorial_selection import selection
+        path = bounded_path(run_root(reference), manifest.get('radio_ledger', ''))
+        bound = selection(None, path, reference)
+        if bound['pending'] or any(c['outcome'] == 'pending' for c in bound['categories']):
+            return ['Radio候选或类别仍有未完成核验，不得声称完整覆盖。']
+        if bound['events']:
+            state = read(bounded_path(run_root(reference), manifest.get('radio_state', 'radio-state.json')))
+            if state.get('editorial_selection', {}).get('sha256') != bound['sha256']:
+                raise ValueError('Radio delivery ledger differs from the original checkpoint plan')
+        return []
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        return ['Radio范围未完成核对：' + str(exc)]
+
+
+def reading_scope(manifest, reference):
+    """Daily production must account for Reading; audio readiness alone cannot hide it."""
+    if not daily_run(manifest, reference):
+        return []
+    try:
+        path = bounded_path(run_root(reference), manifest.get('reading_ledger', ''))
+        ledger = read(path)
+        inventory = read(bounded_path(run_root(reference), ledger['inventory_file']))
+        if digest(inventory) != ledger.get('inventory_sha256') or inventory.get('pagination', {}).get('complete') is not True:
+            raise ValueError('Reading inventory is incomplete or changed')
+        expected = {r['id'] for r in inventory.get('sources', {}).get('items', [])}
+        rows = ledger.get('candidates', [])
+        if not isinstance(rows, list) or len(rows) != len(expected) or {r.get('source_id') for r in rows} != expected:
+            raise ValueError('Reading candidates were not reconciled')
+        output_ids = {r['voice_job_id'] for r in manifest['outputs']}
+        pending = []
+        for row in rows:
+            outcome = row.get('outcome')
+            if not row.get('reason') or outcome not in ('published', 'already-published', 'not-selected', 'pending', 'unverifiable'):
+                raise ValueError('Reading decision lacks a concrete reason')
+            if outcome == 'published' and row.get('voice_job_id') not in output_ids:
+                raise ValueError('Selected Reading audio is missing from required outputs')
+            if outcome in ('pending', 'unverifiable'):
+                pending.append(row['source_id'])
+        return ['Reading仍有未完成候选：' + ','.join(pending)] if pending else []
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        return ['Reading范围未完成核对：' + str(exc)]
+
+
 def finalize(args, api, public, save):
     manifest = json.loads(Path(args.manifest).read_text())
     if not manifest.get('date') or not manifest.get('edition') or not isinstance(manifest.get('outputs'), list):
@@ -113,6 +165,8 @@ def finalize(args, api, public, save):
     if not 0 <= args.wait_seconds <= 7200:
         raise ValueError('Wait must be between 0 and7200seconds')
     deadline = time.monotonic() + args.wait_seconds
+    scope_errors = radio_scope(manifest, args.manifest) + reading_scope(manifest, args.manifest)
+    manifest['warnings'] = list(manifest.get('warnings', [])) + scope_errors
     while True:
         outputs = []
         for entry in entries:
@@ -125,9 +179,9 @@ def finalize(args, api, public, save):
         except Exception:
             weekly = {'state': 'unverified', 'description': '周报上线验证失败'}
         manifest['editorial_issues'] = report_issues(run_root(args.manifest))
-        editorial_blocked = unresolved(manifest['editorial_issues'])
+        editorial_blocked = bool(scope_errors) or unresolved(manifest['editorial_issues'])
         ready = not editorial_blocked and all(row['state'] == 'ready' for row in outputs) and weekly['state'] in ('ready', 'not_due')
-        state = {'editorial_issues': manifest['editorial_issues'], 'editorial_blocked': editorial_blocked, 'delivered': ready, 'checked_at': datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(), 'outputs': outputs, 'weekly': weekly}
+        state = {'editorial_issues': manifest['editorial_issues'], 'editorial_blocked': editorial_blocked, 'scope_errors': scope_errors, 'delivered': ready, 'checked_at': datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(), 'outputs': outputs, 'weekly': weekly}
         save(args.out, state)
         print(json.dumps({'delivered': ready, 'ready': sum(row['state'] == 'ready' for row in outputs), 'total': len(outputs), 'weekly': weekly['state']}, ensure_ascii=False), flush=True)
         if ready or editorial_blocked or time.monotonic() >= deadline or any(row['state'] == 'failed' for row in outputs) or weekly['state'] == 'missing':

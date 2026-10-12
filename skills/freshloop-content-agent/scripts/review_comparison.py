@@ -98,7 +98,7 @@ def units(artifact):
     return rows
 
 
-def prepare_inputs(artifact_path, source_paths, out):
+def prepare_inputs(artifact_path, source_paths, out, ledger_path=None):
     root = run_root(artifact_path)
     artifact = read(artifact_path)
     sources = []
@@ -113,12 +113,21 @@ def prepare_inputs(artifact_path, source_paths, out):
         sources.append(source)
     needed = {url for row in units(artifact) for url in row['source_urls']}
     if not needed <= {s['url'] for s in sources}:
-        raise EditorialError('source_unavailable', '无法完成来源核验：存在没有完整来源快照的文稿引用', 'source')
+        raise EditorialError('source_unavailable', '无法完成来源核验：存在没有完整来源快照的文稿引用', 'source', sorted(needed - {s['url'] for s in sources}))
     packet = {'artifact_sha256': digest(artifact), 'artifact_file': str(Path(artifact_path).resolve()),
               'sources': sources, 'units': units(artifact), 'dimensions': sorted(DIMENSIONS),
               'instruction': 'Read every full source snapshot body and final unit. Return concrete source/draft differences and a pass/revise/reject/unverifiable conclusion. Program acceptance only binds evidence; it does not prove semantic truth.'}
+    if ledger_path:
+        from editorial_selection import selection
+        packet['selection'] = selection(artifact, ledger_path, artifact_path)
+    elif 'agent-runs' in Path(artifact_path).resolve().parts and ('sections' in artifact or 'stories' in artifact):
+        raise EditorialError('selection_ledger_missing', 'Prepare the reconciled candidate ledger before Radio review', 'selection')
     save(out, packet)
-    return {'input_file': str(Path(out).resolve()), 'input_sha256': digest(packet), 'units': len(packet['units']), 'sources': len(sources)}
+    request = {'input_file': str(Path(out).resolve()), 'input_sha256': digest(packet),
+               'artifact_sha256': digest(artifact), 'units': len(packet['units']), 'sources': len(sources)}
+    request_path = Path(out).with_suffix('.request.json')
+    save(request_path, request)
+    return dict(request, request_file=str(request_path.resolve()))
 
 
 def verify_comparison(artifact, review, review_path):
@@ -138,6 +147,14 @@ def verify_comparison(artifact, review, review_path):
         if hashlib.sha256(snapshot.get('body','').encode()).hexdigest() != current['body_sha256']:
             raise EditorialError('stale_source_review', 'Full source input given to the reviewer changed', source_ids=[current['source_id']])
         sources[current['source_id']] = current
+    if packet.get('selection'):
+        from editorial_selection import selection
+        current = selection(artifact, packet['selection']['file'], review_path)
+        if current != packet['selection']:
+            raise EditorialError('stale_selection_review', 'Candidate/depth ledger changed after source review', 'selection')
+    elif 'agent-runs' in Path(review_path).resolve().parts and ('sections' in artifact or 'stories' in artifact):
+        raise EditorialError('selection_ledger_missing', 'Production Radio review must bind the complete candidate ledger', 'selection')
+    verify_receipts(review, root)
     expected = {row['unit']: row for row in units(artifact)}
     for role in review.get('reviews', []):
         comparisons = role.get('comparisons')
@@ -159,27 +176,140 @@ def verify_comparison(artifact, review, review_path):
                     raise EditorialError('difference_missing', 'A non-passing review must state concrete differences, not an empty conclusion', source_ids=ids, unit=row['unit'])
                 reason = '; '.join(f"{d['kind']}: {d['reason']}" for d in differences)
                 raise EditorialError('semantic_' + str(conclusion), reason, source_ids=ids, unit=row['unit'])
-            if row.get('differences') != [] or not row.get('assessment'):
+            if row.get('differences') != [] or generic_verdict(row.get('assessment')):
                 raise EditorialError('comparison_incomplete', 'Passing comparison requires a concrete assessment and no unresolved material differences', unit=row['unit'])
             anchors = row.get('evidence')
             if not isinstance(anchors, list) or not anchors:
                 raise EditorialError('comparison_evidence_missing', 'Comparison must quote actual source and final manuscript passages', unit=row['unit'])
-            compact = lambda s: ''.join(str(s).split())
+            if {a.get('source_id') for a in anchors} != set(ids):
+                raise EditorialError('comparison_evidence_missing', 'Quote the actual contribution of every source for this unit', unit=row['unit'])
             for anchor in anchors:
                 ident = anchor.get('source_id')
                 original, final = anchor.get('source_excerpt'), anchor.get('draft_excerpt')
-                if ident not in ids or not original or not final or compact(original) not in compact(sources[ident]['body']) or compact(final) not in compact(unit['text']) or not anchor.get('observation'):
+                if ident not in ids or not passage_match(sources[ident]['body'], original) or not passage_match(unit['text'], final) or generic_verdict(anchor.get('observation')):
                     raise EditorialError('comparison_evidence_mismatch', 'Source/final excerpts do not match the actual inputs', source_ids=ids, unit=row['unit'])
     return packet
 
 
+def generic_verdict(value):
+    if not isinstance(value, str) or not value.strip():
+        return True
+    normalized = ''.join(c.casefold() for c in value if c.isalnum())
+    return normalized in {'pass', '通过', '通过审核', '事实无误', '听感无误', '事实完全匹配无出入', '无差异', '准确', '正确', '已核实'}
+
+
+def passage_match(text, excerpt):
+    """Require a complete sentence/paragraph anchor; no length/word quota."""
+    if not isinstance(excerpt, str) or not excerpt.strip():
+        return False
+    clean, starts, ends = [], {0}, {0}
+    for char in text:
+        if char in '\r\n':
+            starts.add(len(clean)); ends.add(len(clean))
+        if char.isspace():
+            continue
+        if char in '。！？!?；;.':
+            ends.add(len(clean))
+        clean.append(char)
+        if char in '。！？!?；;.':
+            starts.add(len(clean)); ends.add(len(clean))
+    body = ''.join(clean); quote = ''.join(excerpt.split())
+    ends.add(len(body))
+    offset = body.find(quote)
+    while offset >= 0:
+        if offset in starts and offset + len(quote) in ends:
+            return True
+        offset = body.find(quote, offset + 1)
+    return False
+
+
+def verify_receipts(review, root):
+    receipts = review.get('receipts', [])
+    rows = review.get('reviews', [])
+    if not isinstance(receipts, list) or len(receipts) != 2 or {r.get('role') for r in receipts} != {'facts', 'listening'}:
+        raise EditorialError('review_receipt_missing', 'Preserve the two actual reviewer JSON receipts; never synthesize comparisons')
+    paths = set()
+    comparisons = []
+    for item in receipts:
+        path = bounded_path(root, item.get('file', ''))
+        if path in paths:
+            raise EditorialError('review_receipt_copied', 'Facts/listening must retain their separate actual receipts')
+        paths.add(path)
+        original = read(path)
+        row = next((r for r in rows if r.get('role') == item['role']), None)
+        if digest(original) != item.get('sha256') or original != row:
+            raise EditorialError('review_receipt_changed', 'Assembled review differs from the actual reviewer receipt')
+        if any(original.get(k) != review.get(k) for k in ('artifact_sha256', 'input_file', 'input_sha256')):
+            raise EditorialError('stale_review_receipt', 'Reviewer receipt belongs to another original input/final manuscript')
+        comparisons.append(original.get('comparisons'))
+    if review.get('mode') == 'native_subagents' and comparisons[0] == comparisons[1]:
+        raise EditorialError('review_receipt_copied', 'Identical comparisons copied to both roles are not independent review results')
+
+
+def assemble_review(artifact_path, input_path, facts_path, listening_path, out, mode='native_subagents', unavailable_reason=None):
+    root = run_root(artifact_path); packet_path = bounded_path(root, input_path)
+    packet = read(packet_path); rows, receipts = [], []
+    for role, path in (('facts', facts_path), ('listening', listening_path)):
+        path = bounded_path(root, path); row = read(path)
+        if row.get('role') != role:
+            raise EditorialError('review_role_missing', 'Reviewer receipt must name its actual facts/listening role')
+        rows.append(row); receipts.append({'role': role, 'file': str(path), 'sha256': digest(row)})
+    result = {'artifact_sha256': packet['artifact_sha256'], 'input_file': str(packet_path),
+              'input_sha256': digest(packet), 'mode': mode, 'reviews': rows, 'receipts': receipts}
+    if unavailable_reason: result['unavailable_reason'] = unavailable_reason
+    save(out, result)  # preserve even a rejected receipt, never fill/change its verdicts
+    verify_comparison(read(artifact_path), result, out)
+    return {'review_file': str(Path(out).resolve()), 'review_sha256': digest(result),
+            'semantic_truth_verified_by_program': False}
+
+
+def issue_events(root):
+    path = Path(root) / '.editorial' / 'issues.events.jsonl'
+    events, previous = [], None
+    if path.exists():
+        try:
+            for line in path.read_text().splitlines():
+                event = json.loads(line)
+                hashed = {k: v for k, v in event.items() if k != 'sha256'}
+                if event.get('previous') != previous or digest(hashed) != event.get('sha256'):
+                    raise ValueError('chain mismatch')
+                events.append(event); previous = event['sha256']
+        except (ValueError, OSError):
+            raise EditorialError('issue_audit_tampered', 'Editorial issue event history is invalid; retain it for inspection', 'audit') from None
+    return events
+
+
 def issues(root):
     path = Path(root) / 'editorial-issues.json'
-    return read(path) if path.exists() else {'version': 1, 'issues': []}
+    events = issue_events(root)
+    if not events:
+        if path.exists() and read(path).get('issues'):
+            raise EditorialError('issue_audit_unverified', 'Legacy issue summary lacks original event history; its resolved flags are unverified', 'audit')
+        return {'version': 2, 'issues': []}
+    data = events[-1]['data']
+    if not path.exists() or read(path) != data:
+        raise EditorialError('issue_audit_tampered', 'Issue summary was edited outside verified helper transitions; do not treat rewritten resolved flags as acceptance', 'audit')
+    return data
+
+
+def persist_issues(root, data, action, evidence=None):
+    events = issue_events(root)
+    event = {'version': 1, 'previous': events[-1]['sha256'] if events else None,
+             'at': int(time.time()), 'action': action, 'evidence': evidence or {}, 'data': data}
+    event['sha256'] = digest(event)
+    path = Path(root) / '.editorial' / 'issues.events.jsonl'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), 'a') as handle:
+        handle.write(json.dumps(event, ensure_ascii=False) + '\n')
+        handle.flush(); os.fsync(handle.fileno())
+    save(Path(root) / 'editorial-issues.json', data)
 
 
 def report_issues(root):
-    data = issues(root)
+    try:
+        data = issues(root)
+    except EditorialError as exc:
+        return [{'id': exc.code, 'stage': 'audit', 'reason': str(exc), 'disposition': 'blocked', 'artifact': 'editorial-issues.json', 'source_ids': []}]
     return [{'id': i['id'], 'stage': i['stage'], 'reason': i['reason'], 'disposition': i['disposition'],
              'artifact': i.get('artifact'), 'source_ids': i.get('source_ids', [])} for i in data['issues']]
 
@@ -264,7 +394,7 @@ def record_issue_locked(args, exc):
             state['editorial_status'] = 'failed'
             row['disposition'] = 'revision_limit_reached'
         save(state_path, state)
-    save(root / 'editorial-issues.json', data); write_issue_report(root)
+    persist_issues(root, data, 'error_recorded', {'issue_id': identity}); write_issue_report(root)
     return {'editorial_error': code, 'stage': stage, 'reason': reason, 'disposition': row['disposition'],
             'issue_id': identity, 'issues_file': str(root / 'editorial-issues.json')}
 
@@ -281,14 +411,16 @@ def approved_locked(artifact, review_path, state):
     save(root / '.editorial' / 'reviews' / (sha + '.json'), read(review_path))
     data = issues(root)
     packet = read(bounded_path(root, read(review_path)['input_file']))
-    reviewed_sources = {s['source_id'] for s in packet['sources']}
+    reviewed_sources = {s['source_id'] for s in packet['sources']} | {s['url'] for s in packet['sources']}
     for row in data['issues']:
-        if row['stage'] == 'source' and set(row['source_ids']) <= reviewed_sources and row['source_ids']:
+        if row['stage'] == 'source' and row.get('artifact') == Path(packet['artifact_file']).name and row.get('artifact_sha256'):
+            row['disposition'] = 'corrected_and_reviewed'; row['resolved_by_sha256'] = sha
+        elif row['stage'] == 'source' and set(row['source_ids']) <= reviewed_sources and row['source_ids']:
             row['disposition'] = 'source_retrieved_and_reviewed'; row['resolved_by_sha256'] = sha
         if row['stage'] in ('validation', 'review') and row.get('job_id') == state.get('job_id') and row.get('job_id'):
             row['disposition'] = 'corrected_and_reviewed'; row['resolved_by_sha256'] = sha
     if data['issues']:
-        save(root / 'editorial-issues.json', data); write_issue_report(root)
+        persist_issues(root, data, 'review_approved', {'artifact_sha256': sha, 'review_sha256': digest(read(review_path)), 'input_sha256': digest(packet)}); write_issue_report(root)
 
 
 def source_recovered(args, record):
@@ -302,7 +434,7 @@ def source_recovered_locked(args, record):
         if row['stage'] == 'source' and args.id in row['source_ids'] and row['disposition'] == 'blocked':
             row['disposition'] = 'source_retrieved_requires_semantic_review'
     if data['issues']:
-        save(root / 'editorial-issues.json', data); write_issue_report(root)
+        persist_issues(root, data, 'source_retrieved', {'source_id': args.id, 'source_sha256': digest(record)}); write_issue_report(root)
 
 
 def submission_reconciled(state, reference):
@@ -314,7 +446,7 @@ def submission_reconciled(state, reference):
             if row['stage'] == 'submit' and row.get('job_id') == state.get('job_id'):
                 row['disposition']='submission_confirmed'; row['result_ref']=state.get('result_ref')
         if data['issues']:
-            save(root/'editorial-issues.json',data);write_issue_report(root)
+            persist_issues(root, data, 'submission_confirmed', {'job_id': state.get('job_id'), 'result_ref': state.get('result_ref')});write_issue_report(root)
 
 
 def unresolved(rows):

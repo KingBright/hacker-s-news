@@ -1,0 +1,41 @@
+{
+  "note": "Independent, non-production regression inputs based on observed failure types; no production job, lease, source snapshot or TTS is reused.",
+  "sources": [
+    {
+      "key": "linux",
+      "id": "fixture-linux",
+      "category": "技术产业",
+      "url": "https://example.test/news/linux",
+      "title": "Linus 借助 Claude Code 开发文件读取优化",
+      "body": "林纳斯·托瓦兹借助 Claude Code 开发 Linux 文件读取路径的优化补丁。目标是在多个线程同时读取同一文件的小块数据时，减少内存页引用计数竞争。AI 协助代码实现、测试、审查和补丁说明；性能测量由托瓦兹在自己的计算机上完成。补丁仍保存在个人 Git 分支，尚未正式进入 Linux 主线。性能收益针对上述测试负载，不代表所有文件操作都会同幅提升。",
+      "tier": "major",
+      "draft": "Linux 创始人林纳斯·托瓦兹正在借助 Claude Code 优化内核的文件读取路径。多个线程同时读取同一文件的小块数据时，内存页引用计数可能发生竞争，补丁试图减少这类同步开销。AI 协助代码、测试、审查和说明，性能测试由托瓦兹在自己的电脑上完成。目前补丁仍在个人 Git 分支，尚未进入 Linux 主线；测试结果也不能推广到所有文件读取负载。",
+      "limits": "个人分支、未合并主线；收益只适用于特定测试负载。",
+      "importance": "涉及内核并发正确性与性能边界，需解释机制和开发状态。"
+    },
+    {
+      "key": "fast",
+      "id": "fixture-fast",
+      "category": "科学探索",
+      "url": "https://example.test/news/fast",
+      "title": "FAST 确认脉冲星三体系统",
+      "body": "中国科学院国家天文台联合研究团队确认 J0435+3233 是处于演化阶段的原生脉冲星三体系统。脉冲星于 2020 年由 FAST 发现，自转周期为 3.2 毫秒。它与一颗白矮星构成双星系统。第三颗类太阳恒星环绕这个双星系统运动，构成三体系统。结论结合五年监测与多波段资料，并非只凭一次射电观测。",
+      "tier": "major",
+      "draft": "国家天文台联合研究团队结合 FAST 和多波段资料，确认脉冲星 J0435+3233 属于一个原生三体系统。脉冲星在 2020 年已被 FAST 发现，自转周期为 3.2 毫秒。这次确认的结构包含它与白矮星组成的双星，以及环绕这对双星运行的第三颗类太阳恒星。研究结合五年监测，新的进展是确认系统构成，不能说三颗星都是今天才发现。",
+      "limits": "区分2020年发现脉冲星和本次确认三体结构；必须说明第三颗恒星。",
+      "importance": "三体结构和发现/确认日期构成事件核心，简化掉第三颗星会破坏解释。"
+    },
+    {
+      "key": "windows",
+      "id": "fixture-windows",
+      "category": "硬件数码",
+      "url": "https://example.test/news/windows",
+      "title": "Windows 11 测试手机快捷设置",
+      "body": "微软在 Windows 11 实验性版本中测试移动设备快速设置入口。配对连接 Android 手机后，可以调节手机音量、切换勿扰模式或让手机发出声音。该功能仍在测试，尚未向普通用户提供。",
+      "tier": "brief",
+      "draft": "微软正在 Windows 11 实验版本中测试 Android 手机快捷设置，配对后可调音量、切换勿扰或播放寻机声音，尚未向普通用户提供。",
+      "limits": "实验测试阶段、需要配对，未向普通用户提供。",
+      "importance": "有限范围的入口调整，一句保留能力与可用性即可。"
+    }
+  ]
+}

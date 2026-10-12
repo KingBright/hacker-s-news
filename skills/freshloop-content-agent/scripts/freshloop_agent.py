@@ -20,7 +20,8 @@ from zoneinfo import ZoneInfo
 from editorial_evidence import validate_evidence
 from source_pagination import collect_sources
 from article_view import article_view
-from review_comparison import EditorialError, prepare_inputs, verify_comparison, record_issue, approved, source_recovered, source_input, submission_reconciled
+from review_comparison import EditorialError, prepare_inputs, verify_comparison, record_issue, approved, source_recovered, source_input, submission_reconciled, assemble_review
+from editorial_selection import bind_selection
 
 JOB_TYPES = ('radio_program', 'radio_episode', 'reading_article', 'weekly_digest', 'loop_preference_extraction')
 
@@ -345,8 +346,10 @@ def main():
         if command == 'submit':
             p.add_argument('--artifact', required=True); p.add_argument('--review-file')
         if command == 'fail': p.add_argument('--error', required=True)
-    p = sub.add_parser('validate'); p.add_argument('--job-type', choices=JOB_TYPES, required=True); p.add_argument('--artifact', required=True); p.add_argument('--state')
-    p = sub.add_parser('review-inputs'); p.add_argument('--artifact', required=True); p.add_argument('--sources', nargs='+', required=True); p.add_argument('--out', required=True)
+    p = sub.add_parser('validate'); p.add_argument('--job-type', choices=JOB_TYPES, required=True); p.add_argument('--artifact', required=True); p.add_argument('--state'); p.add_argument('--ledger')
+    p = sub.add_parser('review-inputs'); p.add_argument('--artifact', required=True); p.add_argument('--sources', nargs='+', required=True); p.add_argument('--out', required=True); p.add_argument('--ledger')
+    p = sub.add_parser('review-assemble'); p.add_argument('--artifact', required=True); p.add_argument('--inputs', required=True); p.add_argument('--facts', required=True); p.add_argument('--listening', required=True); p.add_argument('--out', required=True)
+    p.add_argument('--mode', choices=('native_subagents', 'self_review'), default='native_subagents'); p.add_argument('--unavailable-reason')
     p = sub.add_parser('review-check'); p.add_argument('--artifact', required=True); p.add_argument('--review-file', required=True); p.add_argument('--state')
     p = sub.add_parser('sources'); p.add_argument('--product-line', choices=('radio','reading')); p.add_argument('--offset', type=int, default=0); p.add_argument('--out', required=True)
     p.add_argument('--all', action='store_true', help='collect every metadata page, bounded by deadline and page count')
@@ -354,6 +357,7 @@ def main():
     p = sub.add_parser('source'); p.add_argument('--id', required=True); p.add_argument('--out', required=True)
     p = sub.add_parser('media'); p.add_argument('--id', required=True); p.add_argument('--index', type=int, required=True); p.add_argument('--out', required=True)
     p = sub.add_parser('refresh'); p.add_argument('--out', required=True)
+    p = sub.add_parser('tts-status'); p.add_argument('--out', required=True)
     p = sub.add_parser('finalize-run'); p.add_argument('--manifest',required=True); p.add_argument('--out',required=True); p.add_argument('--report',required=True); p.add_argument('--wait-seconds',type=int,default=5400)
     args = parser.parse_args()
     with checkpoint_lock(getattr(args,"state",None)):
@@ -377,6 +381,8 @@ def dispatch_unchecked(args):
         from delivery import finalize
         return finalize(args,nexus(),Api(os.environ['NEXUS_URL'],'','X-NEXUS-KEY'),save)
     if args.command == 'begin': return begin(args)
+    if args.command == 'review-assemble':
+        print(json.dumps(assemble_review(args.artifact, args.inputs, args.facts, args.listening, args.out, getattr(args, 'mode', 'native_subagents'), getattr(args, 'unavailable_reason', None)), ensure_ascii=False)); return
     if args.command == 'review-check':
         state=read(args.state) if getattr(args,'state',None) else {}
         if 'agent-runs' in Path(args.artifact).resolve().parts and not state:
@@ -387,6 +393,7 @@ def dispatch_unchecked(args):
         if state.get('pending_hash') and state['pending_hash'] != artifact_digest(artifact):
             raise EditorialError('pending_submission_changed','Pending submission differs; reconcile the original outcome before reviewing another draft','submit')
         kind=state.get('job_type') or ('radio_program' if 'sections' in artifact else 'radio_episode' if 'stories' in artifact else 'reading_article' if 'compressed_markdown' in artifact else 'weekly_digest')
+        bind_selection(artifact, state, args.artifact, state_path=getattr(args, 'state', None))
         errors=validate(artifact,kind)
         if errors: raise EditorialError('invalid_manuscript','; '.join(errors),'validation')
         try:
@@ -398,7 +405,7 @@ def dispatch_unchecked(args):
         approved(artifact,args.review_file,state)
         print(json.dumps({'review_record_valid':True,'semantic_truth_verified_by_program':False})); return
     if args.command == 'review-inputs':
-        result=prepare_inputs(args.artifact,args.sources,args.out)
+        result=prepare_inputs(args.artifact,args.sources,args.out,getattr(args, 'ledger', None))
         print(json.dumps(result,ensure_ascii=False)); return
     if args.command == 'validate':
         state=read(args.state) if getattr(args,'state',None) else {}
@@ -406,7 +413,10 @@ def dispatch_unchecked(args):
             raise EditorialError('review_state_missing','Production validation requires the existing --state to bound draft revisions','validation')
         if state.get('editorial_status') == 'failed' and not state.get('pending_hash'):
             raise EditorialError('revision_limit_reached','Three rejected drafts exhausted the editorial budget; stop and fail the existing job','validation')
-        errors=validate(read(args.artifact),args.job_type)
+        artifact = read(args.artifact)
+        bound = bind_selection(artifact, state, args.artifact, getattr(args, 'ledger', None), getattr(args, 'state', None))
+        if bound and getattr(args, 'state', None): save(args.state, state)
+        errors=validate(artifact,args.job_type)
         if errors:
             event=record_issue(args,EditorialError('invalid_manuscript','; '.join(errors),'validation'))
             if event: print(json.dumps(event,ensure_ascii=False),file=sys.stderr)
@@ -449,7 +459,10 @@ def dispatch_unchecked(args):
     if args.command == 'submit':
         if state.get('editorial_status') == 'failed' and not state.get('pending_hash'):
             raise EditorialError('revision_limit_reached','Three distinct rejected drafts exhausted the editorial budget; stop and fail the existing job, never create a new ID','review')
-        artifact=read(args.artifact); errors=validate(artifact,state['job_type'])
+        artifact=read(args.artifact)
+        bound = bind_selection(artifact, state, args.artifact, state_path=args.state)
+        if bound: save(args.state, state)
+        errors=validate(artifact,state['job_type'])
         if errors: raise EditorialError('invalid_manuscript','; '.join(errors),'validation')
         digest=artifact_digest(artifact)
         if state.get('pending_hash') and state['pending_hash'] != digest:

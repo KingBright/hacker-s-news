@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 import freshloop_agent as agent
 import review_comparison as review
 import delivery
-from test_freshloop_agent import radio_artifact, artifact, reviewed_file
+from test_freshloop_agent import radio_artifact, artifact, reviewed_file, sync_receipts
 
 
 class ComparisonTests(unittest.TestCase):
@@ -35,7 +35,7 @@ class ComparisonTests(unittest.TestCase):
                 data=radio_artifact();p=root/'review.json';reviewed_file(p,data)
                 r=agent.read(p);row=r['reviews'][0]['comparisons'][0]
                 row.update(conclusion='revise',differences=[dict(kind=kind,reason=reason)])
-                agent.save(p,r);draft=root/'draft.json';agent.save(draft,data)
+                sync_receipts(p,r);draft=root/'draft.json';agent.save(draft,data)
                 state=root/'state.json';agent.save(state,dict(job_id='same-job',job_type='radio_episode',lease_token='private'))
                 args=argparse.Namespace(command='submit',state=str(state),artifact=str(draft),review_file=str(p))
                 api=Mock()
@@ -54,9 +54,9 @@ class ComparisonTests(unittest.TestCase):
             with self.assertRaisesRegex(review.EditorialError,'changed'):agent.require_final_review(data,p)
             source.write_text(old)
             r['reviews'][0]['comparisons'][0]['evidence'][0]['source_excerpt']='invented evidence'
-            agent.save(p,r)
+            sync_receipts(p,r)
             with self.assertRaisesRegex(review.EditorialError,'excerpts'):agent.require_final_review(data,p)
-            reviewed_file(p,data);r=agent.read(p);r['reviews'][1]['comparisons'].pop();agent.save(p,r)
+            reviewed_file(p,data);r=agent.read(p);r['reviews'][1]['comparisons'].pop();sync_receipts(p,r)
             with self.assertRaisesRegex(review.EditorialError,'every'):agent.require_final_review(data,p)
 
     def test_source_packet_tampering_and_unknown_submit_reconciliation(self):
@@ -104,7 +104,7 @@ class ComparisonTests(unittest.TestCase):
             args=argparse.Namespace(command='review-check',state=str(state),artifact=str(draft),review_file=str(p))
             for i in range(3):
                 data=radio_artifact();data['title']=str(i);agent.save(draft,data);reviewed_file(p,data)
-                r=agent.read(p);r['reviews'][0]['comparisons'][0].update(conclusion='reject',differences=[dict(kind='numbers',reason='数字失真')]);agent.save(p,r)
+                r=agent.read(p);r['reviews'][0]['comparisons'][0].update(conclusion='reject',differences=[dict(kind='numbers',reason='数字失真')]);sync_receipts(p,r)
                 with self.assertRaises(review.EditorialError):agent.dispatch(args)
             self.assertEqual(agent.read(state)['editorial_status'],'failed')
             data=radio_artifact();agent.save(draft,data);reviewed_file(p,data)

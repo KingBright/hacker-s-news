@@ -27,8 +27,21 @@ def radio_artifact():
     return data
 
 
+def sync_receipts(path, result):
+    """Modify only synthetic test receipts, preserving the production assembler contract."""
+    from review_comparison import digest
+    result['receipts'] = []
+    for row in result['reviews']:
+        for key in ('artifact_sha256', 'input_file', 'input_sha256'):
+            row[key] = result[key]
+        receipt = Path(path).parent / (row['role'] + '-receipt.json')
+        agent.save(receipt, row)
+        result['receipts'].append(dict(role=row['role'], file=str(receipt.resolve()), sha256=digest(row)))
+    agent.save(path, result)
+
+
 def reviewed_file(path, data):
-    # Synthetic comparison fixture for transport tests; no claim of semantic QA.
+    # Synthetic binding fixture only; semantic regressions use independent source fixtures.
     import hashlib
     from html import escape
     from review_comparison import prepare_inputs, read, units, DIMENSIONS
@@ -44,15 +57,20 @@ def reviewed_file(path, data):
         files.append(str(source))
     packet_path=root/'review-inputs.json'
     prepared=prepare_inputs(draft,files,packet_path); packet=read(packet_path)
-    comparisons=[]
-    for unit in packet['units']:
-        source=next(s for s in packet['sources'] if s['url'] in unit['source_urls'])
-        excerpt=unit['text'][:50]
-        comparisons.append(dict(unit=unit['unit'],source_ids=[s['source_id'] for s in packet['sources'] if s['url'] in unit['source_urls']],
-            checked_dimensions=sorted(DIMENSIONS),conclusion='pass',differences=[],assessment='Synthetic source/transport fixture',
-            evidence=[dict(source_id=source['source_id'],source_excerpt=excerpt,draft_excerpt=excerpt,observation='Exact fixture excerpt matches')]))
-    agent.save(path, dict(artifact_sha256=agent.artifact_digest(data),input_file=prepared['input_file'],input_sha256=prepared['input_sha256'],
-        mode='native_subagents', reviews=[dict(role=r,blocking=[],checked_artifacts=['draft.json'],summary='测试审稿输入结构',comparisons=comparisons) for r in ('facts','listening')]))
+    rows=[]
+    for role in ('facts','listening'):
+        comparisons=[]
+        for unit in packet['units']:
+            sources=[s for s in packet['sources'] if s['url'] in unit['source_urls']]
+            comparisons.append(dict(unit=unit['unit'],source_ids=[s['source_id'] for s in sources],
+                checked_dimensions=sorted(DIMENSIONS),conclusion='pass',differences=[],
+                assessment=role + ': synthetic source and complete final unit are bound',
+                evidence=[dict(source_id=s['source_id'],source_excerpt=unit['text'],draft_excerpt=unit['text'],
+                               observation=role + ': complete fixture passage corresponds to this unit') for s in sources]))
+        rows.append(dict(role=role,blocking=[],checked_artifacts=['draft.json'],summary='Synthetic '+role+' binding fixture',comparisons=comparisons))
+    result=dict(artifact_sha256=agent.artifact_digest(data),input_file=prepared['input_file'],input_sha256=prepared['input_sha256'],
+                mode='native_subagents',reviews=rows)
+    sync_receipts(path, result)
     return str(path)
 
 
@@ -132,7 +150,7 @@ class AgentContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'stale'): agent.require_final_review(data, path)
             with self.assertRaisesRegex(ValueError, 'requires'): agent.require_final_review(data, None)
             path=reviewed_file(Path(directory)/'review.json', data)
-            review=agent.read(path); review['reviews'][0]['blocking']=['未核实']; agent.save(path, review)
+            review=agent.read(path); review['reviews'][0]['blocking']=['未核实']; sync_receipts(path, review)
             with self.assertRaisesRegex(ValueError, 'blocking'): agent.require_final_review(data, path)
 
     def test_state_is_private_and_atomic(self):
@@ -193,7 +211,6 @@ class AgentContractTests(unittest.TestCase):
 
     def test_transport_rejects_plaintext_remote_credentials(self):
         with self.assertRaises(ValueError): agent.Api('http://remote.example','key','X-NEXUS-KEY')
-
 
 
 
