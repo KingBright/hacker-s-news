@@ -19,6 +19,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from editorial_evidence import validate_evidence
 from source_pagination import collect_sources
+from article_view import article_view
 
 JOB_TYPES = ('radio_program', 'radio_episode', 'reading_article', 'weekly_digest', 'loop_preference_extraction')
 
@@ -320,7 +321,9 @@ def dispatch(args):
                 batch=result.get('sources',{})
                 next_offset=args.offset+len(batch.get('items',[]))
                 result['pagination']={'complete':args.offset==0 and next_offset>=batch.get('total',0),'next_offset':next_offset,'since':getattr(args,'since',0)}
-        elif args.command == 'source': result=api.call('/api/agent/sources/'+urllib.parse.quote(args.id,safe='')+'/fetch',{})
+        elif args.command == 'source':
+            result=api.call('/api/agent/sources/'+urllib.parse.quote(args.id,safe='')+'/fetch',{})
+            result['article_view']=article_view(result)
         else: result=api.call('/api/agent/sources/refresh',{},retry=False)
         save(args.out,result); print(json.dumps({'saved':args.out})); return
     state=read(args.state); api=nexus()
