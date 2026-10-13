@@ -178,4 +178,84 @@ class ComparisonTests(unittest.TestCase):
             self.assertIn('数字失真',(root/'run-report.md').read_text())
             self.assertIn('corrected_and_reviewed',(root/'run-report.md').read_text())
 
+class ProductionReviewTests(unittest.TestCase):
+    def test_disclosed_self_review_stays_preview_only_and_cannot_submit(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);p=root/'review.json';data=radio_artifact();reviewed_file(p,data)
+            result=agent.read(p);result.update(mode='self_review',unavailable_reason='Both original reviewers returned unverifiable.')
+            agent.save(p,result)
+            agent.require_final_review(data,p)  # explicit private preview remains possible
+            draft=root/'draft.json';state=root/'state.json';agent.save(draft,data)
+            agent.save(state,dict(job_id='original-job',job_type='radio_episode',lease_token='private'))
+            api=Mock()
+            for command in ('review-check','submit'):
+                args=argparse.Namespace(command=command,state=str(state),artifact=str(draft),review_file=str(p))
+                with patch.object(agent,'nexus',return_value=api):
+                    with self.assertRaisesRegex(review.EditorialError,'independent reviewer'):
+                        agent.dispatch(args)
+            api.call.assert_not_called()
+            self.assertNotIn('pending_hash',agent.read(state))
+            self.assertTrue(any(x['code']=='independent_review_required' for x in review.issues(root)['issues']))
+
+    def test_unknown_refresh_blocks_publish_even_with_valid_independent_review(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);p=root/'review.json';data=radio_artifact();reviewed_file(p,data)
+            draft=root/'draft.json';state=root/'state.json';agent.save(draft,data)
+            agent.save(state,dict(job_id='original-job',job_type='radio_episode',lease_token='private'))
+            review.record_issue(argparse.Namespace(command='refresh',out=str(root/'refresh-result.json')),RuntimeError('Request outcome unknown'))
+            api=Mock();args=argparse.Namespace(command='submit',state=str(state),artifact=str(draft),review_file=str(p))
+            with patch.object(agent,'nexus',return_value=api):
+                with self.assertRaisesRegex(review.EditorialError,'refresh remains unresolved'):
+                    agent.dispatch(args)
+            api.call.assert_not_called()
+            self.assertNotIn('pending_hash',agent.read(state))
+            first=review.issues(root)['issues'][0]
+            self.assertEqual(first['stage'],'refresh')
+            self.assertEqual(first['disposition'],'blocked')
+
+    def test_inventory_and_submit_reference_cannot_resolve_refresh_issue(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root)
+            review.record_issue(argparse.Namespace(command='refresh',out=str(root/'refresh-result.json')),RuntimeError('Request outcome unknown'))
+            data=review.issues(root);data['issues'][0]['disposition']='corrected_and_reviewed'
+            journal=root/'.editorial/issues.events.jsonl';original=journal.read_bytes()
+            for action in ('reconcile_refresh','review_approved'):
+                with self.assertRaisesRegex(review.EditorialError,'defined evidence'):
+                    review.persist_issues(root,data,action,dict(result_ref='radio_item:already-published'))
+                self.assertEqual(journal.read_bytes(),original)
+                self.assertEqual(review.issues(root)['issues'][0]['disposition'],'blocked')
+
+    def test_rehashed_unsupported_refresh_resolution_is_detected_on_read(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root)
+            review.record_issue(argparse.Namespace(command='refresh',out=str(root/'refresh-result.json')),RuntimeError('Request outcome unknown'))
+            data=review.issues(root);data['issues'][0]['disposition']='corrected_and_reviewed'
+            journal=root/'.editorial/issues.events.jsonl';original=journal.read_text()
+            previous=json.loads(original.splitlines()[-1])['sha256']
+            for action in ('reconcile_refresh','review_approved'):
+                event=dict(version=1,previous=previous,at=1,action=action,evidence=dict(result_ref='radio_item:published'),data=data)
+                event['sha256']=review.digest(event)
+                journal.write_text(original+json.dumps(event)+'\n')
+                agent.save(root/'editorial-issues.json',data)
+                rows=review.report_issues(root)
+                self.assertEqual(rows[0]['id'],'issue_audit_tampered')
+                self.assertTrue(review.unresolved(rows))
+
+    def test_refresh_has_batch_timeout_while_other_requests_keep_short_bound(self):
+        import contextlib
+        api=agent.Api('http://127.0.0.1:3721','','X-CORTEX-KEY')
+        response=Mock();response.read.return_value=b'{}'
+        with patch.object(agent.urllib.request,'urlopen',side_effect=lambda *a,**k:contextlib.nullcontext(response)) as open_request:
+            api.call('/api/agent/sources/refresh',{},retry=False)
+            api.call('/api/status')
+        self.assertEqual([x.kwargs['timeout'] for x in open_request.call_args_list],[300,45])
+
+    def test_unknown_refresh_is_never_automatically_replayed(self):
+        api=agent.Api('http://127.0.0.1:3721','','X-CORTEX-KEY')
+        with patch.object(agent.urllib.request,'urlopen',side_effect=TimeoutError) as open_request:
+            with self.assertRaisesRegex(RuntimeError,'outcome unknown'):
+                api.call('/api/agent/sources/refresh',{},retry=False)
+        self.assertEqual(open_request.call_count,1)
+
+
 if __name__ == '__main__':unittest.main()

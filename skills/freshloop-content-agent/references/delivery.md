@@ -2,6 +2,10 @@
 
 Mechanical checks bind evidence and validate structure. They never prove factual truth or actual listening quality.
 
+Production review-check and submit require both actual independent reviewer receipts. self_review is available only for private offline previews; unavailable or unverifiable independent reviewers cannot be replaced with editor-generated pass comparisons. Read-only reviewers can return their actual JSON response to the editor for verbatim saving. They must read the complete source snapshots, using bounded file ranges when needed; inability to write a receipt file is not permission to invent a review.
+
+A timed-out refresh remains unresolved until its actual result is verified. The synchronous full-feed refresh has a 300-second client bound and no automatic replay; normal requests retain 45 seconds. Cache-first-seen timestamps, full pagination, source article fetches and a published result_ref do not establish that refresh completed or that every feed succeeded. The existing helper has no refresh-resolution transition: do not create one in a scratch script, change the disposition, or rehash an event chain. Keep the original issue and report the unverified/partial freshness. Publishing and TTS submission stop while refresh is unresolved; status reads remain available.
+
 ## Preserve the candidate/depth plan before drafting
 
 Radio uses the existing candidate ledger, now supplied with `validate --ledger RUN/candidate-ledger.json`. Bind the complete `sources --all` output, not a shortened list of selected titles. Every returned source ID needs a category, outcome and concrete reason; every configured category needs covered/empty/pending/filtered with a reason. Use a verified prior cache-first-seen boundary to avoid repeatedly treating retained historical inventory as new. Original publication dates must still be checked separately. If no verified boundary exists, retain the complete inventory and reconcile old/out-of-scope sources honestly.

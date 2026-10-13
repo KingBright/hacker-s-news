@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 from editorial_evidence import validate_evidence
 from source_pagination import collect_sources
 from article_view import article_view
-from review_comparison import EditorialError, prepare_inputs, verify_comparison, record_issue, approved, source_recovered, source_input, submission_reconciled, assemble_review
+from review_comparison import EditorialError, prepare_inputs, verify_comparison, record_issue, approved, source_recovered, source_input, submission_reconciled, assemble_review, report_issues, run_root
 from editorial_selection import bind_selection
 
 JOB_TYPES = ('radio_program', 'radio_episode', 'reading_article', 'weekly_digest', 'loop_preference_extraction')
@@ -65,7 +65,9 @@ class Api:
         for attempt in range(3):
             try:
                 request = urllib.request.Request(self.base + path, data=data, headers=headers)
-                with urllib.request.urlopen(request, timeout=45, context=self.context) as response:
+                # Refresh waits for all feed batches; ordinary requests retain their short bound.
+                timeout = 300 if path == '/api/agent/sources/refresh' else 45
+                with urllib.request.urlopen(request, timeout=timeout, context=self.context) as response:
                     raw = response.read(64 * 1024 * 1024 + 1)
                     if len(raw) > 64 * 1024 * 1024:
                         raise RuntimeError("API response exceeds 64 MiB limit")
@@ -92,7 +94,7 @@ def artifact_digest(artifact):
     return hashlib.sha256(json.dumps(artifact, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def require_final_review(artifact, path):
+def require_final_review(artifact, path, *, production=False):
     if not path:
         raise ValueError('submit requires --review-file for the final artifact; review after all edits')
     review = read(path)
@@ -101,6 +103,8 @@ def require_final_review(artifact, path):
     mode = review.get('mode')
     if mode not in ('native_subagents', 'self_review'):
         raise ValueError('review mode must describe actual review execution')
+    if production and mode != 'native_subagents':
+        raise EditorialError('independent_review_required', 'Production requires both actual independent reviewer receipts; unavailable or unverifiable reviewers cannot be replaced by editor self-review', 'review')
     if mode == 'self_review' and not review.get('unavailable_reason'):
         raise ValueError('self review must disclose why independent reviewers were unavailable')
     rows = review.get('reviews', [])
@@ -411,7 +415,7 @@ def dispatch_unchecked(args):
         errors=validate(artifact,kind)
         if errors: raise EditorialError('invalid_manuscript','; '.join(errors),'validation')
         try:
-            require_final_review(artifact,args.review_file)
+            require_final_review(artifact,args.review_file,production=bool(state.get('lease_token')))
         except EditorialError:
             raise
         except (ValueError,OSError,KeyError) as exc:
@@ -483,12 +487,15 @@ def dispatch_unchecked(args):
             raise ValueError('pending submission differs; reconcile status before changing artifact')
         if state['job_type'] != 'loop_preference_extraction':
             try:
-                require_final_review(artifact, getattr(args, 'review_file', None))
+                require_final_review(artifact, getattr(args, 'review_file', None), production=True)
             except EditorialError:
                 raise
             except (ValueError, OSError, KeyError) as exc:
                 raise EditorialError('review_invalid',str(exc),'review') from None
             approved(artifact,args.review_file,state)
+        if any(row.get('stage') == 'refresh' and row.get('disposition') == 'blocked'
+               for row in report_issues(run_root(args.state))):
+            raise EditorialError('refresh_unreconciled', 'Source refresh remains unresolved; preserve its evidence and reconcile before publishing or queuing TTS', 'refresh')
         state['pending_hash']=digest; save(args.state,state); body['artifact']=artifact
     try:
         result=api.call(job_path(state,args.command),body)

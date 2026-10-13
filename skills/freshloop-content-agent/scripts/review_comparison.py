@@ -263,6 +263,24 @@ def assemble_review(artifact_path, input_path, facts_path, listening_path, out, 
             'semantic_truth_verified_by_program': False}
 
 
+def validate_issue_transition(previous, event):
+    if event.get('action') not in {'error_recorded', 'review_approved', 'source_retrieved', 'submission_confirmed'}:
+        raise ValueError('undefined issue transition')
+    current = event.get('data', {}).get('issues', [])
+    before = {row['id']: row for row in previous.get('issues', [])}
+    after = {row['id']: row for row in current}
+    # There is no verified refresh-result reconciliation command yet. Taking a
+    # source inventory or publishing a draft cannot establish refresh completion.
+    for ident, row in before.items():
+        if row.get('stage') == 'refresh':
+            newer = after.get(ident)
+            if newer is None or {k:v for k,v in row.items() if k != 'last_seen'} != {k:v for k,v in newer.items() if k != 'last_seen'}:
+                raise ValueError('refresh issue changed without verified refresh evidence')
+    for ident, row in after.items():
+        if ident not in before and row.get('stage') == 'refresh' and row.get('disposition') not in ('blocked', 'revision_limit_reached'):
+            raise ValueError('refresh issue cannot start resolved')
+
+
 def issue_events(root):
     path = Path(root) / '.editorial' / 'issues.events.jsonl'
     events, previous = [], None
@@ -273,6 +291,7 @@ def issue_events(root):
                 hashed = {k: v for k, v in event.items() if k != 'sha256'}
                 if event.get('previous') != previous or digest(hashed) != event.get('sha256'):
                     raise ValueError('chain mismatch')
+                validate_issue_transition(events[-1]['data'] if events else {'issues': []}, event)
                 events.append(event); previous = event['sha256']
         except (ValueError, OSError):
             raise EditorialError('issue_audit_tampered', 'Editorial issue event history is invalid; retain it for inspection', 'audit') from None
@@ -296,6 +315,10 @@ def persist_issues(root, data, action, evidence=None):
     events = issue_events(root)
     event = {'version': 1, 'previous': events[-1]['sha256'] if events else None,
              'at': int(time.time()), 'action': action, 'evidence': evidence or {}, 'data': data}
+    try:
+        validate_issue_transition(events[-1]['data'] if events else {'issues': []}, event)
+    except ValueError:
+        raise EditorialError('unverified_issue_transition', 'Issue resolution lacks a defined evidence-verified helper transition; preserve the unresolved record', 'audit') from None
     event['sha256'] = digest(event)
     path = Path(root) / '.editorial' / 'issues.events.jsonl'
     path.parent.mkdir(parents=True, exist_ok=True)
