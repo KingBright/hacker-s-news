@@ -64,9 +64,9 @@ def reviewed_file(path, data):
             sources=[s for s in packet['sources'] if s['url'] in unit['source_urls']]
             comparisons.append(dict(unit=unit['unit'],source_ids=[s['source_id'] for s in sources],
                 checked_dimensions=sorted(DIMENSIONS),conclusion='pass',differences=[],
-                assessment=role + ': synthetic source and complete final unit are bound',
+                assessment=role + ': synthetic binding for the retained passage: ' + unit['text'],
                 evidence=[dict(source_id=s['source_id'],source_excerpt=unit['text'],draft_excerpt=unit['text'],
-                               observation=role + ': complete fixture passage corresponds to this unit') for s in sources]))
+                               observation=role + ': fixture source contributes this retained passage: ' + unit['text']) for s in sources]))
         rows.append(dict(role=role,blocking=[],checked_artifacts=['draft.json'],summary='Synthetic '+role+' binding fixture',comparisons=comparisons))
     result=dict(artifact_sha256=agent.artifact_digest(data),input_file=prepared['input_file'],input_sha256=prepared['input_sha256'],
                 mode='native_subagents',reviews=rows)
@@ -183,6 +183,7 @@ class AgentContractTests(unittest.TestCase):
             self.assertEqual(api.leases,1)
             self.assertEqual(state['job_id'],'freshloop:v2:radio_episode:2026-09-21:morning-Tech')
 
+    @patch('native_review.require_origins', lambda *args: None)  # transport-only fixture
     def test_unknown_submit_keeps_digest_and_blocks_changed_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path=Path(directory)/'state.json'; draft=Path(directory)/'draft.json'
@@ -197,6 +198,7 @@ class AgentContractTests(unittest.TestCase):
                 changed=artifact(); changed['title']='Changed'; agent.save(draft,changed)
                 with self.assertRaisesRegex(ValueError,'pending submission differs'): agent.dispatch(args)
 
+    @patch('native_review.require_origins', lambda *args: None)  # transport-only fixture
     def test_400_allows_correcting_the_draft(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path=Path(directory)/'state.json'; draft=Path(directory)/'draft.json'

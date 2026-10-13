@@ -117,6 +117,7 @@ def prepare_inputs(artifact_path, source_paths, out, ledger_path=None):
     packet = {'artifact_sha256': digest(artifact), 'artifact_file': str(Path(artifact_path).resolve()),
               'sources': sources, 'units': units(artifact), 'dimensions': sorted(DIMENSIONS),
               'instruction': 'Read every full source snapshot body and final unit. Return concrete source/draft differences and a pass/revise/reject/unverifiable conclusion. Program acceptance only binds evidence; it does not prove semantic truth.'}
+    packet['program_context'] = {k:artifact[k] for k in ('title', 'opening', 'closing') if k in artifact}
     if ledger_path:
         from editorial_selection import selection
         packet['selection'] = selection(artifact, ledger_path, artifact_path)
@@ -125,6 +126,8 @@ def prepare_inputs(artifact_path, source_paths, out, ledger_path=None):
     save(out, packet)
     request = {'input_file': str(Path(out).resolve()), 'input_sha256': digest(packet),
                'artifact_sha256': digest(artifact), 'units': len(packet['units']), 'sources': len(sources)}
+    from review_batches import prepare_batches
+    request['review_batches'] = prepare_batches(packet, request, root / '.editorial' / 'review-batches' / digest(packet))
     request_path = Path(out).with_suffix('.request.json')
     save(request_path, request)
     return dict(request, request_file=str(request_path.resolve()))
@@ -156,10 +159,23 @@ def verify_comparison(artifact, review, review_path):
         raise EditorialError('selection_ledger_missing', 'Production Radio review must bind the complete candidate ledger', 'selection')
     verify_receipts(review, root)
     expected = {row['unit']: row for row in units(artifact)}
+    context = {k:artifact[k] for k in ('title', 'opening', 'closing') if k in artifact}
+    if packet.get('program_context', context) != context:
+        raise EditorialError('stale_source_review', 'Program opening/closing context differs from the final artifact')
+    def without_labels(value):
+        text = re.sub(r'(?:/sections/\d+)?(?:/stories/\d+)?/(?:script|audio_script)', '', str(value))
+        text = re.sub(r'\b[0-9a-f]{8,64}\b', '', text, flags=re.I)
+        return ''.join(c.casefold() for c in text if c.isalnum())
     for role in review.get('reviews', []):
         comparisons = role.get('comparisons')
         if not isinstance(comparisons, list) or len(comparisons) != len(expected) or {c.get('unit') for c in comparisons if isinstance(c, dict)} != set(expected):
             raise EditorialError('comparison_missing', 'Each reviewer must compare every display/compressed/spoken unit with full original inputs')
+        events = {u.get('event_key') for u in expected.values() if u.get('event_key')}
+        if len(events) > 1 and all(c.get('conclusion') == 'pass' for c in comparisons):
+            assessments = {without_labels(c.get('assessment')) for c in comparisons}
+            observations = {without_labels(a.get('observation')) for c in comparisons for a in c.get('evidence', [])}
+            if len(assessments) == 1 or len(observations) == 1:
+                raise EditorialError('comparison_template', 'Verdict templates repeated across distinct events do not establish source/draft correspondence')
         for row in comparisons:
             unit = expected[row['unit']]
             ids = row.get('source_ids', [])
@@ -224,40 +240,54 @@ def passage_match(text, excerpt):
 
 
 def verify_receipts(review, root):
+    from review_batches import merge_parts
     receipts = review.get('receipts', [])
     rows = review.get('reviews', [])
-    if not isinstance(receipts, list) or len(receipts) != 2 or {r.get('role') for r in receipts} != {'facts', 'listening'}:
-        raise EditorialError('review_receipt_missing', 'Preserve the two actual reviewer JSON receipts; never synthesize comparisons')
-    paths = set()
-    comparisons = []
+    if not isinstance(receipts, list) or len(receipts) < 2 or {r.get('role') for r in receipts} != {'facts', 'listening'}:
+        raise EditorialError('review_receipt_missing', 'Preserve actual receipts from both reviewers; partial responses must not be filled by the editor')
+    paths, parts = set(), {'facts': [], 'listening': []}
     for item in receipts:
         path = bounded_path(root, item.get('file', ''))
         if path in paths:
-            raise EditorialError('review_receipt_copied', 'Facts/listening must retain their separate actual receipts')
-        paths.add(path)
-        original = read(path)
-        row = next((r for r in rows if r.get('role') == item['role']), None)
-        if digest(original) != item.get('sha256') or original != row:
-            raise EditorialError('review_receipt_changed', 'Assembled review differs from the actual reviewer receipt')
+            raise EditorialError('review_receipt_copied', 'Facts/listening must retain separate actual receipts')
+        paths.add(path); original = read(path)
+        if digest(original) != item.get('sha256') or original.get('role') != item['role']:
+            raise EditorialError('review_receipt_changed', 'Raw reviewer receipt changed after assembly')
         if any(original.get(k) != review.get(k) for k in ('artifact_sha256', 'input_file', 'input_sha256')):
             raise EditorialError('stale_review_receipt', 'Reviewer receipt belongs to another original input/final manuscript')
-        comparisons.append(original.get('comparisons'))
-    if review.get('mode') == 'native_subagents' and comparisons[0] == comparisons[1]:
+        parts[item['role']].append(original)
+    merged = []
+    for role in ('facts', 'listening'):
+        try: actual = merge_parts(parts[role], role)
+        except ValueError as exc: raise EditorialError('review_receipt_changed', str(exc)) from None
+        row = next((r for r in rows if r.get('role') == role), None)
+        if actual != row:
+            raise EditorialError('review_receipt_changed', 'Assembled review differs from the actual raw parts')
+        merged.append(actual.get('comparisons'))
+    if review.get('mode') == 'native_subagents' and merged[0] == merged[1]:
         raise EditorialError('review_receipt_copied', 'Identical comparisons copied to both roles are not independent review results')
 
 
 def assemble_review(artifact_path, input_path, facts_path, listening_path, out, mode='native_subagents', unavailable_reason=None):
+    from review_batches import merge_parts
     root = run_root(artifact_path); packet_path = bounded_path(root, input_path)
     packet = read(packet_path); rows, receipts = [], []
-    for role, path in (('facts', facts_path), ('listening', listening_path)):
-        path = bounded_path(root, path); row = read(path)
-        if row.get('role') != role:
-            raise EditorialError('review_role_missing', 'Reviewer receipt must name its actual facts/listening role')
-        rows.append(row); receipts.append({'role': role, 'file': str(path), 'sha256': digest(row)})
+    for role, given in (('facts', facts_path), ('listening', listening_path)):
+        parts = []
+        for value in given if isinstance(given, (list, tuple)) else [given]:
+            path = bounded_path(root, value); row = read(path)
+            if row.get('role') != role:
+                raise EditorialError('review_role_missing', 'Reviewer receipt must name its actual facts/listening role')
+            parts.append(row); item={'role': role, 'file': str(path), 'sha256': digest(row)}
+            origin=path.with_suffix('.origin.json')
+            if origin.exists(): item['origin_file']=str(origin)
+            receipts.append(item)
+        try: rows.append(merge_parts(parts, role))
+        except ValueError as exc: raise EditorialError('review_receipt_changed', str(exc)) from None
     result = {'artifact_sha256': packet['artifact_sha256'], 'input_file': str(packet_path),
               'input_sha256': digest(packet), 'mode': mode, 'reviews': rows, 'receipts': receipts}
     if unavailable_reason: result['unavailable_reason'] = unavailable_reason
-    save(out, result)  # preserve even a rejected receipt, never fill/change its verdicts
+    save(out, result)  # preserve rejection and every raw part; never fill/change verdicts
     verify_comparison(read(artifact_path), result, out)
     return {'review_file': str(Path(out).resolve()), 'review_sha256': digest(result),
             'semantic_truth_verified_by_program': False}

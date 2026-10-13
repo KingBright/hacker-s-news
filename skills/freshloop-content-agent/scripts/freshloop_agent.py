@@ -116,6 +116,9 @@ def require_final_review(artifact, path, *, production=False):
                 verify_comparison(artifact, review, path)
             raise ValueError('final review incomplete or contains unresolved blocking findings')
     verify_comparison(artifact, review, path)
+    if production:
+        from native_review import require_origins
+        require_origins(review, path)
 
 
 def validate_narration(text):
@@ -366,7 +369,8 @@ def main():
         if command == 'fail': p.add_argument('--error', required=True)
     p = sub.add_parser('validate'); p.add_argument('--job-type', choices=JOB_TYPES, required=True); p.add_argument('--artifact', required=True); p.add_argument('--state'); p.add_argument('--ledger')
     p = sub.add_parser('review-inputs'); p.add_argument('--artifact', required=True); p.add_argument('--sources', nargs='+', required=True); p.add_argument('--out', required=True); p.add_argument('--ledger')
-    p = sub.add_parser('review-assemble'); p.add_argument('--artifact', required=True); p.add_argument('--inputs', required=True); p.add_argument('--facts', required=True); p.add_argument('--listening', required=True); p.add_argument('--out', required=True)
+    p = sub.add_parser('review-import'); p.add_argument('--conversation', required=True); p.add_argument('--role', choices=('facts','listening'), required=True); p.add_argument('--batch', required=True); p.add_argument('--out', required=True)
+    p = sub.add_parser('review-assemble'); p.add_argument('--artifact', required=True); p.add_argument('--inputs', required=True); p.add_argument('--facts', nargs='+', required=True); p.add_argument('--listening', nargs='+', required=True); p.add_argument('--out', required=True)
     p.add_argument('--mode', choices=('native_subagents', 'self_review'), default='native_subagents'); p.add_argument('--unavailable-reason')
     p = sub.add_parser('review-check'); p.add_argument('--artifact', required=True); p.add_argument('--review-file', required=True); p.add_argument('--state')
     p = sub.add_parser('sources'); p.add_argument('--product-line', choices=('radio','reading')); p.add_argument('--offset', type=int, default=0); p.add_argument('--out', required=True)
@@ -399,6 +403,9 @@ def dispatch_unchecked(args):
         from delivery import finalize
         return finalize(args,nexus(),Api(os.environ['NEXUS_URL'],'','X-NEXUS-KEY'),save)
     if args.command == 'begin': return begin(args)
+    if args.command == 'review-import':
+        from native_review import import_receipt
+        print(json.dumps(import_receipt(args.conversation,args.role,args.batch,args.out),ensure_ascii=False)); return
     if args.command == 'review-assemble':
         print(json.dumps(assemble_review(args.artifact, args.inputs, args.facts, args.listening, args.out, getattr(args, 'mode', 'native_subagents'), getattr(args, 'unavailable_reason', None)), ensure_ascii=False)); return
     if args.command == 'review-check':
@@ -458,7 +465,9 @@ def dispatch_unchecked(args):
         elif args.command == 'source':
             result=api.call('/api/agent/sources/'+urllib.parse.quote(args.id,safe='')+'/fetch',{})
             result['article_view']=article_view(result)
-        else: result=api.call('/api/agent/sources/refresh',{},retry=False)
+        else:
+            from refresh_receipt import refresh_once
+            result=refresh_once(api,args.out,save,read)
         save(args.out,result)
         if args.command == 'source':
             source_input(args.out)  # empty/failed original remains saved, but cannot exit as success

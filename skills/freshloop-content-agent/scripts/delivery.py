@@ -1,5 +1,6 @@
 """Read-only delivery gate and deterministic human report. Never publishes or requeues."""
 import json
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -143,6 +144,10 @@ def reading_scope(manifest, reference):
             outcome = row.get('outcome')
             if not row.get('reason') or outcome not in ('published', 'already-published', 'not-selected', 'pending', 'unverifiable'):
                 raise ValueError('Reading decision lacks a concrete reason')
+            reason = row['reason']
+            deferred = row.get('deferral_reason') == 'editorial_budget_exhausted' or bool(re.search(r'保留至后续版次核验|留待.{0,20}核验|budget.{0,60}defer|defer.{0,30}(?:edition|verification)', reason, re.I))
+            if outcome == 'not-selected' and deferred:
+                raise ValueError('Reading budget deferral must remain pending; it is not an editorial rejection')
             if outcome == 'published' and row.get('voice_job_id') not in output_ids:
                 raise ValueError('Selected Reading audio is missing from required outputs')
             if outcome in ('pending', 'unverifiable'):

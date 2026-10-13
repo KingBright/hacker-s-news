@@ -197,6 +197,7 @@ class ProductionReviewTests(unittest.TestCase):
             self.assertNotIn('pending_hash',agent.read(state))
             self.assertTrue(any(x['code']=='independent_review_required' for x in review.issues(root)['issues']))
 
+    @patch('native_review.require_origins', lambda *args: None)  # refresh-state contract only
     def test_unknown_refresh_blocks_publish_even_with_valid_independent_review(self):
         with tempfile.TemporaryDirectory() as root:
             root=Path(root);p=root/'review.json';data=radio_artifact();reviewed_file(p,data)
