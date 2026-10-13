@@ -368,6 +368,8 @@ def main():
             p.add_argument('--artifact', required=True); p.add_argument('--review-file')
         if command == 'fail': p.add_argument('--error', required=True)
     p = sub.add_parser('validate'); p.add_argument('--job-type', choices=JOB_TYPES, required=True); p.add_argument('--artifact', required=True); p.add_argument('--state'); p.add_argument('--ledger')
+    p = sub.add_parser('draft-inputs'); p.add_argument('--product-line',choices=('radio','reading'),required=True); p.add_argument('--sources',nargs='+',required=True); p.add_argument('--ledger'); p.add_argument('--event-key'); p.add_argument('--out',required=True)
+    p = sub.add_parser('draft-check'); p.add_argument('--input',required=True); p.add_argument('--response',required=True); p.add_argument('--out',required=True)
     p = sub.add_parser('review-inputs'); p.add_argument('--artifact', required=True); p.add_argument('--sources', nargs='+', required=True); p.add_argument('--out', required=True); p.add_argument('--ledger')
     p = sub.add_parser('review-import'); p.add_argument('--conversation', required=True); p.add_argument('--role', choices=('facts','listening'), required=True); p.add_argument('--batch', required=True); p.add_argument('--out', required=True)
     p = sub.add_parser('review-assemble'); p.add_argument('--artifact', required=True); p.add_argument('--inputs', required=True); p.add_argument('--facts', nargs='+', required=True); p.add_argument('--listening', nargs='+', required=True); p.add_argument('--out', required=True)
@@ -403,6 +405,12 @@ def dispatch_unchecked(args):
         from delivery import finalize
         return finalize(args,nexus(),Api(os.environ['NEXUS_URL'],'','X-NEXUS-KEY'),save)
     if args.command == 'begin': return begin(args)
+    if args.command == 'draft-inputs':
+        from draft_handoff import prepare
+        print(json.dumps(prepare(args.product_line,args.sources,args.out,getattr(args,'ledger',None),getattr(args,'event_key',None)),ensure_ascii=False));return
+    if args.command == 'draft-check':
+        from draft_handoff import check
+        result=check(args.input,args.response,args.out);print(json.dumps(result,ensure_ascii=False));return not result['mechanical_valid']
     if args.command == 'review-import':
         from native_review import import_receipt
         print(json.dumps(import_receipt(args.conversation,args.role,args.batch,args.out),ensure_ascii=False)); return
