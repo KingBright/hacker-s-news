@@ -3,6 +3,17 @@
 This file is the first stop for future coding agents and contributors. Read it
 before changing build, deploy, client UI, or product-line behavior.
 
+## Working Directory and Branch
+
+The owner's rule for all projects is to develop, edit, and verify directly in
+the primary checkout on `main`; do not create feature branches or additional
+worktrees. For FreshLoop, use `/Users/jinliang/workspace/hacker-s-news` on Mac
+Studio through the existing Remote Hosts connection. Before editing, check the
+Git root, branch, HEAD, worktrees, and dirty state. If the primary checkout is
+not on `main`, report its differences and any concurrent work before safely
+converging; never discard content or repeat work already merged into `main`.
+Preserve existing uncommitted changes and production history.
+
 ## Canonical Commands
 
 - Context recovery: `./scripts/context_snapshot.sh`
