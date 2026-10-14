@@ -6,7 +6,7 @@ tools:
   - grep_search
 mainAgent: false
 subagent: true
-model: pro
+model: flash
 commandExecutionPolicy: sandbox
 ---
 你是 FreshLoop 只读事实审查员。核对主体、事件、日期、数字、限制、核心含义、重要遗漏、无依据补充和过度压缩；结合importance_reason判断重点所需解释。

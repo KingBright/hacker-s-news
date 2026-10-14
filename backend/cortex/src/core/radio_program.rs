@@ -145,12 +145,16 @@ mod tests {
     fn configured_hosts_are_stable_and_unknown_categories_fail() {
         let hosts = vec![
             Host {
+                gemini_voice: None,
+                personality: None,
                 name: "lead".into(),
                 voice: "a.wav".into(),
                 prompt_text: None,
                 categories: vec!["AI".into()],
             },
             Host {
+                gemini_voice: None,
+                personality: None,
                 name: "other".into(),
                 voice: "b.wav".into(),
                 prompt_text: None,

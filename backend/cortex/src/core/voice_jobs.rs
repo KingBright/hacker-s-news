@@ -1,6 +1,7 @@
 use crate::core::config::{Config, VoiceWorkerConfig};
 use crate::core::nexus::{NexusClient, VoiceJobPayload};
 use crate::core::tts::TtsClient;
+use crate::core::tts_routing::TtsRouter;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -30,7 +31,6 @@ struct VoiceWorkerSettings {
     repair_limit: i64,
     voice_kinds: Option<Vec<String>>,
     hosts: Vec<crate::core::config::Host>,
-    tts_fingerprint: String,
 }
 
 impl VoiceWorkerSettings {
@@ -92,7 +92,6 @@ impl VoiceWorkerSettings {
             repair_limit,
             voice_kinds,
             hosts: config.hosts.clone().unwrap_or_default(),
-            tts_fingerprint: format!("{:?}", config.tts),
         }
     }
 
@@ -110,6 +109,10 @@ pub async fn run_voice_worker_loop(
     tts: Arc<TtsClient>,
     nexus: Arc<NexusClient>,
 ) {
+    let tts=match TtsRouter::new(&config,tts) {
+        Ok(router)=>Arc::new(router),
+        Err(error)=> { log::error!("[VoiceWorker] TTS routing initialization failed: {error:#}"); return; }
+    };
     let settings = VoiceWorkerSettings::from_config(&config);
     if !settings.enabled {
         log::info!("[VoiceWorker] Disabled by config");
@@ -159,7 +162,7 @@ pub async fn run_voice_worker_loop(
 
 async fn run_voice_worker_instance(
     settings: VoiceWorkerSettings,
-    tts: Arc<TtsClient>,
+    tts: Arc<TtsRouter>,
     nexus: Arc<NexusClient>,
 ) {
     log::info!(
@@ -225,7 +228,7 @@ async fn run_voice_repair_loop(settings: VoiceWorkerSettings, nexus: Arc<NexusCl
 
 async fn process_next_voice_job(
     settings: &VoiceWorkerSettings,
-    tts: Arc<TtsClient>,
+    tts: Arc<TtsRouter>,
     nexus: Arc<NexusClient>,
 ) -> Result<bool> {
     let job = nexus
@@ -262,7 +265,7 @@ async fn process_next_voice_job(
         lease_token.clone(),
         settings.lease_seconds,
     );
-    let result = synthesize_and_upload(&job, tts, nexus.clone(), settings).await;
+    let result = synthesize_and_upload(&job, tts.clone(), nexus.clone(), settings).await;
     heartbeat.abort();
 
     match result {
@@ -271,9 +274,8 @@ async fn process_next_voice_job(
                 .complete_voice_job(&job.id, &lease_token, &audio_url, Some(duration_sec))
                 .await
                 .with_context(|| format!("complete voice job {}", job.id))?;
-            if job.voice_kind == "radio_program" {
-                let _ = tokio::fs::remove_dir_all(program_cache(&job.id)).await;
-            }
+            let _ = tokio::fs::remove_dir_all(program_cache(&job.id)).await;
+            tts.clear_completed_cache(&job.id).await;
             log::info!(
                 "[VoiceWorker] Completed job={} audio_url={} duration={}s",
                 job.id,
@@ -328,26 +330,13 @@ fn start_voice_job_heartbeat(
 
 async fn synthesize_and_upload(
     job: &VoiceJobPayload,
-    tts: Arc<TtsClient>,
+    tts: Arc<TtsRouter>,
     nexus: Arc<NexusClient>,
     settings: &VoiceWorkerSettings,
 ) -> Result<(String, i64)> {
-    let (mp3_bytes, duration_sec) = if job.voice_kind == "radio_program" {
-        super::radio_program::render(
-            &job.text,
-            &settings.hosts,
-            tts,
-            &program_cache(&job.id),
-            &settings.tts_fingerprint,
-            settings.concurrency,
-        )
-        .await?
-    } else {
-        let text = normalize_voice_text(&job.text)?;
-        tts.speak_mp3(&text)
-            .await
-            .with_context(|| format!("synthesize voice job {}", job.id))?
-    };
+    let program=job.voice_kind == "radio_program";
+    let text=if program { job.text.clone() } else { normalize_voice_text(&job.text)? };
+    let (mp3_bytes,duration_sec)=tts.render(&job.id,&text,&job.voice_kind,&settings.hosts,&program_cache(&job.id),settings.concurrency).await?;
     validate_generated_mp3(&mp3_bytes, duration_sec)
         .with_context(|| format!("validate voice job {}", job.id))?;
     let file_prefix = sanitize_file_prefix(&job.file_prefix);

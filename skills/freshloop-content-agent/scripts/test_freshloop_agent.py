@@ -146,6 +146,9 @@ class AgentContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data=radio_artifact(); path=reviewed_file(Path(directory)/'review.json', data)
             agent.require_final_review(data, path)
+            gemini_path=reviewed_file(Path(directory)/'gemini-review.json', data)
+            gemini_review=agent.read(gemini_path); gemini_review['mode']='gemini_direct'; sync_receipts(gemini_path, gemini_review)
+            agent.require_final_review(data, gemini_path, production=True)
             data['script'] += '新增了一条消息。'
             with self.assertRaisesRegex(ValueError, 'stale'): agent.require_final_review(data, path)
             with self.assertRaisesRegex(ValueError, 'requires'): agent.require_final_review(data, None)
@@ -217,5 +220,20 @@ class AgentContractTests(unittest.TestCase):
 
 
 
+
+class TtsStatusTests(unittest.TestCase):
+    def test_status_filters_unrelated_payload_and_does_not_need_nexus_key(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(agent.Api,'call',return_value={'tts_policy':{'configured_engine':'gemini'},'tts_routing':{'last_event':{'job_id':'j'}},'unrelated_secret':'never-copy'}) as call:
+            out=str(Path(root)/'status.json')
+            agent.dispatch(argparse.Namespace(command='tts-status',out=out))
+            result=json.loads(Path(out).read_text())
+            self.assertTrue(result['supported'])
+            self.assertNotIn('unrelated_secret',result)
+            call.assert_called_once_with('/api/status')
+    def test_legacy_server_is_not_reported_as_fallback_capable(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(agent.Api,'call',return_value={'status':'idle'}):
+            out=str(Path(root)/'status.json')
+            agent.dispatch(argparse.Namespace(command='tts-status',out=out))
+            self.assertFalse(json.loads(Path(out).read_text())['supported'])
 
 if __name__=='__main__': unittest.main()

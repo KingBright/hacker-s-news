@@ -1,3 +1,5 @@
+pub mod gemini;
+pub mod gemini_resources;
 pub mod magictts;
 pub mod moss;
 pub mod qwen3;

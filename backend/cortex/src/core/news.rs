@@ -1324,6 +1324,47 @@ async fn handle_status(
         "content_generation_enabled": content_generation_enabled,
         "external_agent_enabled": state.config.external_agent_enabled(),
         "voice_worker_enabled": voice_worker_enabled,
+        "tts_routing": super::tts_routing::public_status(),
+        "tts_policy": {
+            "configured_engine":state.config.tts.engine,
+            "primary_model": if state.config.tts.engine.as_deref() == Some("colab") {
+                Some("colab_dual_ab(voxcpm2+indextts25)".to_string())
+            } else {
+                state.config.tts.gemini.as_ref().map(|g| g.model.clone())
+            },
+            "colab_routing": if state.config.tts.engine.as_deref() == Some("colab") {
+                Some(serde_json::json!({
+                    "morning_radio": "colab_voxcpm2",
+                    "evening_radio": "colab_indextts25",
+                    "weekly_digest": "colab_indextts25",
+                    "reading_article": "sha256_50_50(colab_voxcpm2,colab_indextts25)"
+                }))
+            } else {
+                None
+            },
+            "fallback_models": if state.config.tts.engine.as_deref() == Some("colab") {
+                state.config.tts.gemini.as_ref().map(|g| {
+                    let mut models = vec![g.model.clone()];
+                    for m in &g.fallback_models {
+                        if !models.contains(m) {
+                            models.push(m.clone());
+                        }
+                    }
+                    models
+                })
+            } else {
+                state.config.tts.gemini.as_ref().map(|g| g.fallback_models.clone())
+            },
+            "fallback_local": if state.config.tts.engine.as_deref() == Some("colab") {
+                state.config.tts.voxcpm.is_some()
+            } else {
+                state.config.tts.gemini.as_ref().is_some_and(|g|g.fallback_local)
+            },
+            "scope":"whole_voice_job",
+            "request_budget":state.config.tts.gemini.as_ref().map(|g|serde_json::json!({"daily":g.daily_request_budget,"background_reserved":g.reserved_requests,"morning_reserved":g.morning_reserved_requests,"min_interval_secs":g.min_request_interval_secs,"reset":"Asia/Shanghai midnight; local planning limit, not provider quota"})),
+            "request_usage":state.config.tts.gemini.as_ref().map(tts::adapters::gemini_resources::status),
+            "hosts":state.config.hosts.as_deref().unwrap_or_default().iter().map(|host|serde_json::json!({"name":host.name,"categories":host.categories,"gemini_voice":host.gemini_voice,"personality":host.personality})).collect::<Vec<_>>()
+        },
         "pending_clusters": total_clusters,
         "curated_feed_enabled": content_generation_enabled && state.curated_pipeline.is_enabled(),
         "curated_weekly_digest_enabled": content_generation_enabled && state.config.curated_feed.as_ref().and_then(|feed| feed.weekly_digest_enabled).unwrap_or(true),

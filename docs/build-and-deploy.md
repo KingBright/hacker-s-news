@@ -223,3 +223,17 @@ python3 -m unittest discover -s skills/freshloop-content-agent/scripts -p 'test_
 For isolated acceptance runs, set `CORTEX_DATA_DIR` to a temporary data directory
 and `CORTEX_BIND_ADDR` to a separate loopback port. Keep the config in that run
 directory and point Nexus to isolated SQLite, memory and audio paths.
+
+## Gemini routing acceptance
+
+When Gemini is configured, the ASR loop uses the same persisted cooldown and
+provider ordering as a new production voice job. It records the effective engine
+in its manifest and logs the selected model/provider. If Google is in an observed
+quota cooldown, the gate verifies the local fallback; this is not cloud quality
+acceptance and does not clear the cooldown. The gate remains mandatory. Do not
+use SKIP_TTS_ASR_LOOP to enable a provider whose acceptance has failed.
+
+Gemini credentials may be supplied by environment or a private (0600) key file;
+only its path is stored in config/worker requests, never the key. Host identity and
+style are configured in each `[[hosts]]` entry as `gemini_voice` and `personality`.
+See the content skill’s `references/hosts-and-tts.md` for operational boundaries.

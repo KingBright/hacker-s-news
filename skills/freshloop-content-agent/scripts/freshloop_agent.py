@@ -101,9 +101,9 @@ def require_final_review(artifact, path, *, production=False):
     if review.get('artifact_sha256') != artifact_digest(artifact):
         raise ValueError('review is stale: final artifact changed; rerun reviews before submitting')
     mode = review.get('mode')
-    if mode not in ('native_subagents', 'self_review'):
+    if mode not in ('native_subagents', 'self_review', 'gemini_direct'):
         raise ValueError('review mode must describe actual review execution')
-    if production and mode != 'native_subagents':
+    if production and mode not in ('native_subagents', 'gemini_direct'):
         raise EditorialError('independent_review_required', 'Production requires both actual independent reviewer receipts; unavailable or unverifiable reviewers cannot be replaced by editor self-review', 'review')
     if mode == 'self_review' and not review.get('unavailable_reason'):
         raise ValueError('self review must disclose why independent reviewers were unavailable')
@@ -116,7 +116,7 @@ def require_final_review(artifact, path, *, production=False):
                 verify_comparison(artifact, review, path)
             raise ValueError('final review incomplete or contains unresolved blocking findings')
     verify_comparison(artifact, review, path)
-    if production:
+    if production and mode == 'native_subagents':
         from native_review import require_origins
         require_origins(review, path)
 
@@ -373,7 +373,7 @@ def main():
     p = sub.add_parser('review-inputs'); p.add_argument('--artifact', required=True); p.add_argument('--sources', nargs='+', required=True); p.add_argument('--out', required=True); p.add_argument('--ledger')
     p = sub.add_parser('review-import'); p.add_argument('--conversation', required=True); p.add_argument('--role', choices=('facts','listening'), required=True); p.add_argument('--batch', required=True); p.add_argument('--out', required=True)
     p = sub.add_parser('review-assemble'); p.add_argument('--artifact', required=True); p.add_argument('--inputs', required=True); p.add_argument('--facts', nargs='+', required=True); p.add_argument('--listening', nargs='+', required=True); p.add_argument('--out', required=True)
-    p.add_argument('--mode', choices=('native_subagents', 'self_review'), default='native_subagents'); p.add_argument('--unavailable-reason')
+    p.add_argument('--mode', choices=('native_subagents', 'self_review', 'gemini_direct'), default='native_subagents'); p.add_argument('--unavailable-reason')
     p = sub.add_parser('review-check'); p.add_argument('--artifact', required=True); p.add_argument('--review-file', required=True); p.add_argument('--state')
     p = sub.add_parser('sources'); p.add_argument('--product-line', choices=('radio','reading')); p.add_argument('--offset', type=int, default=0); p.add_argument('--out', required=True)
     p.add_argument('--all', action='store_true', help='collect every metadata page, bounded by deadline and page count')
@@ -454,6 +454,12 @@ def dispatch_unchecked(args):
             event=record_issue(args,EditorialError('invalid_manuscript','; '.join(errors),'validation'))
             if event: print(json.dumps(event,ensure_ascii=False),file=sys.stderr)
         print(json.dumps({'valid': not errors,'errors':errors}, ensure_ascii=False)); return bool(errors)
+    if args.command == 'tts-status':
+        api=Api(os.environ.get('CORTEX_URL','http://127.0.0.1:3721'),os.environ.get('CORTEX_API_KEY',''),'X-CORTEX-KEY')
+        status=api.call('/api/status')
+        result={'supported':'tts_policy' in status,'policy':status.get('tts_policy'),'routing':status.get('tts_routing')}
+        save(args.out,result)
+        print(json.dumps(result,ensure_ascii=False)); return
     if args.command in ('sources', 'source', 'refresh', 'media'):
         api=Api(os.environ.get('CORTEX_URL','http://127.0.0.1:3721'),os.environ.get('CORTEX_API_KEY',''),'X-CORTEX-KEY')
         if args.command == 'media':

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+reqwest = { version = "0.13", features = ["blocking", "json"] }
+base64 = "0.22"
+sha2 = "0.10"
 aha = { path = "../aha" }
 qwen3-tts = { path = "../qwen3-tts-rs", features = ["hub"] }
 anyhow = "1.0"

@@ -15,3 +15,5 @@ pub mod utils;
 pub mod voice_jobs;
 
 pub mod radio_program;
+
+pub mod tts_routing;

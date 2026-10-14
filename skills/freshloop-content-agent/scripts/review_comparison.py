@@ -264,7 +264,7 @@ def verify_receipts(review, root):
         if actual != row:
             raise EditorialError('review_receipt_changed', 'Assembled review differs from the actual raw parts')
         merged.append(actual.get('comparisons'))
-    if review.get('mode') == 'native_subagents' and merged[0] == merged[1]:
+    if review.get('mode') in ('native_subagents', 'gemini_direct') and merged[0] == merged[1]:
         raise EditorialError('review_receipt_copied', 'Identical comparisons copied to both roles are not independent review results')
 
 

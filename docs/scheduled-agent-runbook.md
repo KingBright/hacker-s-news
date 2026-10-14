@@ -84,9 +84,9 @@ Match voice worker concurrency with isolated TTS process slots and benchmark on
 the target machine before increasing them. Multiple Metal processes share the
 same GPU; a higher process count is not an assumed linear speedup.
 
-## Installed production schedule (2026-09-21)
+## Installed production schedule (updated2026-10-09)
 
-Antigravity native Scheduled Tasks, project `hacker-s-news`, Asia/Shanghai:
+Antigravity native Scheduled Tasks, project `FreshLoop 内容生产` (ID `50ab1974-0eec-4ef3-944a-ddedae352e84`), workspace `/Users/jinliang/workspace/freshloop-content`, Asia/Shanghai:
 
 | Task ID | Schedule | Work |
 | --- | --- | --- |
@@ -95,7 +95,7 @@ Antigravity native Scheduled Tasks, project `hacker-s-news`, Asia/Shanghai:
 | `freshloop-weekly` | Monday around 08:00 | Previous complete Monday–Sunday week |
 
 Antigravity applies launch jitter; these are target times, not exact deadlines.
-Its native scheduled tasks use Flash. Background/menu-bar mode and Prevent Sleep
+Tasks now explicitly select `agentapi new-conversation --model=flash` (Gemini 3.8 Flash) paired with `Gemini 4 Argon (Low)` (`MODEL_PLACEHOLDER_M419`) default fallback and `model: flash` inherited-workspace custom fact/listening auditors (`freshloop-fact-auditor` and `freshloop-listening-editor`), avoiding wasteful `High` thinking / `Pro` token burn. Background/menu-bar mode and Prevent Sleep
 were already enabled and were verified. The application, network and model
 account must remain available. Exact installed prompts are recorded in
 `antigravity-schedules.json`. Daily prompts include a missing-weekly catch-up
@@ -148,3 +148,39 @@ Daily Radio now uses one `radio_program` per date and `morning-program` /
 contract; use one opening/closing and submit the ordered sections together.
 Cortex applies configured host/category ownership and assembles a single MP3.
 Do not submit each section separately. Weekly and Reading remain unchanged.
+
+## Host personas and voice degradation
+
+Read the canonical skill reference [hosts-and-tts.md](../skills/freshloop-content-agent/references/hosts-and-tts.md). `freshloop_agent.py tts-status --out FILE` retrieves the live host mapping and job-level routing status. A configured fallback is not proof of deployment; check `supported` and `configured_engine`. Keep the same editorial/voice job IDs through audio failures. The helper is read-only for routing; scheduled agents do not change providers, credentials, cooldowns or deployment.
+
+
+## Fixed project and delivery gate (2026-10-09)
+
+All three native sidecar projectId bindings now point to the one content project. Its folder resource is the independent production workspace, not the code checkout. Existing history/projects were not deleted. The three sidecar logs confirmed configuration reload with all original cron expressions preserved.
+Project-scoped `.agents/agents/*.md` installs the two canonical reviewers from the skill’s agents directory. Official subagent discovery/invoke_subagent supports inherited workspaces; no Teamwork campaign or new worktree is started per edition. `/boost` is a paid-plan engineering workflow, not synonymous with selectingPro. Teamwork requires a scoping interview; it is not used for unattended news runs.
+See [delivery contract](../skills/freshloop-content-agent/references/delivery.md). The old3-minute audio inspection allowance is removed from all three installed prompts. `finalize-run` waits up to90minutes, checks every required voice job, product linkage and public MP3 response, plus weekly/Reading linkage. Only successful delivery permits a success report. Timeout/failure retains state and reports failure; it never turns pending into success.
+The deterministic report has date/edition, delivery conclusion, listening links/durations, weekly check and exceptions. Internal IDs remain in privateJSON. On2026-10-09 the gate was run from the new workspace against the existing morningRadio,3Reading items and latestweekly; all verified online. This proves current delivery checks, not full semantic audio QA or a futurePro/subagent scheduled run.
+Native UI verification/historical conversation migration remained unavailable because both Antigravity CUA attempts timed out. Native watched configuration and scheduler reload were verified; do not claim the new subagents have already executed a full production run.
+Official references: https://antigravity.google/docs/subagents/ , https://antigravity.google/docs/boost/ , https://antigravity.google/docs/teamwork/ .
+
+### 2026-10-10 final-manuscript regression guard
+
+The morning editor reviewed a draft, then a validation-fix script appended generic
+padding and appended all stories to the already-complete section. Audio faithfully
+read the damaged manuscript. Reviews must follow mechanical validation and bind
+to the final JSON digest through `submit --review-file`; edits invalidate reviews.
+Radio importance is not a minimum-word quota. The helper and Nexus reject repeated
+substantial passages and require each story exactly once in both manuscripts.
+Never fix validation by copying sentences or replacing source evidence with the
+editor's own narrative. Source metadata pagination and extraction limits must be
+reported; fetching the first30 candidates or reading the first1000 page characters
+is not whole-window coverage or article verification.
+
+A maintenance repair can POST a validated replacement artifact plus
+`expected_voice_job_id` to `/api/internal/agent/jobs/{original_job_id}/repair-radio`.
+This requires internal authentication and an existing completed radio program.
+It preserves the item/date/bookmarks, archives previous evidence, removes the
+known-bad public audio association and queues one replacement. Identical retries
+return the same result; stale audio/active jobs block repair. Do not use a new slot
+or direct database writes. Repaired audio still requires public delivery and ASR
+acceptance; a successful manuscript repair response is not audio completion.

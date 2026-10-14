@@ -131,6 +131,7 @@ impl TtsClient {
 
         // Map Cortex internal config to external TTS Library config schema
         let lib_config = LibTtsConfig {
+            gemini: config.gemini.clone(),
             engine: Some(engine_name.to_string()),
             device: Some(device_name.to_string()),
             voxcpm: config.voxcpm.as_ref().map(|v| VoxCpmConfig {
@@ -292,6 +293,25 @@ impl TtsClient {
     where
         F: FnMut(&str) -> String + Send,
     {
+        if self.config.engine.as_deref() == Some("gemini") {
+            let mut text = Vec::new();
+            while let Some(chunk) = chunks_rx.recv().await {
+                let chunk = clean_chunk(&chunk);
+                if !chunk.trim().is_empty() && !chunk.trim().contains("SKIP") {
+                    text.push(chunk);
+                }
+            }
+            let text = text.join("\n");
+            let result = if self.process_isolation {
+                self.speak_mp3_via_worker(&text, voice_override, prompt_override)
+                    .await
+            } else {
+                self.speak_and_encode_mp3(&text, voice_override, prompt_override)
+                    .await
+            };
+            self.release_engine_after_use("speak_mp3_from_chunks").await;
+            return result;
+        }
         if self.process_isolation {
             let mut chunks = Vec::new();
             let mut total_chars = 0_usize;
@@ -355,9 +375,7 @@ impl TtsClient {
                             text: prompt_override.clone(),
                             wav_path: voice_override.clone(),
                         };
-                        if let Err(e) = engine.cache_voice_prompt(&override_prompt) {
-                            log::warn!("Failed to apply temporary voice override cache: {}", e);
-                        }
+                        engine.cache_voice_prompt(&override_prompt).context("apply requested host voice")?;
                     }
 
                     let samples = engine.synthesize_chunk(&tts_text);
@@ -455,7 +473,7 @@ impl TtsClient {
         let request = TtsWorkerRequest {
             config: self.config.clone(),
             mode: TtsWorkerMode::Wav,
-            text: Some(Self::bounded_text(raw_text)),
+            text: Some(self.prepare_input_text(raw_text)),
             chunks: None,
             voice_override,
             prompt_override,
@@ -473,7 +491,7 @@ impl TtsClient {
         let request = TtsWorkerRequest {
             config: self.config.clone(),
             mode: TtsWorkerMode::Mp3,
-            text: Some(Self::bounded_text(raw_text)),
+            text: Some(self.prepare_input_text(raw_text)),
             chunks: None,
             voice_override,
             prompt_override,
@@ -594,7 +612,7 @@ impl TtsClient {
         voice_override: Option<String>,
         prompt_override: Option<String>,
     ) -> Result<Vec<u8>> {
-        let text = Self::bounded_text(raw_text);
+        let text = self.prepare_input_text(raw_text);
 
         log::info!("Synthesizing long text through abstracted TTS library...");
 
@@ -614,9 +632,7 @@ impl TtsClient {
                 text: prompt_override,
                 wav_path: voice_override,
             };
-            if let Err(e) = engine.cache_voice_prompt(&override_prompt) {
-                log::warn!("Failed to apply temporary voice override cache: {}", e);
-            }
+            engine.cache_voice_prompt(&override_prompt).context("apply requested host voice")?;
         }
 
         let pcm_samples_result = tokio::time::timeout(
@@ -645,7 +661,7 @@ impl TtsClient {
         voice_override: Option<String>,
         prompt_override: Option<String>,
     ) -> Result<(Vec<u8>, i64)> {
-        let text = Self::bounded_text(raw_text);
+        let text = self.prepare_input_text(raw_text);
         log::info!("Synthesizing long text directly into MP3...");
 
         tokio::time::timeout(Duration::from_secs(60), async {
@@ -664,14 +680,14 @@ impl TtsClient {
                     text: prompt_override,
                     wav_path: voice_override,
                 };
-                if let Err(e) = engine.cache_voice_prompt(&override_prompt) {
-                    log::warn!("Failed to apply temporary voice override cache: {}", e);
-                }
+                engine.cache_voice_prompt(&override_prompt).context("apply requested host voice")?;
             }
 
             let sample_rate = engine.sample_rate() as u32;
             let mut mp3_process = tts::Mp3StreamProcess::start_s16le(sample_rate)?;
-            let chunks = tts::chunk_text(&text);
+            let chunks = if self.config.engine.as_deref() == Some("gemini") {
+                split_tts_text_for_config(&text, &self.config)
+            } else { tts::chunk_text(&text) };
             let mut pcm_stream = tts::PcmStreamEncoder::new(sample_rate as usize, 0.05);
 
             for (idx, chunk) in chunks.iter().enumerate() {
@@ -708,6 +724,14 @@ impl TtsClient {
     /// Helper: Convert WAV bytes to MP3 using TTS library
     pub async fn convert_to_mp3(&self, wav_bytes: &[u8]) -> Result<Vec<u8>> {
         tts::convert_to_mp3(wav_bytes).await
+    }
+
+    fn prepare_input_text(&self, raw_text: &str) -> String {
+        if self.config.engine.as_deref() == Some("gemini") {
+            super::speech_text::prepare_speech(raw_text)
+        } else {
+            Self::bounded_text(raw_text)
+        }
     }
 
     fn bounded_text(raw_text: &str) -> String {
@@ -833,7 +857,10 @@ pub async fn run_tts_asr_loop_synthesize(
         anyhow::anyhow!("config path is not valid UTF-8: {}", config_path.display())
     })?;
     let config = load_config(config_path_str)?;
-    let client = TtsClient::new(config.tts.clone());
+    let primary = std::sync::Arc::new(TtsClient::new(config.tts.clone()));
+    let router = super::tts_routing::TtsRouter::new(&config, primary)?;
+    let selected = router.selected_config().await?;
+    let client = TtsClient::new(selected);
     let source_text = std::fs::read_to_string(text_path)?;
     let chunks = prepare_tts_asr_loop_chunks(&source_text, &client.config);
     if chunks.is_empty() {
@@ -1367,6 +1394,11 @@ fn synthesize_validated_chunk_with_heartbeat(
         ) {
             Ok(samples) => samples,
             Err(e) => {
+                // Cloud calls can already have consumed quota. The job router alone
+                // owns cloud fallback; local chunk retries must not replay them.
+                if format!("{e:#}").contains("GEMINI_TTS[") {
+                    return Err(e);
+                }
                 let reason = format!("synthesis error: {}", e);
                 log::warn!(
                     "[TTS Worker] Chunk {}/{} attempt {}/{} failed: {}",
@@ -1542,6 +1574,12 @@ fn resolve_cortex_tts_runtime_policy<'a>(
     let requested_device = requested_device
         .map(str::trim)
         .filter(|device| !device.is_empty());
+    if req == "gemini" {
+        return ("gemini", "cpu");
+    }
+    if req == "colab" {
+        return ("colab", "cpu");
+    }
     if allow_experimental {
         return (
             req,
@@ -1680,6 +1718,14 @@ fn push_bounded_chunk(chunks: &mut Vec<String>, text: &str, total_chars: &mut us
 }
 
 fn split_tts_safe_chunks_for_config(chunks: &[String], config: &LibTtsConfig) -> Vec<String> {
+    if config.engine.as_deref() == Some("gemini") {
+        return chunks
+            .iter()
+            .flat_map(|text| {
+                tts::adapters::gemini::speech_chunks(text, tts_stable_chunk_max_chars(config))
+            })
+            .collect();
+    }
     split_tts_safe_chunks(chunks, tts_stable_chunk_max_chars(config))
 }
 
@@ -1693,6 +1739,9 @@ fn split_tts_safe_chunks(chunks: &[String], max_chars: usize) -> Vec<String> {
 }
 
 fn split_tts_text_for_config(text: &str, config: &LibTtsConfig) -> Vec<String> {
+    if config.engine.as_deref() == Some("gemini") {
+        return tts::adapters::gemini::speech_chunks(text, tts_stable_chunk_max_chars(config));
+    }
     split_tts_text_with_max_chars(text, tts_stable_chunk_max_chars(config))
 }
 
@@ -1781,6 +1830,12 @@ fn split_tts_chunk_by_max_chars(chunk: &str, max_chars: usize) -> Vec<String> {
 
 fn tts_stable_chunk_max_chars(config: &LibTtsConfig) -> usize {
     match config.engine.as_deref().unwrap_or("voxcpm").trim() {
+        "gemini" => config
+            .gemini
+            .as_ref()
+            .map(|g| g.max_request_chars)
+            .unwrap_or(400)
+            .clamp(100, 8000),
         "moss" => config
             .moss
             .as_ref()
@@ -1916,6 +1971,7 @@ mod tests {
         process_isolation: Option<bool>,
     ) -> CortexTtsConfig {
         CortexTtsConfig {
+            gemini: None,
             engine: Some(engine.to_string()),
             device: device.map(str::to_string),
             keep_engine_loaded: None,
@@ -1934,6 +1990,7 @@ mod tests {
 
     fn voxcpm_lib_config() -> LibTtsConfig {
         LibTtsConfig {
+            gemini: None,
             engine: Some("voxcpm_metal".to_string()),
             device: Some("metal".to_string()),
             voxcpm: None,
@@ -1941,6 +1998,31 @@ mod tests {
             magictts: None,
             moss: None,
         }
+    }
+
+    #[test]
+    fn gemini_preserves_long_manuscripts_and_uses_larger_requests() {
+        let client = TtsClient::new(tts_config("gemini", None));
+        let text = "新闻内容。".repeat(1800);
+        assert!(client.prepare_input_text(&text).chars().count() > MAX_TOTAL_CHARS);
+        let chunks = split_tts_text_for_config(&text, &client.config);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|c| c.chars().count() <= 400));
+        assert_eq!(
+            split_tts_text_for_config("第一句。第二句。", &client.config).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn explicitly_selected_gemini_is_not_replaced_by_local_model() {
+        assert_eq!(
+            resolve_cortex_tts_runtime_policy("gemini", Some("metal"), false),
+            ("gemini", "cpu")
+        );
+        let client = TtsClient::new(tts_config("gemini", None));
+        assert_eq!(client.config.engine.as_deref(), Some("gemini"));
+        assert!(client.process_isolation);
     }
 
     #[test]
@@ -2144,6 +2226,7 @@ mod tests {
     #[test]
     fn moss_tts_policy_keeps_long_text_chunks_shorter_than_voxcpm() {
         let config = LibTtsConfig {
+            gemini: None,
             engine: Some("moss".to_string()),
             device: Some("cpu".to_string()),
             voxcpm: None,
@@ -2370,4 +2453,19 @@ mod tests {
         assert_eq!(engine.calls, TTS_CHUNK_MAX_ATTEMPTS);
         assert!(err.to_string().contains("broadband"));
     }
+    #[test]
+    fn cloud_errors_are_not_replayed_by_local_chunk_retry_loop() {
+        struct FailingCloud { calls:usize, marker:&'static str }
+        impl TtsEngine for FailingCloud {
+            fn cache_voice_prompt(&mut self,_:&tts::VoicePrompt)->Result<()> {Ok(())}
+            fn sample_rate(&self)->usize {24000}
+            fn synthesize_chunk(&mut self,_:&str)->Result<Vec<f32>> {self.calls+=1;anyhow::bail!("worker: {}",self.marker)}
+        }
+        for marker in ["GEMINI_TTS[quota]","GEMINI_TTS[budget]","GEMINI_TTS[auth]","GEMINI_TTS[transient]","GEMINI_TTS[invalid_audio]","GEMINI_TTS[request]"] {
+            let mut engine=FailingCloud {calls:0,marker};
+            let error=synthesize_validated_chunk_with_heartbeat(&mut engine,"test",None,1,1).unwrap_err();
+            assert!(error.to_string().contains(marker));assert_eq!(engine.calls,1);
+        }
+    }
+
 }

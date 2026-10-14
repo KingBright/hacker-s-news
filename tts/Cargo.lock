@@ -5174,6 +5174,7 @@ dependencies = [
  "aha",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "candle-core",
  "candle-nn",
  "candle-transformers",
@@ -5188,8 +5189,10 @@ dependencies = [
  "qwen3-tts",
  "rand 0.8.5",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokenizers",
  "tokio",
 ]

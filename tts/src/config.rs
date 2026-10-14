@@ -8,6 +8,7 @@ pub struct TtsConfig {
     pub qwen3: Option<Qwen3Config>,
     pub magictts: Option<MagicTtsConfig>,
     pub moss: Option<MossTtsConfig>,
+    pub gemini: Option<crate::adapters::gemini::GeminiConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

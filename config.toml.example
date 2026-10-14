@@ -110,6 +110,23 @@ process_isolation = true
 # More Metal processes share one GPU; benchmark before increasing (maximum 4).
 worker_max_processes = 1
 
+[tts.gemini]
+# Local editorial budget, NOT the Google project quota.
+daily_request_budget = 60
+reserved_requests = 40 # background audio leaves allowance for Radio
+morning_reserved_requests = 25 # morning Radio leaves allowance for evening
+min_request_interval_secs = 20
+model = "gemini-3.8-flash-lite-tts"
+fallback_models = ["gemini-3.8-flash-tts"]
+fallback_local = true
+voice = "Kore"
+style = "用自然清晰的普通话忠实朗读原稿，不增删、不重复，不朗读任何语气指令。"
+api_key_env = "GEMINI_API_KEY"
+timeout_secs = 180
+max_request_chars = 400
+# Optional private key file (0600); never put the secret in TOML.
+# api_key_file = "/private/path/gemini-tts.key"
+
 [tts.voxcpm]
 # Path to local VoxCPM model directory (required for aha)
 model_path = "/path/to/VoxCPM1.5"
@@ -162,27 +179,37 @@ repair_limit = 20
 
 [[hosts]]
 name = "Vivian"
+gemini_voice = "Kore"
+personality = "主主持人，沉稳、温暖、条理清晰。负责开场、收束和全局衔接；技术内容讲清因果，健康话题克制，不夸大结论。语速适中，关键事实后自然停顿。"
 # Voice file path (or model name if using other engines)
 voice = "file:///path/to/audio/vivian.wav"
 categories = ["热点科技", "工程技术", "生命科学", "科学", "极客"]
 
 [[hosts]]
 name = "灿灿"
+gemini_voice = "Aoede"
+personality = "轻快、敏锐、有工程师的好奇心。硬件和游戏话题有活力但不喊叫，不用营销腔；规格与体验分开说，型号、数字读清楚。"
 voice = "file:///path/to/audio/cancan.wav"
 categories = ["数码", "游戏影音"]
 
 [[hosts]]
 name = "小萌"
+gemini_voice = "Leda"
+personality = "亲切、细腻、有文化观察力。文娱话题温柔自然，感兴趣但不追星式夸张；区分作品评价与事实，不擅自增加笑声和感叹。"
 voice = "file:///path/to/audio/meng.wav"
 categories = ["读书", "文娱"]
 
 [[hosts]]
 name = "小凡"
+gemini_voice = "Charon"
+personality = "冷静、理性、审慎。财经和时政先交代事实与来源，再说明影响；数字、比较和不确定性读清楚，不煽动情绪，不装作给投资建议。"
 voice = "file:///path/to/audio/xiaofan.wav"
 categories = ["财经", "政治"]
 
 [[hosts]]
 name = "小何"
+gemini_voice = "Sadaltager"
+personality = "博学、好奇、耐心。像善于解释问题的朋友，用清楚的层次讲科学与生活；重点有重音，保留证据边界，不把推测读成定论。"
 voice = "file:///path/to/audio/xiaohe.wav"
 categories = ["探索", "生活", "其他"]
 

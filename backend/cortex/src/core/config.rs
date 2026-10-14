@@ -41,6 +41,8 @@ pub struct Host {
     pub voice: String,
     pub prompt_text: Option<String>,
     pub categories: Vec<String>,
+    pub gemini_voice: Option<String>,
+    pub personality: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -81,6 +83,7 @@ pub struct TtsConfig {
     pub qwen3: Option<Qwen3Config>,
     pub magictts: Option<MagicTtsConfig>,
     pub moss: Option<MossTtsConfig>,
+    pub gemini: Option<tts::adapters::gemini::GeminiConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -226,9 +229,25 @@ fn default_true() -> bool {
     true
 }
 
+pub fn apply_host_personas(config: &mut Config) -> Result<()> {
+    if let Some(gemini) = config.tts.gemini.as_mut() {
+        for host in config.hosts.as_deref().unwrap_or_default() {
+            if let Some(voice) = &host.gemini_voice {
+                anyhow::ensure!(!voice.trim().is_empty(), "empty Gemini voice for host {}", host.name);
+                gemini.host_voices.insert(host.voice.clone(), voice.clone());
+            }
+            if let Some(style) = &host.personality {
+                gemini.host_styles.insert(host.voice.clone(), style.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn load_config(path: &str) -> Result<Config> {
     let content = fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&content)?;
+    let mut config: Config = toml::from_str(&content)?;
+    apply_host_personas(&mut config)?;
     Ok(config)
 }
 
@@ -254,6 +273,26 @@ engine = "voxcpm"
 "#
         );
         toml::from_str(&content).expect("valid config")
+    }
+
+    #[test]
+    fn host_persona_mapping_preserves_identity_and_categories() {
+        let mut config=parse_config(r#"
+[tts.gemini]
+model="gemini-3.8-flash-lite-tts"
+[[hosts]]
+name="Vivian"
+voice="file:///voice/vivian.wav"
+categories=["AI前沿","生命健康"]
+gemini_voice="Kore"
+personality="沉稳温暖"
+"#);
+        apply_host_personas(&mut config).unwrap();
+        let host=&config.hosts.as_ref().unwrap()[0];
+        assert_eq!(host.name,"Vivian");assert_eq!(host.categories,vec!["AI前沿","生命健康"]);
+        let gemini=config.tts.gemini.unwrap();
+        assert_eq!(gemini.host_voices.get("file:///voice/vivian.wav").unwrap(),"Kore");
+        assert_eq!(gemini.host_styles.get("file:///voice/vivian.wav").unwrap(),"沉稳温暖");
     }
 
     #[test]

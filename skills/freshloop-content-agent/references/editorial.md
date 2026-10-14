@@ -50,3 +50,21 @@ Reading has three different outputs. reader_markdown preserves the author's actu
 Weekly must explain specific findings from the actual included article contents and connect supported similarities/differences. A list of three titles and generic topic descriptions is not a digest. Insufficient substantive material means report the gap, not invent or pad. Source dates and attribution remain visible in the evidence ledger.
 
 Reading must retain at least two distinct substantive claims with different supporting passages (e.g. thesis and example/limitation); Weekly at least three. These facts must actually be explained in the displayed and spoken versions. Title-only evidence cannot establish the article's argument. This checks evidence structure, not correctness or a manuscript length quota.
+
+## 2026-10-14: 五类高频事实失真硬性防线（写稿与终审必查）
+
+针对近期实战复盘暴露出的典型失真模式，写稿人在起草每条 Radio `major`/`brief` 与 Reading 长文时，以及 `freshloop-fact-auditor` / `freshloop-listening-editor` 在审稿时，必须逐项核对以下五条硬防线：
+
+1. **严禁混淆媒介形态与研发/试验阶段**：
+   - 区分“临床人体试验（含受试者人数与周期）”与“临床前/实验室阶段”；区分“纪录片放映/访谈”、“口述史图书出版”、“学术预印本”与“正式期刊发表”。
+2. **严禁将预告猜测写为已确认规格，或混淆测试版与正式版状态**：
+   - 商业联名预告（Teaser）中未由官方确认的具体角色、售价、音效或发售日期，若属媒体猜测必须明确标注“外界推测/尚未公布”，绝不能写成既定事实。
+   - 软件版本必须核对发稿当日处于 `Beta/RC/候选版` 还是 `正式稳定版（Stable）`，并写明正式版预计发布日期。
+3. **严禁错配性能基准对象（Baseline）与吞吐/能效口径**：
+   - 涉及芯片、存储或系统跑分（如 Maia 300、ZuluSCSI / Eagle 450 与 Eagle 500 对比）时，必须逐一锁死“被测对象、对比基准（如对比主流 GPU 还是上一代自研芯片、首次运行还是开启系统缓存后的二次运行、机械硬盘基线还是固态模拟）、指标单位（如每兆瓦 token 数 vs 整机柜吞吐倍数）”。
+4. **严禁抹除具名企业/机构主体或遗漏生效年份与散热/兼容条件**：
+   - 原文明确点名的企业、产品与规模数据（如 Atomic Canyon 的 NIVA 覆盖 94 座反应堆、Nuclearn 逾 65 家合作方、AVIDrone 电动直升机干重比 3.84），不得泛化改写为“某国行业/某研究团队”。
+   - 政策草案、芯片量产或机柜参考设计必须保留生效/出货年份（如 2027 年部署、2028 年 12 月 1 日生效）及技术兼容边界（如“同时支持风冷与液冷”不得改写为“必须依赖专用液冷”）。
+5. **分段全文必读与严禁脚本代填审稿收据**：
+   - 写稿与两位独立只读审稿子智能体（`freshloop-fact-auditor`、`freshloop-listening-editor`）必须按 `read_plan_files` 逐段调用 `view_file(StartLine, EndLine)` 读完全部正文行范围（每段 ≤80 行），严禁依赖默认前 800 行截断或由主任务脚本拼接模板化 `pass` 收据。
+

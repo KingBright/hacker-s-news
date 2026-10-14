@@ -71,6 +71,14 @@ pub struct EngineFactory;
 impl EngineFactory {
     pub fn create(config: &TtsConfig) -> Result<Box<dyn TtsEngine>> {
         let engine = config.engine.as_deref().unwrap_or("voxcpm").trim();
+        if engine == "gemini" {
+            return Ok(Box::new(crate::adapters::gemini::GeminiAdapter::new(
+                config
+                    .gemini
+                    .clone()
+                    .ok_or_else(|| anyhow!("Gemini config missing"))?,
+            )?));
+        }
         let device_preference = resolve_device_preference(engine, config.device.as_deref());
         let device = create_device(device_preference)?;
         log::info!("TTS using device: {:?} ({:?})", device, device_preference);
