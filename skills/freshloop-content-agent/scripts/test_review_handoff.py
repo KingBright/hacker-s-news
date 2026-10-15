@@ -71,6 +71,24 @@ class HandoffTests(unittest.TestCase):
             with patch.object(native,'state_root',return_value=state):
                 write(rows+[reply]);actual,origin=native.native_result(ident,'facts',batch_file)
                 self.assertEqual(actual,raw);self.assertEqual(origin['parent_conversation_id'],parent)
+                source = Path(batch['sources'][0]['source_file'])
+                original_bytes = source.read_bytes()
+                changed_record = json.loads(original_bytes)
+                changed_record['original_html'] = changed_record['original_html'].replace('<p>', '<p>A later source correction changes the reported comparison. ', 1)
+                mutations = [('raw-only', original_bytes + b'\n'),
+                             ('body', json.dumps(changed_record).encode())]
+                for label, changed_bytes in mutations:
+                    with self.subTest(source_change=label):
+                        out = root / ('import-' + label + '.json')
+                        source.write_bytes(changed_bytes)
+                        try:
+                            with self.assertRaisesRegex(review.EditorialError, 'Source snapshot changed'):
+                                native.import_receipt(ident, 'facts', batch_file, out)
+                            self.assertFalse(out.exists())
+                            self.assertFalse(out.with_suffix('.origin.json').exists())
+                            self.assertEqual(agent.read(out.with_suffix('.unverified-native.json'))['actual_raw_response'], raw)
+                        finally:
+                            source.write_bytes(original_bytes)
                 write([reply]+rows)
                 with self.assertRaisesRegex(review.EditorialError,'batch metadata'):native.native_result(ident,'facts',batch_file)
                 bad=copy.deepcopy(rows);bad[1]['content']+=' Content truncated';write(bad+[reply])

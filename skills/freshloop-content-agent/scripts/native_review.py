@@ -26,7 +26,7 @@ def parse_receipt(text):
 
 
 def native_result(conversation, role, batch_file, retain_raw=None):
-    from review_comparison import EditorialError, digest, read, bounded_path, run_root
+    from review_comparison import EditorialError, digest, read, bounded_path, run_root, source_input
     uuid.UUID(conversation)
     base=state_root();db=base/'conversation_summaries.db'
     with contextlib.closing(sqlite3.connect(db.as_uri()+'?mode=ro',uri=True)) as conn:
@@ -83,6 +83,9 @@ def native_result(conversation, role, batch_file, retain_raw=None):
     for descriptor in batch['sources']:
         if {k:v for k,v in descriptor.items() if k!='readable'}!=canonical_sources[descriptor['url']]:
             raise EditorialError('review_batch_changed','Batch source descriptor differs from its bound original','review')
+        current = source_input(bounded_path(root, descriptor['source_file']))
+        if any(current[key] != descriptor[key] for key in ('source_sha256', 'body_sha256')):
+            raise EditorialError('stale_source_review', 'Source snapshot changed after review', source_ids=[current['source_id']])
     originals={s['source_id']:read(bounded_path(root,s['snapshot']))['body'] for s in packet['sources']}
     unit_text={u['unit']:u['text'] for u in packet['units']}
     for descriptor in batch['sources']+batch['units']:

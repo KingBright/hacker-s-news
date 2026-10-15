@@ -69,6 +69,10 @@ def source_input(path):
         status=re.search(r'(?:HTTP|status|code)[^0-9]{0,8}([45][0-9]{2})',str(error),re.I) if error else None
         detail=('获取失败：HTTP '+status.group(1)) if status else ('获取失败：'+re.sub(r'https?://[^\s]+','[source URL]',str(error))[:200]) if error else view.get('reason','来源标识、URL或原始正文不完整')
         raise EditorialError('source_unavailable', '无法完成来源核验：'+detail, 'source', [ident or Path(path).name])
+    if view.get('cleaning', {}).get('requires_inspection'):
+        raise EditorialError('clean_input_requires_inspection',
+                             'Source cleaning flagged encoding, changed numbers, suspicious deletion or an empty/short body; inspect retained original before review',
+                             'cleaning', [ident])
     return {'source_id': ident, 'url': url, 'body': view['text'], 'root': view['root'],
             'aggregate_date': entry.get('pub_date'),
             'source_file': str(Path(path).resolve()), 'source_sha256': hashlib.sha256(Path(path).read_bytes()).hexdigest(),

@@ -13,6 +13,32 @@ from test_freshloop_agent import radio_artifact, artifact, reviewed_file, sync_r
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_flagged_cleaning_cannot_prepare_review_inputs(self):
+        # These real extractor warnings must block every source-consuming entry.
+        fragments = [
+            '<p>Reported improvement is 1\x002% over the stated reference system.</p>',
+            '<p>The recorded model name contains a replacement character: \ufffd.</p>',
+            '<div class="advertisement"><h2>Comparison scope</h2><p>Laboratory results only; external deployment has not been tested.</p></div>',
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft = root / 'draft.json'
+            agent.save(draft, artifact())
+            for number, fragment in enumerate(fragments):
+                with self.subTest(case=number):
+                    source = root / ('source-' + str(number) + '.json')
+                    original = dict(id='source', entry=dict(link='https://example.org/article'),
+                                    original_html='<article><p>The team reports a measured improvement under a specified workload and retains the comparison scope.</p>' + fragment + '</article>')
+                    agent.save(source, original)
+                    before = source.read_bytes()
+                    self.assertTrue(review.article_view(original)['cleaning']['requires_inspection'])
+                    packet = root / ('inputs-' + str(number) + '.json')
+                    with self.assertRaises(review.EditorialError) as caught:
+                        review.prepare_inputs(draft, [source], packet)
+                    self.assertEqual(caught.exception.code, 'clean_input_requires_inspection')
+                    self.assertFalse(packet.exists())
+                    self.assertEqual(source.read_bytes(), before)
+
     def test_normal_major_and_one_sentence_brief_are_not_length_gated(self):
         with tempfile.TemporaryDirectory() as root:
             p=Path(root)/'review.json';data=radio_artifact();reviewed_file(p,data)
